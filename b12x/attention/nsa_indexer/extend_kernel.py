@@ -1310,20 +1310,20 @@ class SparseNSAExtendLogitsPrefillKernel:
                         )
                         # Accumulate per K-sub-tile (q_local always in [0,31], no bounds check needed)
                         lane_group = lane // Int32(4)
+                        w_rs0 = ld_shared_f32(w_smem_base + w_off_rs0 + head_idx * Int32(4))
+                        w_rs1 = ld_shared_f32(w_smem_base + w_off_rs1 + head_idx * Int32(4))
                         for mma_kv in cutlass.range_constexpr(_PREFILL_NUM_MMA_KV):
                             for reg_id in cutlass.range_constexpr(8):
                                 row_slot = (reg_id % 4) // 2
                                 q_local = warp_q_idx * Int32(16) + lane_group + Int32(8 * row_slot)
-                                w_off = w_off_rs0 if row_slot == Int32(0) else w_off_rs1
+                                w_val = w_rs0 if row_slot == Int32(0) else w_rs1
                                 acc_frag[Int32(0), mma_kv, reg_id] = Float32(
                                     acc_frag[Int32(0), mma_kv, reg_id]
                                     + attention_utils.fmax(
                                         score_frag[Int32(0), mma_kv, reg_id],
                                         Float32(0.0),
                                     )
-                                    * ld_shared_f32(
-                                        w_smem_base + w_off + head_idx * Int32(4)
-                                    )
+                                    * w_val
                                 )
                 # The next batch reuses the same Q shared-memory slots.
                 cute.arch.sync_threads()
@@ -1689,19 +1689,19 @@ class SparseNSAExtendLogitsPrefill512Kernel:
                             Int32(_FP8_ROW_VECS),
                         )
                         lane_group = lane // Int32(4)
+                        w_rs0 = ld_shared_f32(w_smem_base + w_off_rs0 + head_idx * Int32(4))
+                        w_rs1 = ld_shared_f32(w_smem_base + w_off_rs1 + head_idx * Int32(4))
                         for mma_kv in cutlass.range_constexpr(_PREFILL512_NUM_MMA_KV):
                             for reg_id in cutlass.range_constexpr(8):
                                 row_slot = (reg_id % 4) // 2
-                                w_off = w_off_rs0 if row_slot == Int32(0) else w_off_rs1
+                                w_val = w_rs0 if row_slot == Int32(0) else w_rs1
                                 acc_frag[Int32(0), mma_kv, reg_id] = Float32(
                                     acc_frag[Int32(0), mma_kv, reg_id]
                                     + attention_utils.fmax(
                                         score_frag[Int32(0), mma_kv, reg_id],
                                         Float32(0.0),
                                     )
-                                    * ld_shared_f32(
-                                        w_smem_base + w_off + head_idx * Int32(4)
-                                    )
+                                    * w_val
                                 )
                 cute.arch.sync_threads()
                 batch_base_head += Int32(_PREFILL512_Q_HEADS_BATCH)
