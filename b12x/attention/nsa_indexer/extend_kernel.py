@@ -922,16 +922,24 @@ def _pack_q_mxfp8_reg_smem_ptr(
     row_local: Int32,
     col_pair_base: Int32,
 ) -> Uint32:
-    """Pack 4 FP8 bytes from smem into one MMA register word.
+    """Pack 4 FP8 bytes from swizzled smem into one MMA register word.
 
     Reads bytes at [row_local, col_pair_base+0], [row_local, col_pair_base+1],
     [row_local, col_pair_base+8], [row_local, col_pair_base+9].
+    Uses _permuted_offset_128b to match the swizzled write layout.
     """
     u32_idx_lo = col_pair_base // Int32(4)
     u32_idx_hi = u32_idx_lo + Int32(2)
     byte_shift = (col_pair_base % Int32(4)) * Int32(8)
-    addr_lo = q_smem_base + row_local * Int32(_PREFILL_Q_STAGE_COLS) + u32_idx_lo * Int32(4)
-    addr_hi = q_smem_base + row_local * Int32(_PREFILL_Q_STAGE_COLS) + u32_idx_hi * Int32(4)
+    byte_off_lo = u32_idx_lo * Int32(4)
+    byte_off_hi = u32_idx_hi * Int32(4)
+    vec_lo = byte_off_lo // Int32(16)
+    vec_hi = byte_off_hi // Int32(16)
+    within_lo = byte_off_lo % Int32(16)
+    within_hi = byte_off_hi % Int32(16)
+    q_rs = Int32(_PREFILL_Q_STAGE_COLS // 16)
+    addr_lo = q_smem_base + _permuted_offset_128b(row_local, vec_lo, q_rs) * Int32(16) + within_lo
+    addr_hi = q_smem_base + _permuted_offset_128b(row_local, vec_hi, q_rs) * Int32(16) + within_hi
     lo = ld_shared_u32(addr_lo)
     hi = ld_shared_u32(addr_hi)
     lo_half = (lo >> byte_shift) & Uint32(0xFFFF)
@@ -1253,8 +1261,9 @@ class SparseNSAExtendLogitsPrefillKernel:
             u32_col_base = col_group * Int32(4)
             q_row = q_tile_base + row_local
             in_bounds_pred = Int32(1) if (row_local < Int32(_PREFILL_Q_STAGE_ROWS) and q_row < valid_q_rows) else Int32(0)
-            thread_offset = row_local * Int32(_PREFILL_Q_STAGE_COLS) + u32_col_base * Int32(4)
             q_smem_stride = Int32(_PREFILL_Q_STAGE_BYTES)
+            q_rs = Int32(_PREFILL_Q_STAGE_COLS // 16)
+            thread_offset = _permuted_offset_128b(row_local, col_group, q_rs) * Int32(16)
             q_row_for_async = q_row if row_local < Int32(_PREFILL_Q_STAGE_ROWS) else Int32(0)
 
             batch_base_head = Int32(0)
@@ -1634,8 +1643,9 @@ class SparseNSAExtendLogitsPrefill512Kernel:
             u32_col_base = col_group * Int32(4)
             q_row = q_tile_base + row_local
             in_bounds_pred = Int32(1) if (row_local < Int32(_PREFILL_Q_STAGE_ROWS) and q_row < valid_q_rows) else Int32(0)
-            thread_offset = row_local * Int32(_PREFILL_Q_STAGE_COLS) + u32_col_base * Int32(4)
             q_smem_stride = Int32(_PREFILL_Q_STAGE_BYTES)
+            q_rs = Int32(_PREFILL_Q_STAGE_COLS // 16)
+            thread_offset = _permuted_offset_128b(row_local, col_group, q_rs) * Int32(16)
             q_row_for_async = q_row if row_local < Int32(_PREFILL_Q_STAGE_ROWS) else Int32(0)
 
             batch_base_head = Int32(0)
