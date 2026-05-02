@@ -13,7 +13,7 @@ Headline `(M=32,K=5376,N=5376)`:
 | torch._scaled_mm | 186.304 | 186.304 |
 | T2 Step 1 CUTLASS atom smoke | 362.496 | 360.592 |
 
-Correctness: Step 1 passed all 22 verifier shapes. Step 2 and Step 3 topology probes failed smoke correctness and were rejected before profiling.
+Correctness: Step 1 passed all 22 verifier shapes. Step 2 and Step 3 topology probes failed smoke correctness and were rejected before profiling. The `186.304 us` row is the slower simultaneous verifier control, not the original promotion reference; against the original `99.408 us` production baseline and ~120 us starting reference, the `362.496 us` candidate is a clear regression.
 
 ## Steps
 

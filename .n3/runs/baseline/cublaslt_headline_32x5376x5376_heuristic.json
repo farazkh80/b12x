@@ -1,0 +1,20 @@
+{
+  "device": "NVIDIA GB10",
+  "compute_capability": "12.1",
+  "shape": {"M": 32, "K": 5376, "N": 5376},
+  "dtype": {"a": "e4m3", "b": "e4m3", "c": "bf16", "compute": "fp32"},
+  "transpose": {"a": "N", "b": "T"},
+  "measurement": {"warmup": 10, "iters": 20, "repeats": 5},
+  "heuristic_returned": 8,
+  "candidates": [
+    {"rank_measured": 0, "rank_heuristic": 6, "algo_id": 67, "tile_id": 15, "stages_id": 36, "splitk_num": 1, "swizzling": 0, "reduction_scheme": 0, "workspace_bytes": 0, "wave_count": 0.8750, "median_us": 199.6160, "mean_us": 199.6224, "min_us": 199.5520, "spread_pct": 0.0641, "launch_ok": true},
+    {"rank_measured": 1, "rank_heuristic": 2, "algo_id": 67, "tile_id": 320, "stages_id": 36, "splitk_num": 1, "swizzling": 0, "reduction_scheme": 0, "workspace_bytes": 0, "wave_count": 0.8750, "median_us": 199.6800, "mean_us": 200.2944, "min_us": 199.6800, "spread_pct": 1.0737, "launch_ok": true},
+    {"rank_measured": 2, "rank_heuristic": 3, "algo_id": 67, "tile_id": 15, "stages_id": 36, "splitk_num": 1, "swizzling": 0, "reduction_scheme": 0, "workspace_bytes": 0, "wave_count": 1.7500, "median_us": 199.6800, "mean_us": 199.6544, "min_us": 199.5840, "spread_pct": 0.0481, "launch_ok": true},
+    {"rank_measured": 3, "rank_heuristic": 5, "algo_id": 67, "tile_id": 15, "stages_id": 36, "splitk_num": 1, "swizzling": 0, "reduction_scheme": 0, "workspace_bytes": 0, "wave_count": 0.8750, "median_us": 199.6800, "mean_us": 199.6608, "min_us": 199.5840, "spread_pct": 0.0641, "launch_ok": true},
+    {"rank_measured": 4, "rank_heuristic": 1, "algo_id": 67, "tile_id": 26, "stages_id": 36, "splitk_num": 1, "swizzling": 0, "reduction_scheme": 0, "workspace_bytes": 0, "wave_count": 0.8750, "median_us": 199.7120, "mean_us": 200.0704, "min_us": 199.6800, "spread_pct": 0.5288, "launch_ok": true},
+    {"rank_measured": 5, "rank_heuristic": 4, "algo_id": 67, "tile_id": 321, "stages_id": 36, "splitk_num": 1, "swizzling": 0, "reduction_scheme": 0, "workspace_bytes": 0, "wave_count": 0.8750, "median_us": 200.7040, "mean_us": 201.6256, "min_us": 200.4800, "spread_pct": 2.1524, "launch_ok": true},
+    {"rank_measured": 6, "rank_heuristic": 0, "algo_id": 67, "tile_id": 399, "stages_id": 36, "splitk_num": 1, "swizzling": 0, "reduction_scheme": 0, "workspace_bytes": 0, "wave_count": 0.4375, "median_us": 200.8640, "mean_us": 201.5616, "min_us": 200.7040, "spread_pct": 1.5453, "launch_ok": true},
+    {"rank_measured": 7, "rank_heuristic": 7, "algo_id": 67, "tile_id": 20, "stages_id": 36, "splitk_num": 3, "swizzling": 0, "reduction_scheme": 2, "workspace_bytes": 2064384, "wave_count": 0.8750, "median_us": 207.8720, "mean_us": 208.0576, "min_us": 207.7760, "spread_pct": 0.5234, "launch_ok": true}
+  ],
+  "best": {"rank_heuristic": 6, "algo_id": 67, "tile_id": 15, "stages_id": 36, "splitk_num": 1, "swizzling": 0, "median_us": 199.6160}
+}

@@ -10,7 +10,7 @@ Best measured Track 1 headline result was Step 2 (`TileM=32, TileN=64, StageK=25
 | Headline graph median | 178.000 us | 178.992 us |
 | Correctness | passed | passed |
 
-This is parity-level only: eager was 0.6% faster than the simultaneous baseline, graph was 0.6% slower, and full-shape no-regression failed. The target gap is `179.200 - 70 = 109.200 us`.
+This is parity-level only against the slower simultaneous verifier baseline: eager was 0.6% faster than that control, graph was 0.6% slower, and full-shape no-regression failed. It is not parity against the original headline reference (`99.408 us` production cuBLASLt / `102.464 us` existing inline PTX, with user-recalled starting reference ~120 us). Against those references, `179.200 us` is a regression. The stretch-target gap is `179.200 - 70 = 109.200 us`.
 
 ## Per-step outcome
 
@@ -55,4 +55,4 @@ I would not continue local tweaks to this hand-written cp/st.shared pipeline. Th
 
 ## Carry-forward decision
 
-Track 1 is closed. Restore and carry forward the original inline-PTX hot path (`TileM=32, TileN=32, StageK=256`) as the parity floor; Step 2 remains an archived measurement, not the promoted implementation, because it fails the graph/full-shape no-regression gate.
+Track 1 is closed. Restore and carry forward the original inline-PTX hot path (`TileM=32, TileN=32, StageK=256`) as the parity floor; Step 2 remains an archived measurement, not the promoted implementation, because it is slower than the original headline reference and fails the graph/full-shape no-regression gate.

@@ -15,7 +15,7 @@ Headline `(M=32,K=5376,N=5376)`, smoke benchmark with `warmup=5,iters=10,repeats
 | torch._scaled_mm | 183.264 | 185.712 |
 | CuTeDSL unscaled staged | 206.704 | 207.152 |
 
-Correctness: passed with `cos=0.99999857`, `max_abs=0.01623`, limit `0.05216`.
+Correctness: passed with `cos=0.99999857`, `max_abs=0.01623`, limit `0.05216`. The `183.264 us` row is the slower simultaneous verifier control, not the original promotion reference; against the original `99.408 us` production baseline and ~120 us starting reference, the `206.704 us` candidate is a regression.
 
 ## Steps
 
