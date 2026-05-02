@@ -38,6 +38,7 @@ include = ["b12x*", "serve*"]
 
 [tool.setuptools.package-data]
 "b12x.distributed" = ["*.cu"]
+"b12x.gemm" = ["*.cu"]
 "b12x.attention.paged.tuning" = ["*.decode.bs*.py"]
 
 [tool.ruff.lint]

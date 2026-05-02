@@ -1,0 +1,19 @@
+# AVO per-run artifacts: large binary captures + ephemeral state.
+# Source code (probe_*.py), planning markdown, and SUMMARY/COMPARISON.md stay tracked.
+runs/baseline/*.sqlite
+runs/baseline/*.nsys-rep
+runs/baseline/*.ncu-rep
+
+# Per-iteration / per-track artifacts emitted by AVO.
+runs/v*/
+runs/tracks/*/step*/nsys.rep
+runs/tracks/*/step*/nsys.txt
+runs/tracks/*/step*/ncu.rep
+runs/tracks/*/step*/ncu.txt
+runs/tracks/*/step*/pytest.log
+
+# Live process state: not source.
+logs/
+checkpoints/
+scratchpads/
+workflow-alert.md

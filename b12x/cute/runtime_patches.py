@@ -17,7 +17,7 @@ _B12X_PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _cute_compile_disk_cache_enabled() -> bool:
-    raw = os.environ.get("B12X_CUTE_COMPILE_DISK_CACHE", "1")
+    raw = os.environ.get("B12X_CUTE_COMPILE_DISK_CACHE", "0")
     return raw.lower() not in {"0", "false", "no", ""}
 
 
@@ -529,6 +529,46 @@ def _patch_cutlass_sm120_blockscaled_arch_check() -> None:
     blockscaled_op._b12x_sm121a_patch = True
 
 
+def _patch_cutlass_sm121_tcgen05_fp8_arch_check() -> None:
+    try:
+        from cutlass.cute.nvgpu.tcgen05 import mma as mma_mod
+    except Exception:
+        return
+
+    fp8_op = getattr(mma_mod, "MmaFP8Op", None)
+    if fp8_op is None:
+        return
+    if getattr(fp8_op, "_b12x_sm121a_patch", False):
+        return
+
+    Arch = mma_mod.Arch
+    sm_121_archs = tuple(
+        arch for name in ("sm_121a", "sm_121f") if (arch := getattr(Arch, name, None)) is not None
+    )
+    if not sm_121_archs:
+        return
+
+    admissible_archs = list(getattr(fp8_op, "admissible_archs", ()))
+    for arch in sm_121_archs:
+        if arch not in admissible_archs:
+            admissible_archs.append(arch)
+    fp8_op.admissible_archs = admissible_archs
+    fp8_op._b12x_sm121a_patch = True
+
+
+def _patch_cutlass_sm121_smem_capacity() -> None:
+    try:
+        from cutlass.utils import smem_allocator
+    except Exception:
+        return
+
+    capacity_map = getattr(smem_allocator, "SMEM_CAPACITY_MAP", None)
+    if not isinstance(capacity_map, dict):
+        return
+    if "sm_121" not in capacity_map and "sm_120" in capacity_map:
+        capacity_map["sm_121"] = capacity_map["sm_120"]
+
+
 def apply_cutlass_runtime_patches() -> None:
     global _PATCHED
     if _PATCHED:
@@ -577,4 +617,6 @@ def apply_cutlass_runtime_patches() -> None:
     BaseDSL.print_warning_once = patched_print_warning_once
     CompileCallable._compile = patched_compile
     _patch_cutlass_sm120_blockscaled_arch_check()
+    _patch_cutlass_sm121_tcgen05_fp8_arch_check()
+    _patch_cutlass_sm121_smem_capacity()
     _PATCHED = True

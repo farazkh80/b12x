@@ -1,0 +1,56 @@
+# AVO hooks + background agents for autonomous b12x kernel optimization.
+# Schema: avo/agent/hooks/config.py (events in agent/hooks/types.py).
+# Loaded by AVO at startup with priority:
+#   .n3/hooks.yaml  (this file, project-local, gitignored)
+#   .n3/hooks.project.yaml  (project, committed)
+#   ~/.n3/hooks.yaml  (user global)
+#
+# YOLO mode: NO blocking hooks. The only hook is a background, observational
+# workflow monitor that writes alerts to a file but cannot stop the agent.
+version: "1"
+
+hooks:
+  # Background-only workflow monitor — observation, not enforcement.
+  # background:true makes it fire-and-forget; it cannot block the main loop
+  # even if it wants to. Worst case it writes .n3/workflow-alert.md.
+  PostTurn:
+    - matcher: "*"
+      description: "Workflow monitor (observational, non-blocking)"
+      hooks:
+        - type: agent
+          background: true
+          model: claude-haiku-4-5
+          timeout: 120
+          tools: [read, grep]
+          prompt: |
+            You are an observational Workflow Monitor for the b12x FP8 dense
+            GEMM optimization loop. You CANNOT block anything; you only
+            observe and write notes.
+            1. Read .n3/TASK.md, .n3/FP8_DENSE_GEMM_BRIEF.md, and the most
+               recent .n3/runs/v*/verify_fp8.json files.
+            2. If the loop appears to violate version discipline (claiming
+               gains without a backing JSON, re-basing on a failed version,
+               or skipping the correctness gate), append a short note to
+               .n3/workflow-alert.md. Otherwise output only: [OK].
+            Be conservative — only note CLEAR deviations. Never set
+            decision=block; always passthrough.
+
+# Background agents — the autonomous-loop engine.
+# session_memory keeps .n3/CLAUDE.md current.
+# task_planner emits the next prompt each turn (or NO_TASK to stop).
+background_agents:
+  session_memory:
+    enabled: true
+    model: claude-sonnet-4-6
+    trigger:
+      min_new_tokens: 5000
+      min_interval_seconds: 60
+      max_interval_seconds: 300
+      min_messages: 4
+
+  task_planner:
+    enabled: true
+    model: ""              # auto-select; sonnet-4-6 if main is sonnet/opus
+    max_iterations: 200    # safety cap; raise after first end-to-end run
+    wait_timeout: 1200     # seconds to wait for a long-running iteration
+

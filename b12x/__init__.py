@@ -1,6 +1,9 @@
 """Public b12x package surface."""
 
 from .cute.runtime_patches import apply_cutlass_runtime_patches
+
+apply_cutlass_runtime_patches()
+
 from .runtime_control import (
     KernelResolutionFrozenError,
     compilation_frozen,
@@ -10,14 +13,11 @@ from .runtime_control import (
     unfreeze_compilation,
     unfreeze_kernel_resolution,
 )
-from . import cute, gemm, integration
-
-apply_cutlass_runtime_patches()
+from . import cute, gemm
 
 __all__ = [
     "cute",
     "gemm",
-    "integration",
     "KernelResolutionFrozenError",
     "compilation_frozen",
     "freeze_compilation",
