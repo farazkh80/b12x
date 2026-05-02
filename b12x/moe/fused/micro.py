@@ -782,9 +782,13 @@ class MoEMicroKernelBackend:
         if cutlass.const_expr(self.m_const == 1):
             m1_epoch0 = ld_global_acquire_i32(get_ptr_as_int64(barrier_epoch, Int32(0)))
 
-        smem_xh_ptr = cute.arch.alloc_smem(Uint32, 2 * cfg.smem_xh_size)
+        if cutlass.const_expr(cfg.k_segments == 2):
+            smem_xh_ptr = cute.arch.alloc_smem(Uint32, 2 * cfg.smem_xh_size)
+            smem_xh = cute.make_tensor(smem_xh_ptr, cute.make_layout(2 * cfg.smem_xh_size))
+        else:
+            smem_xh_ptr = cute.arch.alloc_smem(Uint32, cfg.smem_xh_size)
+            smem_xh = cute.make_tensor(smem_xh_ptr, cute.make_layout(cfg.smem_xh_size))
         smem_int_ptr = cute.arch.alloc_smem(Float32, cfg.i_chunk)
-        smem_xh = cute.make_tensor(smem_xh_ptr, cute.make_layout(2 * cfg.smem_xh_size))
         smem_int = cute.make_tensor(smem_int_ptr, cute.make_layout(cfg.i_chunk))
 
         warp_id = tidx // Int32(32)
@@ -797,43 +801,43 @@ class MoEMicroKernelBackend:
         # ===================================================================
         fc1_task_count = Int32(self.m_const * cfg.num_topk * cfg.fc1_chunks)
         fc1_task = Int32(bidx_x)
-        buf_idx = Int32(0)
-
-        # Pre-loop: quantize first task into buf[0]
-        if fc1_task < fc1_task_count:
-            route_idx_0 = fc1_task // Int32(cfg.fc1_chunks)
-            chunk_idx_0 = fc1_task - route_idx_0 * Int32(cfg.fc1_chunks)
-            t0 = route_idx_0 // Int32(cfg.num_topk)
-            eid_addr_0 = t0 * Int32(cfg.num_topk) + (route_idx_0 - t0 * Int32(cfg.num_topk))
-            gs_fc1_0 = input_gs[Int32(topk_ids[eid_addr_0])]
-            if tidx < Int32(cfg.k_dim // _BLOCK_SIZE):
-                in_blk = tidx
-                x_base = t0 * Int32(cfg.k_dim) + in_blk * Int32(_BLOCK_SIZE)
-                pad_off = in_blk // Int32(8)
-                phys_base = in_blk * Int32(_BLOCK_SIZE // 2) + pad_off
-                blk_peak = Float32(0.0)
-                for i in cutlass.range_constexpr(_BLOCK_SIZE):
-                    v = Float32(a_input[x_base + Int32(i)])
-                    abs_v = v
-                    if v < Float32(0.0):
-                        abs_v = -v
-                    if abs_v > blk_peak:
-                        blk_peak = abs_v
-                q_scale = blk_peak / (Float32(6.0) * gs_fc1_0)
-                if q_scale > Float32(_FP8_E4M3_MAX):
-                    q_scale = Float32(_FP8_E4M3_MAX)
-                sf_val = cvt_e4m3_to_f32_via_f16(cvt_f32_to_e4m3(q_scale))
-                eff_scale = sf_val * gs_fc1_0
-                if eff_scale < Float32(1e-30):
-                    eff_scale = Float32(1e-30)
-                inv_eff = Float32(1.0) / eff_scale
-                for i in cutlass.range_constexpr(_BLOCK_SIZE // 2):
-                    v0 = Float32(a_input[x_base + Int32(i * 2)])
-                    v1 = Float32(a_input[x_base + Int32(i * 2 + 1)])
-                    f0, f1 = quant_dequant_2(v0, v1, sf_val, inv_eff)
-                    smem_xh[phys_base + Int32(i)] = pack_f32x2_to_f16x2(f0, f1)
-            cute.arch.sync_threads()
-
+        if cutlass.const_expr(cfg.k_segments == 2):
+            buf_idx = Int32(0)
+            # Pre-loop: quantize first task into buf[0]
+            if fc1_task < fc1_task_count:
+                route_idx_0 = fc1_task // Int32(cfg.fc1_chunks)
+                t0 = route_idx_0 // Int32(cfg.num_topk)
+                eid_addr_0 = t0 * Int32(cfg.num_topk) + (route_idx_0 - t0 * Int32(cfg.num_topk))
+                gs_fc1_0 = input_gs[Int32(topk_ids[eid_addr_0])]
+                if tidx < Int32(cfg.k_dim // _BLOCK_SIZE):
+                    in_blk = tidx
+                    x_base = t0 * Int32(cfg.k_dim) + in_blk * Int32(_BLOCK_SIZE)
+                    pad_off = in_blk // Int32(8)
+                    phys_base = in_blk * Int32(_BLOCK_SIZE // 2) + pad_off
+                    blk_peak = Float32(0.0)
+                    for i in cutlass.range_constexpr(_BLOCK_SIZE):
+                        v = Float32(a_input[x_base + Int32(i)])
+                        abs_v = v
+                        if v < Float32(0.0):
+                            abs_v = -v
+                        if abs_v > blk_peak:
+                            blk_peak = abs_v
+                    q_scale = blk_peak / (Float32(6.0) * gs_fc1_0)
+                    if q_scale > Float32(_FP8_E4M3_MAX):
+                        q_scale = Float32(_FP8_E4M3_MAX)
+                    sf_val = cvt_e4m3_to_f32_via_f16(cvt_f32_to_e4m3(q_scale))
+                    eff_scale = sf_val * gs_fc1_0
+                    if eff_scale < Float32(1e-30):
+                        eff_scale = Float32(1e-30)
+                    inv_eff = Float32(1.0) / eff_scale
+                    for i in cutlass.range_constexpr(_BLOCK_SIZE // 2):
+                        v0 = Float32(a_input[x_base + Int32(i * 2)])
+                        v1 = Float32(a_input[x_base + Int32(i * 2 + 1)])
+                        f0, f1 = quant_dequant_2(v0, v1, sf_val, inv_eff)
+                        smem_xh[phys_base + Int32(i)] = pack_f32x2_to_f16x2(f0, f1)
+                cute.arch.sync_threads()
+        else:
+            prev_t = Int32(-1)
         while fc1_task < fc1_task_count:
             route_idx = fc1_task // Int32(cfg.fc1_chunks)
             chunk_idx = fc1_task - route_idx * Int32(cfg.fc1_chunks)
@@ -847,11 +851,49 @@ class MoEMicroKernelBackend:
             gs_fc1 = input_gs[eid]
             gs_fc2 = down_input_scale[eid]
 
+            # ---- Input quantization ----
+            if cutlass.const_expr(cfg.k_segments == 8):
+                need_quant = Int32(1)
+                if cutlass.const_expr(self.share_input_across_experts):
+                    need_quant = Int32(1) if t != prev_t else Int32(0)
+                if need_quant > Int32(0):
+                    if tidx < Int32(cfg.k_dim // _BLOCK_SIZE):
+                        in_blk = tidx
+                        x_base = t * Int32(cfg.k_dim) + in_blk * Int32(_BLOCK_SIZE)
+                        pad_off = in_blk // Int32(8)
+                        phys_base = in_blk * Int32(_BLOCK_SIZE // 2) + pad_off
+                        blk_peak = Float32(0.0)
+                        for i in cutlass.range_constexpr(_BLOCK_SIZE):
+                            v = Float32(a_input[x_base + Int32(i)])
+                            abs_v = v
+                            if v < Float32(0.0):
+                                abs_v = -v
+                            if abs_v > blk_peak:
+                                blk_peak = abs_v
+                        q_scale = blk_peak / (Float32(6.0) * gs_fc1)
+                        if q_scale > Float32(_FP8_E4M3_MAX):
+                            q_scale = Float32(_FP8_E4M3_MAX)
+                        sf_val = cvt_e4m3_to_f32_via_f16(cvt_f32_to_e4m3(q_scale))
+                        eff_scale = sf_val * gs_fc1
+                        if eff_scale < Float32(1e-30):
+                            eff_scale = Float32(1e-30)
+                        inv_eff = Float32(1.0) / eff_scale
+                        for i in cutlass.range_constexpr(_BLOCK_SIZE // 2):
+                            v0 = Float32(a_input[x_base + Int32(i * 2)])
+                            v1 = Float32(a_input[x_base + Int32(i * 2 + 1)])
+                            f0, f1 = quant_dequant_2(v0, v1, sf_val, inv_eff)
+                            smem_xh[phys_base + Int32(i)] = pack_f32x2_to_f16x2(f0, f1)
+                    if cutlass.const_expr(self.share_input_across_experts):
+                        prev_t = t
+                cute.arch.sync_threads()
+
             # ---- FC1 weight load + dot product ----
-            xh_buf_base = buf_idx * Int32(cfg.smem_xh_size)
             ebase_w = Int64(eid) * Int64(cfg.two_n) * Int64(cfg.k_half)
             ebase_sf = Int64(eid) * Int64(cfg.w1_sf_rows * cfg.w1_sf_cols)
             thread_byte_off = Int64(lane) * Int64(cfg.k_half // 32)
+            xh_buf_base = Int32(0)
+            if cutlass.const_expr(cfg.k_segments == 2):
+                xh_buf_base = buf_idx * Int32(cfg.smem_xh_size)
             xh_base_t = xh_buf_base + lane * Int32(cfg.smem_xh_stride)
 
             for r_iter in cutlass.range_constexpr(cfg.rows_per_warp_fc1):
@@ -912,41 +954,33 @@ class MoEMicroKernelBackend:
                             sf_g7 * _block_dot_hfma2(gw_d2, gw_d3, smem_xh, xh_base_t + Int32(56))
                         )
                     elif cutlass.const_expr(self.is_gated):
-                        dot_u0a, dot_g0a = _block_dot4_pair(uw_a0, gw_a0, smem_xh, xh_base_t + Int32(0))
-                        dot_u0b, dot_g0b = _block_dot4_pair(uw_a1, gw_a1, smem_xh, xh_base_t + Int32(4))
-                        dot_u1a, dot_g1a = _block_dot4_pair(uw_a2, gw_a2, smem_xh, xh_base_t + Int32(8))
-                        dot_u1b, dot_g1b = _block_dot4_pair(uw_a3, gw_a3, smem_xh, xh_base_t + Int32(12))
-                        dot_u2a, dot_g2a = _block_dot4_pair(uw_b0, gw_b0, smem_xh, xh_base_t + Int32(16))
-                        dot_u2b, dot_g2b = _block_dot4_pair(uw_b1, gw_b1, smem_xh, xh_base_t + Int32(20))
-                        dot_u3a, dot_g3a = _block_dot4_pair(uw_b2, gw_b2, smem_xh, xh_base_t + Int32(24))
-                        dot_u3b, dot_g3b = _block_dot4_pair(uw_b3, gw_b3, smem_xh, xh_base_t + Int32(28))
-                        dot_u4a, dot_g4a = _block_dot4_pair(uw_c0, gw_c0, smem_xh, xh_base_t + Int32(32))
-                        dot_u4b, dot_g4b = _block_dot4_pair(uw_c1, gw_c1, smem_xh, xh_base_t + Int32(36))
-                        dot_u5a, dot_g5a = _block_dot4_pair(uw_c2, gw_c2, smem_xh, xh_base_t + Int32(40))
-                        dot_u5b, dot_g5b = _block_dot4_pair(uw_c3, gw_c3, smem_xh, xh_base_t + Int32(44))
-                        dot_u6a, dot_g6a = _block_dot4_pair(uw_d0, gw_d0, smem_xh, xh_base_t + Int32(48))
-                        dot_u6b, dot_g6b = _block_dot4_pair(uw_d1, gw_d1, smem_xh, xh_base_t + Int32(52))
-                        dot_u7a, dot_g7a = _block_dot4_pair(uw_d2, gw_d2, smem_xh, xh_base_t + Int32(56))
-                        dot_u7b, dot_g7b = _block_dot4_pair(uw_d3, gw_d3, smem_xh, xh_base_t + Int32(60))
+                        dot_u0, dot_g0 = _block_dot_hfma2_pair(uw_a0, uw_a1, gw_a0, gw_a1, smem_xh, xh_base_t + Int32(0))
+                        dot_u1, dot_g1 = _block_dot_hfma2_pair(uw_a2, uw_a3, gw_a2, gw_a3, smem_xh, xh_base_t + Int32(8))
+                        dot_u2, dot_g2 = _block_dot_hfma2_pair(uw_b0, uw_b1, gw_b0, gw_b1, smem_xh, xh_base_t + Int32(16))
+                        dot_u3, dot_g3 = _block_dot_hfma2_pair(uw_b2, uw_b3, gw_b2, gw_b3, smem_xh, xh_base_t + Int32(24))
+                        dot_u4, dot_g4 = _block_dot_hfma2_pair(uw_c0, uw_c1, gw_c0, gw_c1, smem_xh, xh_base_t + Int32(32))
+                        dot_u5, dot_g5 = _block_dot_hfma2_pair(uw_c2, uw_c3, gw_c2, gw_c3, smem_xh, xh_base_t + Int32(40))
+                        dot_u6, dot_g6 = _block_dot_hfma2_pair(uw_d0, uw_d1, gw_d0, gw_d1, smem_xh, xh_base_t + Int32(48))
+                        dot_u7, dot_g7 = _block_dot_hfma2_pair(uw_d2, uw_d3, gw_d2, gw_d3, smem_xh, xh_base_t + Int32(56))
                         partial_up = (
-                            sf_u0 * (dot_u0a + dot_u0b) +
-                            sf_u1 * (dot_u1a + dot_u1b) +
-                            sf_u2 * (dot_u2a + dot_u2b) +
-                            sf_u3 * (dot_u3a + dot_u3b) +
-                            sf_u4 * (dot_u4a + dot_u4b) +
-                            sf_u5 * (dot_u5a + dot_u5b) +
-                            sf_u6 * (dot_u6a + dot_u6b) +
-                            sf_u7 * (dot_u7a + dot_u7b)
+                            sf_u0 * dot_u0 +
+                            sf_u1 * dot_u1 +
+                            sf_u2 * dot_u2 +
+                            sf_u3 * dot_u3 +
+                            sf_u4 * dot_u4 +
+                            sf_u5 * dot_u5 +
+                            sf_u6 * dot_u6 +
+                            sf_u7 * dot_u7
                         )
                         partial_gate = (
-                            sf_g0 * (dot_g0a + dot_g0b) +
-                            sf_g1 * (dot_g1a + dot_g1b) +
-                            sf_g2 * (dot_g2a + dot_g2b) +
-                            sf_g3 * (dot_g3a + dot_g3b) +
-                            sf_g4 * (dot_g4a + dot_g4b) +
-                            sf_g5 * (dot_g5a + dot_g5b) +
-                            sf_g6 * (dot_g6a + dot_g6b) +
-                            sf_g7 * (dot_g7a + dot_g7b)
+                            sf_g0 * dot_g0 +
+                            sf_g1 * dot_g1 +
+                            sf_g2 * dot_g2 +
+                            sf_g3 * dot_g3 +
+                            sf_g4 * dot_g4 +
+                            sf_g5 * dot_g5 +
+                            sf_g6 * dot_g6 +
+                            sf_g7 * dot_g7
                         )
                 elif cutlass.const_expr(cfg.k_segments == 2):
                     if cutlass.const_expr(self.is_gated):
@@ -981,82 +1015,6 @@ class MoEMicroKernelBackend:
                         dot_u1b, dot_g1b = _block_dot4_pair(uw_a3, gw_a3, smem_xh, xh_base1 + Int32(4))
                         partial_up = sf_u0 * (dot_u0a + dot_u0b) + sf_u1 * (dot_u1a + dot_u1b)
                         partial_gate = sf_g0 * (dot_g0a + dot_g0b) + sf_g1 * (dot_g1a + dot_g1b)
-                else:
-                    partial_gate = Float32(0.0)
-                    if cutlass.const_expr(self.is_gated):
-                        partial_up = Float32(0.0)
-                    for seg_group in cutlass.range_constexpr(cfg.k_segments // 4):
-                        group_byte_off = Int64(seg_group * 32)
-                        uw_a0, uw_a1, uw_a2, uw_a3 = ld_global_nc_v4_u32(up_byte_addr + group_byte_off)
-                        uw_b0, uw_b1, uw_b2, uw_b3 = ld_global_nc_v4_u32(up_byte_addr + group_byte_off + Int64(16))
-                        gw_a0, gw_a1, gw_a2, gw_a3 = ld_global_nc_v4_u32(gate_byte_addr + group_byte_off)
-                        gw_b0, gw_b1, gw_b2, gw_b3 = ld_global_nc_v4_u32(gate_byte_addr + group_byte_off + Int64(16))
-
-                        bsf_group_off = col_blk_off + Int64(seg_group * 512)
-                        sf_u0, sf_u1, sf_u2, sf_u3 = cvt_e4m3x4_to_f32x4(
-                            ld_global_nc_u32(w1s_base_addr + ebase_sf + bsf_base_u + bsf_group_off)
-                        )
-                        sf_g0, sf_g1, sf_g2, sf_g3 = cvt_e4m3x4_to_f32x4(
-                            ld_global_nc_u32(w1s_base_addr + ebase_sf + bsf_base_g + bsf_group_off)
-                        )
-
-                        seg_blk0 = lane * Int32(cfg.k_segments) + Int32(seg_group * 4)
-                        seg_blk1 = seg_blk0 + Int32(1)
-                        seg_blk2 = seg_blk0 + Int32(2)
-                        seg_blk3 = seg_blk0 + Int32(3)
-                        xh_base0 = xh_buf_base + seg_blk0 * Int32(8) + seg_blk0 // Int32(8)
-                        xh_base1 = xh_buf_base + seg_blk1 * Int32(8) + seg_blk1 // Int32(8)
-                        xh_base2 = xh_buf_base + seg_blk2 * Int32(8) + seg_blk2 // Int32(8)
-                        xh_base3 = xh_buf_base + seg_blk3 * Int32(8) + seg_blk3 // Int32(8)
-
-                        if cutlass.const_expr(self.is_gated):
-                            dot_u0a, dot_g0a = _block_dot4_pair(uw_a0, gw_a0, smem_xh, xh_base0)
-                            dot_u0b, dot_g0b = _block_dot4_pair(uw_a1, gw_a1, smem_xh, xh_base0 + Int32(4))
-                            dot_u1a, dot_g1a = _block_dot4_pair(uw_a2, gw_a2, smem_xh, xh_base1)
-                            dot_u1b, dot_g1b = _block_dot4_pair(uw_a3, gw_a3, smem_xh, xh_base1 + Int32(4))
-                            dot_u2a, dot_g2a = _block_dot4_pair(uw_b0, gw_b0, smem_xh, xh_base2)
-                            dot_u2b, dot_g2b = _block_dot4_pair(uw_b1, gw_b1, smem_xh, xh_base2 + Int32(4))
-                            dot_u3a, dot_g3a = _block_dot4_pair(uw_b2, gw_b2, smem_xh, xh_base3)
-                            dot_u3b, dot_g3b = _block_dot4_pair(uw_b3, gw_b3, smem_xh, xh_base3 + Int32(4))
-                            partial_up = partial_up + (
-                                sf_u0 * (dot_u0a + dot_u0b) +
-                                sf_u1 * (dot_u1a + dot_u1b) +
-                                sf_u2 * (dot_u2a + dot_u2b) +
-                                sf_u3 * (dot_u3a + dot_u3b)
-                            )
-                            partial_gate = partial_gate + (
-                                sf_g0 * (dot_g0a + dot_g0b) +
-                                sf_g1 * (dot_g1a + dot_g1b) +
-                                sf_g2 * (dot_g2a + dot_g2b) +
-                                sf_g3 * (dot_g3a + dot_g3b)
-                            )
-                    else:
-                        for seg_group in cutlass.range_constexpr(cfg.k_segments // 4):
-                            group_byte_off = Int64(seg_group * 32)
-                            gw_a0, gw_a1, gw_a2, gw_a3 = ld_global_nc_v4_u32(gate_byte_addr + group_byte_off)
-                            gw_b0, gw_b1, gw_b2, gw_b3 = ld_global_nc_v4_u32(gate_byte_addr + group_byte_off + Int64(16))
-
-                            bsf_group_off = col_blk_off + Int64(seg_group * 512)
-                            sf_g0, sf_g1, sf_g2, sf_g3 = cvt_e4m3x4_to_f32x4(
-                                ld_global_nc_u32(w1s_base_addr + ebase_sf + bsf_base_g + bsf_group_off)
-                            )
-
-                            seg_blk0 = lane * Int32(cfg.k_segments) + Int32(seg_group * 4)
-                            seg_blk1 = seg_blk0 + Int32(1)
-                            seg_blk2 = seg_blk0 + Int32(2)
-                            seg_blk3 = seg_blk0 + Int32(3)
-                            xh_base0 = xh_buf_base + seg_blk0 * Int32(8) + seg_blk0 // Int32(8)
-                            xh_base1 = xh_buf_base + seg_blk1 * Int32(8) + seg_blk1 // Int32(8)
-                            xh_base2 = xh_buf_base + seg_blk2 * Int32(8) + seg_blk2 // Int32(8)
-                            xh_base3 = xh_buf_base + seg_blk3 * Int32(8) + seg_blk3 // Int32(8)
-
-                            partial_gate = partial_gate + (
-                                sf_g0 * _block_dot_hfma2(gw_a0, gw_a1, smem_xh, xh_base0) +
-                                sf_g1 * _block_dot_hfma2(gw_a2, gw_a3, smem_xh, xh_base1) +
-                                sf_g2 * _block_dot_hfma2(gw_b0, gw_b1, smem_xh, xh_base2) +
-                                sf_g3 * _block_dot_hfma2(gw_b2, gw_b3, smem_xh, xh_base3)
-                            )
-
                 # ---- Activation + intermediate quant ----
                 gate_red = cute.arch.warp_reduction_sum(partial_gate) * alpha_fc1
                 if cutlass.const_expr(self.is_gated):
@@ -1070,47 +1028,48 @@ class MoEMicroKernelBackend:
                         activated = relu_val * relu_val
                     smem_int[i_local] = activated
 
-            # Look-ahead: quantize next task into other buffer
-            next_task = fc1_task + Int32(gdim_x)
-            need_quant_next = Int32(0)
-            t_next = t
-            next_route = route_idx
-            if next_task < fc1_task_count:
-                next_route = next_task // Int32(cfg.fc1_chunks)
-                t_next = next_route // Int32(cfg.num_topk)
-                need_quant_next = Int32(1)
-                if cutlass.const_expr(self.share_input_across_experts):
-                    need_quant_next = Int32(1) if t_next != t else Int32(0)
-            if need_quant_next > Int32(0):
-                next_eid_addr = t_next * Int32(cfg.num_topk) + (next_route - t_next * Int32(cfg.num_topk))
-                gs_fc1_next = input_gs[Int32(topk_ids[next_eid_addr])]
-                next_buf_base = (Int32(1) - buf_idx) * Int32(cfg.smem_xh_size)
-                if tidx < Int32(cfg.k_dim // _BLOCK_SIZE):
-                    in_blk = tidx
-                    x_base = t_next * Int32(cfg.k_dim) + in_blk * Int32(_BLOCK_SIZE)
-                    pad_off = in_blk // Int32(8)
-                    phys_base = in_blk * Int32(_BLOCK_SIZE // 2) + pad_off
-                    blk_peak = Float32(0.0)
-                    for i in cutlass.range_constexpr(_BLOCK_SIZE):
-                        v = Float32(a_input[x_base + Int32(i)])
-                        abs_v = v
-                        if v < Float32(0.0):
-                            abs_v = -v
-                        if abs_v > blk_peak:
-                            blk_peak = abs_v
-                    q_scale = blk_peak / (Float32(6.0) * gs_fc1_next)
-                    if q_scale > Float32(_FP8_E4M3_MAX):
-                        q_scale = Float32(_FP8_E4M3_MAX)
-                    sf_val = cvt_e4m3_to_f32_via_f16(cvt_f32_to_e4m3(q_scale))
-                    eff_scale = sf_val * gs_fc1_next
-                    if eff_scale < Float32(1e-30):
-                        eff_scale = Float32(1e-30)
-                    inv_eff = Float32(1.0) / eff_scale
-                    for i in cutlass.range_constexpr(_BLOCK_SIZE // 2):
-                        v0 = Float32(a_input[x_base + Int32(i * 2)])
-                        v1 = Float32(a_input[x_base + Int32(i * 2 + 1)])
-                        f0, f1 = quant_dequant_2(v0, v1, sf_val, inv_eff)
-                        smem_xh[next_buf_base + phys_base + Int32(i)] = pack_f32x2_to_f16x2(f0, f1)
+            # Look-ahead: quantize next task into other buffer (k_segments==2 only)
+            if cutlass.const_expr(cfg.k_segments == 2):
+                next_task = fc1_task + Int32(gdim_x)
+                need_quant_next = Int32(0)
+                t_next = t
+                next_route = route_idx
+                if next_task < fc1_task_count:
+                    next_route = next_task // Int32(cfg.fc1_chunks)
+                    t_next = next_route // Int32(cfg.num_topk)
+                    need_quant_next = Int32(1)
+                    if cutlass.const_expr(self.share_input_across_experts):
+                        need_quant_next = Int32(1) if t_next != t else Int32(0)
+                if need_quant_next > Int32(0):
+                    next_eid_addr = t_next * Int32(cfg.num_topk) + (next_route - t_next * Int32(cfg.num_topk))
+                    gs_fc1_next = input_gs[Int32(topk_ids[next_eid_addr])]
+                    next_buf_base = (Int32(1) - buf_idx) * Int32(cfg.smem_xh_size)
+                    if tidx < Int32(cfg.k_dim // _BLOCK_SIZE):
+                        in_blk = tidx
+                        x_base = t_next * Int32(cfg.k_dim) + in_blk * Int32(_BLOCK_SIZE)
+                        pad_off = in_blk // Int32(8)
+                        phys_base = in_blk * Int32(_BLOCK_SIZE // 2) + pad_off
+                        blk_peak = Float32(0.0)
+                        for i in cutlass.range_constexpr(_BLOCK_SIZE):
+                            v = Float32(a_input[x_base + Int32(i)])
+                            abs_v = v
+                            if v < Float32(0.0):
+                                abs_v = -v
+                            if abs_v > blk_peak:
+                                blk_peak = abs_v
+                        q_scale = blk_peak / (Float32(6.0) * gs_fc1_next)
+                        if q_scale > Float32(_FP8_E4M3_MAX):
+                            q_scale = Float32(_FP8_E4M3_MAX)
+                        sf_val = cvt_e4m3_to_f32_via_f16(cvt_f32_to_e4m3(q_scale))
+                        eff_scale = sf_val * gs_fc1_next
+                        if eff_scale < Float32(1e-30):
+                            eff_scale = Float32(1e-30)
+                        inv_eff = Float32(1.0) / eff_scale
+                        for i in cutlass.range_constexpr(_BLOCK_SIZE // 2):
+                            v0 = Float32(a_input[x_base + Int32(i * 2)])
+                            v1 = Float32(a_input[x_base + Int32(i * 2 + 1)])
+                            f0, f1 = quant_dequant_2(v0, v1, sf_val, inv_eff)
+                            smem_xh[next_buf_base + phys_base + Int32(i)] = pack_f32x2_to_f16x2(f0, f1)
 
             cute.arch.sync_threads()
 
@@ -1150,8 +1109,9 @@ class MoEMicroKernelBackend:
                     intermediate[packed_idx] = pack_f32x2_to_f16x2(f0, f1)
 
             cute.arch.sync_threads()
-            if need_quant_next > Int32(0):
-                buf_idx = Int32(1) - buf_idx
+            if cutlass.const_expr(cfg.k_segments == 2):
+                if need_quant_next > Int32(0):
+                    buf_idx = Int32(1) - buf_idx
             fc1_task += Int32(gdim_x)
 
         if cutlass.const_expr(self.m_const == 1):

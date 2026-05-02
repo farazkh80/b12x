@@ -362,7 +362,8 @@ def _load_config(model_path: pathlib.Path) -> dict:
     return raw_cfg.get("text_config", raw_cfg)
 
 
-def build_model_spec(model_path: pathlib.Path, profile: ModelProfile) -> ModelSpec:
+def build_model_spec(model_path: pathlib.Path, profile: ModelProfile, *, tp_size_override: int | None = None, tp_rank: int = 0) -> ModelSpec:
+    tp = tp_size_override if tp_size_override is not None else profile.tp_size
     cfg = _load_config(model_path)
     if profile.checkpoint_family == "qwen":
         return ModelSpec(
@@ -370,8 +371,8 @@ def build_model_spec(model_path: pathlib.Path, profile: ModelProfile) -> ModelSp
             intermediate_size=cfg["moe_intermediate_size"],
             num_experts=cfg["num_experts"],
             top_k=cfg["num_experts_per_tok"],
-            tp_size=profile.tp_size,
-            tp_rank=0,
+            tp_size=tp,
+            tp_rank=tp_rank,
         )
     if profile.checkpoint_family == "glm":
         return ModelSpec(
@@ -379,21 +380,24 @@ def build_model_spec(model_path: pathlib.Path, profile: ModelProfile) -> ModelSp
             intermediate_size=cfg["moe_intermediate_size"],
             num_experts=cfg["n_routed_experts"],
             top_k=cfg["num_experts_per_tok"],
-            tp_size=profile.tp_size,
-            tp_rank=0,
+            tp_size=tp,
+            tp_rank=tp_rank,
         )
     if profile.checkpoint_family == "nemotron":
         if cfg["hidden_size"] % TP_SIZE != 0:
             raise ValueError(
                 f"expected hidden_size {cfg['hidden_size']} to be divisible by {TP_SIZE} for Nemotron local shard"
             )
+        # Nemotron expert tensors are stored for one hidden TP shard. The
+        # benchmark --tp-size controls how the intermediate dimension is sliced,
+        # not the hidden width loaded from each checkpoint shard.
         return ModelSpec(
             hidden_size=cfg["hidden_size"] // TP_SIZE,
             intermediate_size=cfg["moe_intermediate_size"],
             num_experts=cfg["n_routed_experts"],
             top_k=cfg["num_experts_per_tok"],
-            tp_size=profile.tp_size,
-            tp_rank=0,
+            tp_size=tp,
+            tp_rank=tp_rank,
         )
     raise ValueError(f"unsupported checkpoint family {profile.checkpoint_family!r}")
 
@@ -504,13 +508,23 @@ def load_expert_weights(
         print(f"  Loading {E} experts...", end="", flush=True)
         for eid in range(E):
             ep = f"{prefix}.{eid}"
-            up_w[eid] = loader.get_tensor(f"{ep}.up_proj.weight").to(device)
-            up_sf[eid] = loader.get_tensor(f"{ep}.up_proj.weight_scale").to(device)
+            tp_off = spec.tp_rank * I_tp
+            tp_off_packed = spec.tp_rank * (I_tp // 2)
+            tp_sf_cols = I_tp // 16
+            tp_sf_off = spec.tp_rank * tp_sf_cols
+
+            if spec.tp_size > 1:
+                up_w[eid] = loader.get_tensor(f"{ep}.up_proj.weight").narrow(0, tp_off, I_tp).to(device)
+                up_sf[eid] = loader.get_tensor(f"{ep}.up_proj.weight_scale").narrow(0, tp_off, I_tp).to(device)
+                down_w[eid] = loader.get_tensor(f"{ep}.down_proj.weight").narrow(1, tp_off_packed, I_tp // 2).to(device)
+                down_sf[eid] = loader.get_tensor(f"{ep}.down_proj.weight_scale").narrow(1, tp_sf_off, tp_sf_cols).to(device)
+            else:
+                up_w[eid] = loader.get_tensor(f"{ep}.up_proj.weight").to(device)
+                up_sf[eid] = loader.get_tensor(f"{ep}.up_proj.weight_scale").to(device)
+                down_w[eid] = loader.get_tensor(f"{ep}.down_proj.weight").to(device)
+                down_sf[eid] = loader.get_tensor(f"{ep}.down_proj.weight_scale").to(device)
             up_gs[eid] = loader.get_tensor(f"{ep}.up_proj.weight_scale_2").to(device)
             up_is[eid] = loader.get_tensor(f"{ep}.up_proj.input_scale").to(device)
-
-            down_w[eid] = loader.get_tensor(f"{ep}.down_proj.weight").to(device)
-            down_sf[eid] = loader.get_tensor(f"{ep}.down_proj.weight_scale").to(device)
             down_gs[eid] = loader.get_tensor(f"{ep}.down_proj.weight_scale_2").to(device)
             down_is[eid] = loader.get_tensor(f"{ep}.down_proj.input_scale").to(device)
         print(" done.")
@@ -1239,6 +1253,8 @@ def bench_e2e() -> None:
     parser.add_argument("--batch-size-profile", choices=sorted(BATCH_SIZE_PROFILES), default="micro")
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=None)
     parser.add_argument("--model-profile", choices=sorted(MODEL_PROFILES), default="qwen397b")
+    parser.add_argument("--tp-size", type=int, default=None, help="Override TP size from model profile")
+    parser.add_argument("--tp-parallel", action="store_true", help="Load all TP rank slices and replay per-rank CUDA graphs in parallel streams")
     parser.add_argument("--model-path", type=pathlib.Path, default=None)
     parser.add_argument("--layer-idx", type=int, default=None)
     parser.add_argument("--activation", choices=["silu", "relu2"], default="silu")
@@ -1313,7 +1329,7 @@ def bench_e2e() -> None:
     l2_flush = make_l2_flush_fn(enabled=args.flush_l2, bytes_hint=args.l2_flush_bytes)
     l2_flush_bytes = resolve_l2_flush_bytes(args.l2_flush_bytes) if args.flush_l2 else 0
 
-    spec = build_model_spec(model_path, model_profile)
+    spec = build_model_spec(model_path, model_profile, tp_size_override=args.tp_size)
     _validate_reference_case(args, spec, model_profile, batch_sizes)
 
     benchmark_scope = "Routing + MoE kernel" if args.include_routing else "Pre-routed MoE kernel only"
@@ -1392,6 +1408,34 @@ def bench_e2e() -> None:
     )
     torch.cuda.synchronize()
     print(" done.")
+
+    # ---- TP-parallel setup ----
+    tp_parallel_ranks: list[tuple[ModelSpec, ExpertWeights, ScaleContractParams]] = []
+    if args.tp_parallel and spec.tp_size > 1:
+        print(f"  Loading TP-parallel ranks...", end="", flush=True)
+        for r in range(spec.tp_size):
+            rspec = build_model_spec(model_path, model_profile, tp_size_override=args.tp_size, tp_rank=r)
+            rw = load_expert_weights(
+                model_path, rspec, layer_idx=layer_idx,
+                activation=args.activation, checkpoint_family=model_profile.checkpoint_family,
+            )
+            rp = get_scale_contract_params(rw, args.scale_contract)
+            tp_parallel_ranks.append((rspec, rw, rp))
+        # Warm up each rank's kernel
+        for r, (rspec, rw, rp) in enumerate(tp_parallel_ranks):
+            x_r = torch.randn(1, rspec.hidden_size, dtype=torch.bfloat16, device=device)
+            rk_warm = torch.randn(1, rspec.num_experts, dtype=torch.float32, device=device)
+            rk_logits, rk_ids = torch.topk(rk_warm, rspec.top_k, dim=-1)
+            rk_weights = torch.softmax(rk_logits, dim=-1)
+            ws_r = allocate_tp_moe_workspace_pool()
+            b12x_moe_fp4(
+                x_r, rp.a1_gscale, rw.w13_weight, rw.w13_blockscale_swizzled,
+                rp.g1_alphas, rp.a2_gscale, rw.w2_weight, rw.w2_blockscale_swizzled,
+                rp.g2_alphas, rk_weights, rk_ids,
+                workspace=ws_r, fast_math=args.fast_math, activation=args.activation,
+            )
+        torch.cuda.synchronize()
+        print(f" {spec.tp_size} ranks done.")
 
     backend_label = "b12x"
 
@@ -1658,6 +1702,71 @@ def bench_e2e() -> None:
                 ref_stats=ref_stats,
                 ratio_stats=ratio_nograph,
             )
+
+        # ---- TP-parallel graph replay ----
+        if tp_parallel_ranks:
+            tp_n = len(tp_parallel_ranks)
+            label = f"b12x TP={tp_n} parallel"
+            print(f"  {label} (CUDA graph):".ljust(28), end="", flush=True)
+            try:
+                # Per-rank inputs, outputs, workspaces
+                tp_x = [torch.randn(batch_size, rs.hidden_size, dtype=torch.bfloat16, device=device) for rs, _, _ in tp_parallel_ranks]
+                tp_routing = [torch.randn(batch_size, rs.num_experts, dtype=torch.float32, device=device) for rs, _, _ in tp_parallel_ranks]
+                tp_topk_ids: list[torch.Tensor] = []
+                tp_topk_weights: list[torch.Tensor] = []
+                for r_routing, (rspec, _, _) in zip(tp_routing, tp_parallel_ranks, strict=True):
+                    r_logits, r_ids = torch.topk(r_routing, rspec.top_k, dim=-1)
+                    tp_topk_ids.append(r_ids)
+                    tp_topk_weights.append(torch.softmax(r_logits, dim=-1))
+                tp_outputs = [torch.empty_like(tp_x[r]) for r in range(tp_n)]
+                tp_workspaces = [allocate_tp_moe_workspace_pool() for _ in range(tp_n)]
+                tp_streams = [torch.cuda.Stream() for _ in range(tp_n)]
+
+                def launch_tp_rank(r: int) -> None:
+                    _rspec, rw, rp = tp_parallel_ranks[r]
+                    b12x_moe_fp4(
+                        tp_x[r], rp.a1_gscale, rw.w13_weight, rw.w13_blockscale_swizzled,
+                        rp.g1_alphas, rp.a2_gscale, rw.w2_weight, rw.w2_blockscale_swizzled,
+                        rp.g2_alphas, tp_topk_weights[r], tp_topk_ids[r],
+                        workspace=tp_workspaces[r], output=tp_outputs[r],
+                        fast_math=args.fast_math, activation=args.activation,
+                    )
+
+                # Warm eager launches
+                for r, stream in enumerate(tp_streams):
+                    with torch.cuda.stream(stream):
+                        launch_tp_rank(r)
+                torch.cuda.synchronize()
+
+                # Capture each rank on its own stream. A single graph context only
+                # captures work issued to its active capture stream.
+                tp_graphs: list[torch.cuda.CUDAGraph] = []
+                for r, stream in enumerate(tp_streams):
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph, stream=stream, capture_error_mode="relaxed"):
+                        launch_tp_rank(r)
+                    tp_graphs.append(graph)
+                torch.cuda.synchronize()
+
+                def tp_replay(
+                    graphs: list[torch.cuda.CUDAGraph] = tp_graphs,
+                    streams: list[torch.cuda.Stream] = tp_streams,
+                ) -> None:
+                    timing_stream = torch.cuda.current_stream()
+                    for stream in streams:
+                        stream.wait_stream(timing_stream)
+                    for graph, stream in zip(graphs, streams, strict=True):
+                        with torch.cuda.stream(stream):
+                            graph.replay()
+                    for stream in streams:
+                        timing_stream.wait_stream(stream)
+
+                tp_times = bench_events(
+                    tp_replay, warmup=args.warmup, iters=args.iters, l2_flush=l2_flush,
+                )
+                print(f" {fmt_us(tp_times)}")
+            except Exception as exc:
+                print(f" FAILED ({type(exc).__name__}: {exc})")
 
     ratio_results = {
         batch_size: result.ratio_stats.median
