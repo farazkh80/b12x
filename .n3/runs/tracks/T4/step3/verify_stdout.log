@@ -1,0 +1,19 @@
+[spark] container 'avo-b12x-spark-fkhoubsirat' already running on p4242-0053
+{
+  "M": 32,
+  "K": 5376,
+  "N": 5376,
+  "baseline_eager_median_us": 183.26399475336075,
+  "baseline_graph_median_us": 185.71200221776962,
+  "b12x_inline_ptx_eager_us": 206.70399814844131,
+  "b12x_inline_ptx_graph_us": 207.15199410915375,
+  "b12x_inline_ptx_oracle": {
+    "max_abs": 0.016229629516601562,
+    "rmse": 0.0019359835423529148,
+    "cos": 0.9999985694885254,
+    "ref_norm_inf": 5.215929985046387,
+    "max_abs_limit": 0.052159299850463865,
+    "finite": true,
+    "passed": true
+  }
+}

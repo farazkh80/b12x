@@ -1,0 +1,3 @@
+# Track 2 Step 1 hypothesis
+
+The fastest way to de-risk the CUTLASS C++ track is to prove the SM120 unscaled FP8 atom builds and produces the same tile result as the existing inline-PTX path before introducing `CollectiveBuilder` or a full TMA mainloop. I will add a separate `fp8_dense_sm120_cute` extension that reuses the current shared-memory/register tiling but replaces the block-scaled `kind::mxf8f6f4` inline PTX with `cute::SM120_16x8x32_TN<cute::float_e4m3_t, cute::float_e4m3_t, float>::fma`, guarded by `CUTE_ARCH_F8F6F4_MMA_ENABLED`. This isolates the unscaled `kind::f8f6f4` atom and build/include path; if it cannot compile or match a single tile, Track 2 should stop early rather than spending steps on a full CUTLASS scheduler.

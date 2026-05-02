@@ -1,0 +1,6 @@
+{
+  "candidate": "cute_dsl_unscaled_inline_asm_nonstaged",
+  "status": "tests_passed",
+  "tests": "tests/test_fp8_dense_gemm.py",
+  "entries": []
+}

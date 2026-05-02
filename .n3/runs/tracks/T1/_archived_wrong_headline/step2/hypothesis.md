@@ -1,0 +1,3 @@
+# Track 1 Step 2 hypothesis
+
+Instead of implementing TMA immediately, add a specialized small-M decode path for `M < 16` in the CUDA extension. The profiler shows the current one-warp tile kernel is ~5x slower than cuBLASLt on native `M=16` and over 2x slower on headline `M=1` because it pads and launches many 16x32 CTAs with low tensor utilization; a row-vector dot-product kernel that maps one warp to one output element should remove the M-padding penalty and reduce shared-memory/ldmatrix overhead. This is the highest-information Track 1 tuning choice because the headline shape is decode `M=1`, and Step 3 can still use profiling to decide whether a wider CTA, vectorized K loop, or persistent N scheduling is worth pushing.

@@ -1,0 +1,3 @@
+# Track 1 Step 3 hypothesis
+
+Do not spend the final Track 1 step on another code mutation after Step 2 regressed. Instead, perform a stricter re-measure of the reverted inline-PTX kernel and compare it against the committed Step 0 baseline to close the track cleanly. The choice is justified by Step 1/2 data: the current kernel is fundamentally underutilized for the headline decode case, and the first plausible CTA-level change made it slower; a third blind mutation is less informative than confirming the no-change floor and documenting that Track 1 needs a different kernel shape (not just TMA/scheduler polish) for follow-up.

@@ -1,0 +1,119 @@
+{
+  "capability": [
+    12,
+    1
+  ],
+  "device": "NVIDIA GB10",
+  "entries": [
+    {
+      "K": 5376,
+      "M": 32,
+      "N": 5376,
+      "ab_dtype": "float8_e4m3fn",
+      "b12x_inline_ptx_eager": {
+        "iters": 1,
+        "max_us": 1644063.8427734375,
+        "mean_us": 1644063.8427734375,
+        "median_us": 1644063.8427734375,
+        "min_us": 1644063.8427734375,
+        "repeat_median_max_us": 1644063.8427734375,
+        "repeat_median_min_us": 1644063.8427734375,
+        "repeat_median_spread_pct": 0.0,
+        "repeat_medians_us": [
+          1644063.8427734375
+        ],
+        "repeats": 1,
+        "sample_min_us": 1644063.8427734375,
+        "warmup": 1
+      },
+      "b12x_inline_ptx_eager_us": 1644063.8427734375,
+      "b12x_inline_ptx_error": null,
+      "b12x_inline_ptx_graph": {
+        "iters": 1,
+        "max_us": 1663273.3154296875,
+        "mean_us": 1663273.3154296875,
+        "median_us": 1663273.3154296875,
+        "min_us": 1663273.3154296875,
+        "repeat_median_max_us": 1663273.3154296875,
+        "repeat_median_min_us": 1663273.3154296875,
+        "repeat_median_spread_pct": 0.0,
+        "repeat_medians_us": [
+          1663273.3154296875
+        ],
+        "repeats": 1,
+        "sample_min_us": 1663273.3154296875,
+        "warmup": 1
+      },
+      "b12x_inline_ptx_graph_100_replay_finite": true,
+      "b12x_inline_ptx_graph_us": 1663273.3154296875,
+      "b12x_inline_ptx_oracle": {
+        "cos": 0.9999985694885254,
+        "finite": true,
+        "max_abs": 0.016229629516601562,
+        "max_abs_limit": 0.052159299850463865,
+        "passed": true,
+        "ref_norm_inf": 5.215929985046387,
+        "rmse": 0.0019359835423529148
+      },
+      "baseline_eager": {
+        "iters": 1,
+        "max_us": 186.0480010509491,
+        "mean_us": 186.0480010509491,
+        "median_us": 186.0480010509491,
+        "min_us": 186.0480010509491,
+        "repeat_median_max_us": 186.0480010509491,
+        "repeat_median_min_us": 186.0480010509491,
+        "repeat_median_spread_pct": 0.0,
+        "repeat_medians_us": [
+          186.0480010509491
+        ],
+        "repeats": 1,
+        "sample_min_us": 186.0480010509491,
+        "warmup": 1
+      },
+      "baseline_eager_median_us": 186.0480010509491,
+      "baseline_graph": {
+        "iters": 1,
+        "max_us": 183.03999304771423,
+        "mean_us": 183.03999304771423,
+        "median_us": 183.03999304771423,
+        "min_us": 183.03999304771423,
+        "repeat_median_max_us": 183.03999304771423,
+        "repeat_median_min_us": 183.03999304771423,
+        "repeat_median_spread_pct": 0.0,
+        "repeat_medians_us": [
+          183.03999304771423
+        ],
+        "repeats": 1,
+        "sample_min_us": 183.03999304771423,
+        "warmup": 1
+      },
+      "baseline_graph_100_replay_finite": true,
+      "baseline_graph_median_us": 183.03999304771423,
+      "baseline_kernel": "torch._scaled_mm",
+      "baseline_oracle": {
+        "cos": 0.9999986290931702,
+        "finite": true,
+        "max_abs": 0.016229629516601562,
+        "max_abs_limit": 0.052159299850463865,
+        "passed": true,
+        "ref_norm_inf": 5.215929985046387,
+        "rmse": 0.0019360088044777513
+      },
+      "c_dtype": "bfloat16",
+      "scaling": "per_tensor",
+      "shape_group": "custom"
+    }
+  ],
+  "measurement": {
+    "cos_threshold": 0.9995,
+    "flush_l2": true,
+    "iters": 1,
+    "l2_flush_bytes": 33554432,
+    "max_abs_ref_fraction": 0.01,
+    "repeats": 1,
+    "warmup": 1
+  },
+  "schema_version": 1,
+  "torch_version": "2.11.0a0+eb65b36914.nv26.02"
+}

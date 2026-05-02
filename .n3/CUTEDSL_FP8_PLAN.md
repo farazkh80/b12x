@@ -34,7 +34,7 @@ Before any track starts:
 
 1. **Generate the baseline JSON.** Author `b12x/benchmarks/verify_fp8_dense_gemm_perf.py` per the schema in `.n3/runs/baseline/fp8_dense_baseline.md`. Run on Spark. Output to `.n3/runs/baseline/fp8_dense_baseline.json`. This is the parity floor every track grades against.
 2. **Bench the existing `fp8_dense_cuda_ext.cu` kernel as a second baseline column** for every shape (eager + graph). Record into the same JSON under key `b12x_inline_ptx_*_us`.
-3. **Pick the headline shape.** Choose the FP8 shape whose `torch._scaled_mm` median_us is *closest above* 80 µs and is representative of production decode/prefill. Record in `.n3/runs/baseline/headline_shape.md` along with one paragraph of justification. This shape is what every track's "push to 70-80 µs" benchmarking looks at.
+3. **Pick the headline shape.** **Headline shape is fixed: `(M=32, K=5376, N=5376)`.** This is the shape in the production nsys profile (`profile_super_nvfp4_disable_b12x.1.nsys-rep`) and the tuning point of `b12x/gemm/fp8_dense_cuda_ext.cu`. cuBLASLt baseline ≈ 99.4 µs; inline-PTX kernel ≈ 102.5 µs; stretch target 70–80 µs. See `.n3/runs/baseline/headline_shape.md` for the no-regression and parity gates. (Earlier "closest above 80 µs" rule is superseded — that picked a shape where the inline-PTX kernel was 2× slower than baseline and gave no useful parity floor.)
 4. Commit `verify_fp8_dense_gemm_perf.py` and the two new baseline files. **No track starts until Step 0 is committed.**
 
 ## Track structure (applies to T1–T4)

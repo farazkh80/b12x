@@ -1,0 +1,11 @@
+[spark] container 'avo-b12x-spark-fkhoubsirat' already running on p4242-0053
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+  File "/usr/local/lib/python3.12/dist-packages/torch/testing/_comparison.py", line 1600, in assert_close
+    raise error_metas[0].to_error(msg)
+AssertionError: Tensor-likes are not equal!
+
+Mismatched elements: 1006 / 1024 (98.2%)
+Greatest absolute difference: 1880.0 at index (15, 37)
+Greatest relative difference: 16256.0 at index (15, 50)
+{'shape': (16, 32, 64), 'max_abs': 1878.515625, 'mean_abs': 52.726539611816406}

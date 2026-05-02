@@ -1,16 +1,20 @@
-# AVO per-run artifacts: large binary captures + ephemeral state.
-# Source code (probe_*.py), planning markdown, and SUMMARY/COMPARISON.md stay tracked.
-runs/baseline/*.sqlite
-runs/baseline/*.nsys-rep
-runs/baseline/*.ncu-rep
+# AVO per-run artifacts.
+# Keep tracked: planning markdown, SUMMARY/COMPARISON, per-step result.md /
+# hypothesis.md / verify_fp8.json / diff.patch / probe scripts.
+# Exclude: binary profiling captures + raw logs (regenerable, ~MB-GB each).
 
-# Per-iteration / per-track artifacts emitted by AVO.
+# Binary profiling captures (any path under runs/)
+runs/**/*.nsys-rep
+runs/**/*.ncu-rep
+runs/**/*.sqlite
+
+# Raw stats / log dumps that are regenerable
+runs/**/*.txt
+runs/**/pytest.log
+runs/**/smoke_*.log
+
+# Old-style version-folder layout (superseded by tracks/)
 runs/v*/
-runs/tracks/*/step*/nsys.rep
-runs/tracks/*/step*/nsys.txt
-runs/tracks/*/step*/ncu.rep
-runs/tracks/*/step*/ncu.txt
-runs/tracks/*/step*/pytest.log
 
 # Live process state: not source.
 logs/

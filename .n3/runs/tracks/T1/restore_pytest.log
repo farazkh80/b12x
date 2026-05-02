@@ -1,0 +1,27 @@
+[spark] container 'avo-b12x-spark-fkhoubsirat' already running on p4242-0053
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-8.1.1, pluggy-1.6.0
+rootdir: /home/farazkh_scratch/agentic-dev/avo-b12x-trt/b12x
+configfile: pyproject.toml
+plugins: typeguard-4.5.0, anyio-4.12.1, rerunfailures-16.1, xdist-3.8.0, hypothesis-6.130.8, shard-0.1.2, flakefinder-1.1.0
+collected 7 items
+Running 7 items in this shard
+
+b12x/tests/test_fp8_dense_gemm.py .......                                [100%]
+
+=============================== warnings summary ===============================
+../../../../usr/local/lib/python3.12/dist-packages/Cython/Distutils/old_build_ext.py:15
+../../../../usr/local/lib/python3.12/dist-packages/Cython/Distutils/old_build_ext.py:15
+  /usr/local/lib/python3.12/dist-packages/Cython/Distutils/old_build_ext.py:15: DeprecationWarning: dep_util is Deprecated. Use functions from setuptools instead.
+    from distutils.dep_util import newer, newer_group
+
+../../../../usr/local/lib/python3.12/dist-packages/_pytest/cacheprovider.py:446
+  /usr/local/lib/python3.12/dist-packages/_pytest/cacheprovider.py:446: PytestCacheWarning: could not create cache path /home/farazkh_scratch/agentic-dev/avo-b12x-trt/b12x/.pytest_cache/v/cache/nodeids: [Errno 13] Permission denied: '/home/farazkh_scratch/agentic-dev/avo-b12x-trt/b12x/.pytest_cache'
+    config.cache.set("cache/nodeids", sorted(self.cached_nodeids))
+
+../../../../usr/local/lib/python3.12/dist-packages/_pytest/stepwise.py:57
+  /usr/local/lib/python3.12/dist-packages/_pytest/stepwise.py:57: PytestCacheWarning: could not create cache path /home/farazkh_scratch/agentic-dev/avo-b12x-trt/b12x/.pytest_cache/v/cache/stepwise: [Errno 13] Permission denied: '/home/farazkh_scratch/agentic-dev/avo-b12x-trt/b12x/.pytest_cache'
+    session.config.cache.set(STEPWISE_CACHE_DIR, [])
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+======================== 7 passed, 4 warnings in 26.55s ========================

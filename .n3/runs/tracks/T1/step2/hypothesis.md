@@ -1,0 +1,3 @@
+# Track 1 Step 2 hypothesis
+
+The Step 1 profile shows the current headline kernel is latency/occupancy limited rather than tensor-core limited: only `168` CTAs (`0.70` waves/SM), two of four warps compute, and each adjacent N tile redundantly stages the same 32x256 A slab. I will tune the nominal hot path by changing the `M % 32 == 0` launch from `TileN=32` to `TileN=64` while keeping `TileM=32`, `StageK=256`, and the existing `kind::mxf8f6f4` inline PTX unchanged. This halves headline CTA count to 84 and makes all four warps compute two N subtiles per CTA, reducing redundant A traffic; the risk is even fewer waves/SM and higher B shared-memory footprint, so the verifier and nsys/ncu comparison decide whether this is retained.

@@ -1,0 +1,3 @@
+# Track 1 Step 2 result
+
+Tested widening the non-staged CUDA extension branch from `TileN=32`/one warp to `TileN=128`/four warps as a small-M decode tuning attempt. The headline smoke run remained correct but regressed to `283.520 us` eager and `284.480 us` graph, compared with Step 1's `270.336 us` eager and `270.352 us` graph. The change was reverted immediately, so `b12x/gemm/fp8_dense_cuda_ext.cu` remains at the Step 1 baseline. Decision: record this as a failed tuning step; Step 3 should avoid wider N tiles and instead test a StageK/register-pressure adjustment that preserves one-warp CTAs.

@@ -1,0 +1,6 @@
+{
+  "candidate": "sm120_cute_atom_tile32x32_stage256",
+  "status": "failed_correctness",
+  "smoke_log": "pytest.log",
+  "entries": []
+}

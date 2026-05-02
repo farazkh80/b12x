@@ -9,17 +9,23 @@ Read these in order, then begin work:
 
 The work is structured as Step 0 → Track 1 → Track 2 → Track 3 → Track 4 → COMPARISON.
 
-Begin with Step 0:
-  - Author b12x/benchmarks/verify_fp8_dense_gemm_perf.py per the schema in
-    .n3/runs/baseline/fp8_dense_baseline.md.
-  - Run on Spark via .claude_docs/scripts/command_on_spark.sh; output to
-    .n3/runs/baseline/fp8_dense_baseline.json.
-  - Bench the existing b12x/gemm/fp8_dense_cuda_ext.cu kernel on every shape
-    (eager + graph) and record into the same JSON under key b12x_inline_ptx_*_us.
-  - Pick the headline shape (FP8 shape whose torch._scaled_mm median_us sits
-    closest above 80 µs and is representative of production decode/prefill).
-    Write justification to .n3/runs/baseline/headline_shape.md.
-  - Commit before starting any track.
+Step 0 is DONE: baseline JSON exists at
+  .n3/runs/baseline/fp8_dense_baseline.json and headline_shape.md has been
+  authoritatively set to:
+
+      *** HEADLINE SHAPE: (M=32, K=5376, N=5376) ***
+
+This is FIXED. Do NOT re-pick a different headline. It is the shape captured in
+the production nsys profile (profile_super_nvfp4_disable_b12x.1.nsys-rep), the
+shape b12x/gemm/fp8_dense_cuda_ext.cu was hand-tuned for, and the only shape
+where the existing inline-PTX kernel is competitive (102.464 µs vs cuBLASLt
+99.408 µs per b12x/README.md tuning notes).
+
+Earlier autopilot iterations picked (M=1, K=4096, N=4096) by following an
+outdated "closest to 80 µs" rule and produced wrong-shape results in
+.n3/runs/tracks/T1/step{1,2}/. Those results target a shape the kernel was
+never tuned for and are archived rather than deleted. **Restart Track 1 from
+step 1 against the correct headline shape.**
 
 Then proceed through the tracks in order (T1 → T2 → T3 → T4), 3 tuning steps
 each, recording per-step artifacts under .n3/runs/tracks/<track>/step{1,2,3}/

@@ -12,6 +12,7 @@ from cutlass.cute.runtime import from_dlpack
 
 from b12x.cute.fp4 import (
     bfloat2_to_float2_scaled,
+    f8f6f4_mma_m16n8k32_f32_e4m3,
     frag_layout_swizzle_16b_to_8b,
     fp8x4_e4m3_to_bfloat2x2,
     ldmatrix_m8n8x4_b16,
@@ -331,25 +332,25 @@ class _Fp8DenseMmaKernel:
             b2_k1 = frag_layout_swizzle_16b_to_8b(b2_k1)
             b3_k1 = frag_layout_swizzle_16b_to_8b(b3_k1)
 
-            d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e4m3(
+            d0, d1, d2, d3 = f8f6f4_mma_m16n8k32_f32_e4m3(
                 out_acc0[0], out_acc0[1], out_acc0[2], out_acc0[3],
                 a_regs[0], a_regs[1], a_regs[2], a_regs[3],
-                b0_k0, b0_k1, unit_scale, unit_scale,
+                b0_k0, b0_k1,
             )
-            d4, d5, d6, d7 = mxfp8_mma_m16n8k32_f32_e4m3(
+            d4, d5, d6, d7 = f8f6f4_mma_m16n8k32_f32_e4m3(
                 out_acc0[4], out_acc0[5], out_acc0[6], out_acc0[7],
                 a_regs[0], a_regs[1], a_regs[2], a_regs[3],
-                b1_k0, b1_k1, unit_scale, unit_scale,
+                b1_k0, b1_k1,
             )
-            e0, e1, e2, e3 = mxfp8_mma_m16n8k32_f32_e4m3(
+            e0, e1, e2, e3 = f8f6f4_mma_m16n8k32_f32_e4m3(
                 out_acc1[0], out_acc1[1], out_acc1[2], out_acc1[3],
                 a_regs[0], a_regs[1], a_regs[2], a_regs[3],
-                b2_k0, b2_k1, unit_scale, unit_scale,
+                b2_k0, b2_k1,
             )
-            e4, e5, e6, e7 = mxfp8_mma_m16n8k32_f32_e4m3(
+            e4, e5, e6, e7 = f8f6f4_mma_m16n8k32_f32_e4m3(
                 out_acc1[4], out_acc1[5], out_acc1[6], out_acc1[7],
                 a_regs[0], a_regs[1], a_regs[2], a_regs[3],
-                b3_k0, b3_k1, unit_scale, unit_scale,
+                b3_k0, b3_k1,
             )
             out_acc0[0] = d0
             out_acc0[1] = d1
@@ -552,25 +553,25 @@ class _Fp8DenseMmaStagedKernel:
                     b2_k1 = frag_layout_swizzle_16b_to_8b(b2_k1)
                     b3_k1 = frag_layout_swizzle_16b_to_8b(b3_k1)
 
-                    d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e4m3(
+                    d0, d1, d2, d3 = f8f6f4_mma_m16n8k32_f32_e4m3(
                         out_acc0[0], out_acc0[1], out_acc0[2], out_acc0[3],
                         a_regs[0], a_regs[1], a_regs[2], a_regs[3],
-                        b0_k0, b0_k1, unit_scale, unit_scale,
+                        b0_k0, b0_k1,
                     )
-                    d4, d5, d6, d7 = mxfp8_mma_m16n8k32_f32_e4m3(
+                    d4, d5, d6, d7 = f8f6f4_mma_m16n8k32_f32_e4m3(
                         out_acc0[4], out_acc0[5], out_acc0[6], out_acc0[7],
                         a_regs[0], a_regs[1], a_regs[2], a_regs[3],
-                        b1_k0, b1_k1, unit_scale, unit_scale,
+                        b1_k0, b1_k1,
                     )
-                    e0, e1, e2, e3 = mxfp8_mma_m16n8k32_f32_e4m3(
+                    e0, e1, e2, e3 = f8f6f4_mma_m16n8k32_f32_e4m3(
                         out_acc1[0], out_acc1[1], out_acc1[2], out_acc1[3],
                         a_regs[0], a_regs[1], a_regs[2], a_regs[3],
-                        b2_k0, b2_k1, unit_scale, unit_scale,
+                        b2_k0, b2_k1,
                     )
-                    e4, e5, e6, e7 = mxfp8_mma_m16n8k32_f32_e4m3(
+                    e4, e5, e6, e7 = f8f6f4_mma_m16n8k32_f32_e4m3(
                         out_acc1[4], out_acc1[5], out_acc1[6], out_acc1[7],
                         a_regs[0], a_regs[1], a_regs[2], a_regs[3],
-                        b3_k0, b3_k1, unit_scale, unit_scale,
+                        b3_k0, b3_k1,
                     )
                     out_acc0[0] = d0
                     out_acc0[1] = d1

@@ -24,6 +24,7 @@ SHAPES_DECODE = [
     (1, 5376, 4096),
     (4, 4096, 5376),
     (32, 4096, 5376),
+    (32, 5376, 5376),  # fixed headline shape from production nsys profile
     (80, 4096, 5376),
 ]
 SHAPES_PREFILL = [

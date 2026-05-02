@@ -1,0 +1,12 @@
+diff --git a/benchmarks/verify_fp8_dense_gemm_perf.py b/benchmarks/verify_fp8_dense_gemm_perf.py
+index c8c2f06..915d75e 100644
+--- a/benchmarks/verify_fp8_dense_gemm_perf.py
++++ b/benchmarks/verify_fp8_dense_gemm_perf.py
+@@ -24,6 +24,7 @@ SHAPES_DECODE = [
+     (1, 5376, 4096),
+     (4, 4096, 5376),
+     (32, 4096, 5376),
++    (32, 5376, 5376),  # fixed headline shape from production nsys profile
+     (80, 4096, 5376),
+ ]
+ SHAPES_PREFILL = [

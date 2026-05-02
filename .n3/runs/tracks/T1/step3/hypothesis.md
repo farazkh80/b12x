@@ -1,0 +1,3 @@
+# Track 1 Step 3 hypothesis
+
+Step 2 showed that widening `TileN` to 64 reduces A-load redundancy but loses too much occupancy (`0.44` waves/SM, ~15% achieved occupancy) to become a real win. For the push-limits step I will revert to the proven `TileN=32` headline tiling and lower the hot-path `StageK` from 256 to 128. This should double the number of K-loop stages but halve the A/B dynamic shared-memory footprint (16 KiB -> 8 KiB) and may increase residency/latency hiding; the risk is more synchronization/staging overhead, which README notes has previously regressed, but the current ncu data makes occupancy the clearest remaining lever within one bounded CUDA C step.

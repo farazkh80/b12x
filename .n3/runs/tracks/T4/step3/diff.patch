@@ -1,0 +1,143 @@
+diff --git a/b12x/cute/fp4.py b/b12x/cute/fp4.py
+index 183fc15..fdd5d75 100644
+--- a/b12x/cute/fp4.py
++++ b/b12x/cute/fp4.py
+@@ -1347,6 +1347,58 @@ def mxfp8_mma_m16n8k32_f32_e4m3(
+     return Float32(r0), Float32(r1), Float32(r2), Float32(r3)
+ 
+ 
++@dsl_user_op
++def f8f6f4_mma_m16n8k32_f32_e4m3(
++    d0: Float32,
++    d1: Float32,
++    d2: Float32,
++    d3: Float32,
++    a0: Uint32,
++    a1: Uint32,
++    a2: Uint32,
++    a3: Uint32,
++    b0: Uint32,
++    b1: Uint32,
++    *,
++    loc=None,
++    ip=None,
++) -> Tuple[Float32, Float32, Float32, Float32]:
++    """Warp MMA helper for SM120 unscaled `m16n8k32` E4M3/E4M3."""
++    result = llvm.inline_asm(
++        llvm.StructType.get_literal([T.f32(), T.f32(), T.f32(), T.f32()]),
++        [
++            Uint32(a0).ir_value(loc=loc, ip=ip),
++            Uint32(a1).ir_value(loc=loc, ip=ip),
++            Uint32(a2).ir_value(loc=loc, ip=ip),
++            Uint32(a3).ir_value(loc=loc, ip=ip),
++            Uint32(b0).ir_value(loc=loc, ip=ip),
++            Uint32(b1).ir_value(loc=loc, ip=ip),
++            Float32(d0).ir_value(loc=loc, ip=ip),
++            Float32(d1).ir_value(loc=loc, ip=ip),
++            Float32(d2).ir_value(loc=loc, ip=ip),
++            Float32(d3).ir_value(loc=loc, ip=ip),
++        ],
++        """
++        mma.sync.aligned.kind::f8f6f4.m16n8k32.row.col.f32.e4m3.e4m3.f32
++        {$0, $1, $2, $3},
++        {$4, $5, $6, $7},
++        {$8, $9},
++        {$0, $1, $2, $3};
++        """,
++        "=f,=f,=f,=f,r,r,r,r,r,r,0,1,2,3",
++        has_side_effects=False,
++        is_align_stack=False,
++        asm_dialect=llvm.AsmDialect.AD_ATT,
++        loc=loc,
++        ip=ip,
++    )
++    r0 = llvm.extractvalue(T.f32(), result, [0], loc=loc, ip=ip)
++    r1 = llvm.extractvalue(T.f32(), result, [1], loc=loc, ip=ip)
++    r2 = llvm.extractvalue(T.f32(), result, [2], loc=loc, ip=ip)
++    r3 = llvm.extractvalue(T.f32(), result, [3], loc=loc, ip=ip)
++    return Float32(r0), Float32(r1), Float32(r2), Float32(r3)
++
++
+ @dsl_user_op
+ def byte_perm(a: Uint32, b: Uint32, selector: Int32, *, loc=None, ip=None) -> Uint32:
+     """PTX byte permutation helper."""
+diff --git a/b12x/gemm/fp8_dense.py b/b12x/gemm/fp8_dense.py
+index 1bafe92..4dddf33 100644
+--- a/b12x/gemm/fp8_dense.py
++++ b/b12x/gemm/fp8_dense.py
+@@ -12,6 +12,7 @@ from cutlass.cute.runtime import from_dlpack
+ 
+ from b12x.cute.fp4 import (
+     bfloat2_to_float2_scaled,
++    f8f6f4_mma_m16n8k32_f32_e4m3,
+     frag_layout_swizzle_16b_to_8b,
+     fp8x4_e4m3_to_bfloat2x2,
+     ldmatrix_m8n8x4_b16,
+@@ -331,25 +332,25 @@ class _Fp8DenseMmaKernel:
+             b2_k1 = frag_layout_swizzle_16b_to_8b(b2_k1)
+             b3_k1 = frag_layout_swizzle_16b_to_8b(b3_k1)
+ 
+-            d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e4m3(
++            d0, d1, d2, d3 = f8f6f4_mma_m16n8k32_f32_e4m3(
+                 out_acc0[0], out_acc0[1], out_acc0[2], out_acc0[3],
+                 a_regs[0], a_regs[1], a_regs[2], a_regs[3],
+-                b0_k0, b0_k1, unit_scale, unit_scale,
++                b0_k0, b0_k1,
+             )
+-            d4, d5, d6, d7 = mxfp8_mma_m16n8k32_f32_e4m3(
++            d4, d5, d6, d7 = f8f6f4_mma_m16n8k32_f32_e4m3(
+                 out_acc0[4], out_acc0[5], out_acc0[6], out_acc0[7],
+                 a_regs[0], a_regs[1], a_regs[2], a_regs[3],
+-                b1_k0, b1_k1, unit_scale, unit_scale,
++                b1_k0, b1_k1,
+             )
+-            e0, e1, e2, e3 = mxfp8_mma_m16n8k32_f32_e4m3(
++            e0, e1, e2, e3 = f8f6f4_mma_m16n8k32_f32_e4m3(
+                 out_acc1[0], out_acc1[1], out_acc1[2], out_acc1[3],
+                 a_regs[0], a_regs[1], a_regs[2], a_regs[3],
+-                b2_k0, b2_k1, unit_scale, unit_scale,
++                b2_k0, b2_k1,
+             )
+-            e4, e5, e6, e7 = mxfp8_mma_m16n8k32_f32_e4m3(
++            e4, e5, e6, e7 = f8f6f4_mma_m16n8k32_f32_e4m3(
+                 out_acc1[4], out_acc1[5], out_acc1[6], out_acc1[7],
+                 a_regs[0], a_regs[1], a_regs[2], a_regs[3],
+-                b3_k0, b3_k1, unit_scale, unit_scale,
++                b3_k0, b3_k1,
+             )
+             out_acc0[0] = d0
+             out_acc0[1] = d1
+@@ -552,25 +553,25 @@ class _Fp8DenseMmaStagedKernel:
+                     b2_k1 = frag_layout_swizzle_16b_to_8b(b2_k1)
+                     b3_k1 = frag_layout_swizzle_16b_to_8b(b3_k1)
+ 
+-                    d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e4m3(
++                    d0, d1, d2, d3 = f8f6f4_mma_m16n8k32_f32_e4m3(
+                         out_acc0[0], out_acc0[1], out_acc0[2], out_acc0[3],
+                         a_regs[0], a_regs[1], a_regs[2], a_regs[3],
+-                        b0_k0, b0_k1, unit_scale, unit_scale,
++                        b0_k0, b0_k1,
+                     )
+-                    d4, d5, d6, d7 = mxfp8_mma_m16n8k32_f32_e4m3(
++                    d4, d5, d6, d7 = f8f6f4_mma_m16n8k32_f32_e4m3(
+                         out_acc0[4], out_acc0[5], out_acc0[6], out_acc0[7],
+                         a_regs[0], a_regs[1], a_regs[2], a_regs[3],
+-                        b1_k0, b1_k1, unit_scale, unit_scale,
++                        b1_k0, b1_k1,
+                     )
+-                    e0, e1, e2, e3 = mxfp8_mma_m16n8k32_f32_e4m3(
++                    e0, e1, e2, e3 = f8f6f4_mma_m16n8k32_f32_e4m3(
+                         out_acc1[0], out_acc1[1], out_acc1[2], out_acc1[3],
+                         a_regs[0], a_regs[1], a_regs[2], a_regs[3],
+-                        b2_k0, b2_k1, unit_scale, unit_scale,
++                        b2_k0, b2_k1,
+                     )
+-                    e4, e5, e6, e7 = mxfp8_mma_m16n8k32_f32_e4m3(
++                    e4, e5, e6, e7 = f8f6f4_mma_m16n8k32_f32_e4m3(
+                         out_acc1[4], out_acc1[5], out_acc1[6], out_acc1[7],
+                         a_regs[0], a_regs[1], a_regs[2], a_regs[3],
+-                        b3_k0, b3_k1, unit_scale, unit_scale,
++                        b3_k0, b3_k1,
+                     )
+                     out_acc0[0] = d0
+                     out_acc0[1] = d1

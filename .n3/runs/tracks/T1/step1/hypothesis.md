@@ -1,0 +1,3 @@
+# Track 1 Step 1 hypothesis
+
+Restart Track 1 on the fixed headline shape `(M=32, K=5376, N=5376)` by measuring the current inline-PTX CUDA extension without changing its PTX path. The current hot path is already hand-tuned for this shape (`TileM=32, TileN=32, StageK=256`, 128 threads/CTA), so this step establishes a correct apples-to-apples baseline, captures nsys/ncu bottleneck evidence, and folds the headline shape into the verifier before attempting any mutation. I will disable the CuTe disk cache for pytest because the installed CUTLASS DSL wheel lacks `external_binary_module`, which affects unrelated CuTe tests but not the CUDA extension path.
