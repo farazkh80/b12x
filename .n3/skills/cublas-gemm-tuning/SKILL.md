@@ -73,32 +73,55 @@ Do NOT trigger for:
 {
   "device": "NVIDIA GB10",
   "compute_capability": "12.1",
-  "shape": {"M": 32, "K": 5376, "N": 5376},
-  "dtype": {"a": "e4m3", "b": "e4m3", "c": "bf16", "compute": "fp32"},
-  "transpose": {"a": "N", "b": "T"},
+  "shape": {"M": 128, "K": 2688, "N": 1},
+  "dtype": {"a": "bf16", "b": "bf16", "c": "bf16", "compute": "fp32"},
+  "transpose": {"a": "T", "b": "N"},
+  "measurement": {"warmup": 5, "iters": 20, "repeats": 3},
+  "heuristic_returned": 10,
   "candidates": [
     {
-      "rank": 0,
-      "algo_id": 25,
-      "tile_id": 27,
-      "stages_id": 12,
-      "splitk_num": 1,
-      "swizzling": 0,
-      "reduction_scheme": 0,
+      "rank_measured": 0,           // index after sorting by measured median
+      "rank_heuristic": 7,           // index in cuBLAS-Lt's predicted-perf order
+      "algo_id": 13, "tile_id": 0, "stages_id": 0,
+      "splitk_num": 9, "swizzling": 0, "reduction_scheme": 0,
       "workspace_bytes": 33554432,
-      "median_us": 99.408,
+      "wave_count": 4.0,
+      "median_us": 16.192, "mean_us": 16.21, "min_us": 16.18,
       "spread_pct": 0.6,
-      "cos": 0.99999857,
-      "max_abs": 0.01623,
-      "finite": true,
-      "passed_correctness": true
+      "speedup_vs_heuristic_baseline": 1.1383,
+      "is_heuristic_baseline": false,
+      "launch_ok": true
     },
     ...
   ],
-  "best": { ... copy of top correct candidate ... },
-  "reference_us": 99.4
+  "heuristic_baseline": {           // rank_heuristic == 0 — what cuBLAS-Lt would auto-pick
+    "rank_heuristic": 0, "rank_measured": 2,
+    "algo_id": 13, "tile_id": 0, "stages_id": 0,
+    "splitk_num": 1, "swizzling": 0,
+    "median_us": 18.432
+  },
+  "best": {                         // fastest candidate after the sweep
+    "rank_heuristic": 7, "rank_measured": 0,
+    "algo_id": 13, "tile_id": 0, "stages_id": 0,
+    "splitk_num": 9, "swizzling": 0,
+    "median_us": 16.192,
+    "speedup_vs_heuristic_baseline": 1.1383
+  }
 }
 ```
+
+**Reading the result.** `heuristic_baseline` is what cuBLAS-Lt would pick on
+its own without a sweep — the "stock" reference. `best` is the fastest
+candidate among the top-N heuristic candidates after actually timing them.
+`best.speedup_vs_heuristic_baseline` quantifies how much you gained by
+sweeping. If `best.rank_heuristic == 0`, the heuristic was already optimal
+and a sweep gives nothing — common for shapes the heuristic has good
+coverage on. If `best.rank_heuristic > 0` (as in the example above), the
+heuristic's predicted-perf order missed a faster config.
+
+If the heuristic returns zero candidates, `heuristic_baseline` and `best`
+are both `null` — escalate (different dtype, larger workspace, or check the
+sm_120 FP8 caveat below).
 
 ## Workflow (AVO-side)
 

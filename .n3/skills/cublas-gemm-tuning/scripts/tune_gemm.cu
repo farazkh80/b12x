@@ -265,6 +265,20 @@ int main(int argc, char** argv) {
     rows.push_back(r);
   }
 
+  // Capture the heuristic-rank-0 timing as the "baseline" — what cuBLAS-Lt
+  // would auto-pick if you didn't sweep. Every other candidate's speedup is
+  // reported relative to this. Done BEFORE sorting so we use rank_heuristic
+  // (the original index) as the tag.
+  double baseline_us = -1.0;
+  int    baseline_idx = -1;
+  for (size_t i = 0; i < rows.size(); ++i) {
+    if (rows[i].rank_heuristic == 0 && rows[i].launch_ok) {
+      baseline_us = rows[i].median_us;
+      baseline_idx = (int)i;
+      break;
+    }
+  }
+
   // Sort by measured median ascending; failed launches sink to the bottom.
   std::sort(rows.begin(), rows.end(), [](const Row& x, const Row& y) {
     if (x.launch_ok != y.launch_ok) return x.launch_ok;
@@ -291,19 +305,48 @@ int main(int argc, char** argv) {
            i, r.rank_heuristic, r.algo_id, r.tile_id, r.stages_id, r.splitk_num,
            r.swizzling, r.reduction_scheme, r.workspace_bytes, r.wave_count);
     if (r.launch_ok) {
-      printf("\"median_us\": %.4f, \"mean_us\": %.4f, \"min_us\": %.4f, \"spread_pct\": %.4f, \"launch_ok\": true",
-             r.median_us, r.mean_us, r.min_us, r.spread_pct);
+      double spd = (baseline_us > 0) ? (baseline_us / r.median_us) : 0.0;
+      printf("\"median_us\": %.4f, \"mean_us\": %.4f, \"min_us\": %.4f, \"spread_pct\": %.4f, "
+             "\"speedup_vs_heuristic_baseline\": %.4f, \"is_heuristic_baseline\": %s, \"launch_ok\": true",
+             r.median_us, r.mean_us, r.min_us, r.spread_pct,
+             spd, (r.rank_heuristic == 0 ? "true" : "false"));
     } else {
-      printf("\"launch_ok\": false, \"launch_status\": %d", r.launch_status);
+      printf("\"launch_ok\": false, \"launch_status\": %d, \"is_heuristic_baseline\": %s",
+             r.launch_status, (r.rank_heuristic == 0 ? "true" : "false"));
     }
     printf("}%s\n", i + 1 < rows.size() ? "," : "");
   }
   printf("  ],\n");
+
+  // Heuristic baseline (rank-0): what cuBLAS-Lt would auto-pick without a sweep.
+  if (baseline_idx >= 0) {
+    // After sort, baseline_idx is invalid; find the rank_heuristic==0 row again.
+    int found = -1;
+    for (size_t i = 0; i < rows.size(); ++i) {
+      if (rows[i].rank_heuristic == 0) { found = (int)i; break; }
+    }
+    if (found >= 0 && rows[found].launch_ok) {
+      const auto& r = rows[found];
+      printf("  \"heuristic_baseline\": {\"rank_heuristic\": 0, \"rank_measured\": %d, "
+             "\"algo_id\": %d, \"tile_id\": %d, \"stages_id\": %d, \"splitk_num\": %d, "
+             "\"swizzling\": %d, \"median_us\": %.4f},\n",
+             found, r.algo_id, r.tile_id, r.stages_id, r.splitk_num, r.swizzling, r.median_us);
+    } else {
+      printf("  \"heuristic_baseline\": null,\n");
+    }
+  } else {
+    // rank-0 candidate failed to launch; can't compare against it.
+    printf("  \"heuristic_baseline\": null,\n");
+  }
+
   if (!rows.empty() && rows.front().launch_ok) {
     const auto& r = rows.front();
-    printf("  \"best\": {\"rank_heuristic\": %d, \"algo_id\": %d, \"tile_id\": %d, \"stages_id\": %d, "
-           "\"splitk_num\": %d, \"swizzling\": %d, \"median_us\": %.4f}\n",
-           r.rank_heuristic, r.algo_id, r.tile_id, r.stages_id, r.splitk_num, r.swizzling, r.median_us);
+    double spd = (baseline_us > 0) ? (baseline_us / r.median_us) : 0.0;
+    printf("  \"best\": {\"rank_heuristic\": %d, \"rank_measured\": 0, \"algo_id\": %d, "
+           "\"tile_id\": %d, \"stages_id\": %d, \"splitk_num\": %d, \"swizzling\": %d, "
+           "\"median_us\": %.4f, \"speedup_vs_heuristic_baseline\": %.4f}\n",
+           r.rank_heuristic, r.algo_id, r.tile_id, r.stages_id, r.splitk_num, r.swizzling,
+           r.median_us, spd);
   } else {
     printf("  \"best\": null\n");
   }
