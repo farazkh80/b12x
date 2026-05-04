@@ -35,15 +35,26 @@
   fprintf(stderr, "cuBLASLt %s @ %s:%d: status=%d\n", #x, __FILE__, __LINE__, (int)s_); \
   std::exit(1); } } while(0)
 
-struct DtypeSpec { const char* name; cudaDataType_t cuda; size_t bytes; int mode; };
+// `bits` carries element width (used for sub-byte types like FP4_E2M1=4 bits).
+// `mode` selects the random-init kernel branch; -1 means "skip init_random,
+// allocations are zeroed via cudaMemset" (used for FP4 — for tuning timing
+// the input values don't have to be sensible).
+struct DtypeSpec { const char* name; cudaDataType_t cuda; int bits; int mode; };
 static DtypeSpec resolve_dtype(const std::string& s) {
-  if (s == "fp32" || s == "float")    return {"fp32", CUDA_R_32F,    4, 0};
-  if (s == "bf16")                    return {"bf16", CUDA_R_16BF,   2, 1};
-  if (s == "fp16" || s == "half")     return {"fp16", CUDA_R_16F,    2, 2};
-  if (s == "e4m3" || s == "fp8_e4m3") return {"e4m3", CUDA_R_8F_E4M3, 1, 3};
-  if (s == "e5m2" || s == "fp8_e5m2") return {"e5m2", CUDA_R_8F_E5M2, 1, 4};
-  if (s == "int8")                    return {"int8", CUDA_R_8I,     1, 5};
+  if (s == "fp32" || s == "float")    return {"fp32", CUDA_R_32F,    32, 0};
+  if (s == "bf16")                    return {"bf16", CUDA_R_16BF,   16, 1};
+  if (s == "fp16" || s == "half")     return {"fp16", CUDA_R_16F,    16, 2};
+  if (s == "e4m3" || s == "fp8_e4m3") return {"e4m3", CUDA_R_8F_E4M3, 8, 3};
+  if (s == "e5m2" || s == "fp8_e5m2") return {"e5m2", CUDA_R_8F_E5M2, 8, 4};
+  if (s == "int8")                    return {"int8", CUDA_R_8I,      8, 5};
+  if (s == "fp4_e2m1" || s == "e2m1") return {"fp4_e2m1", CUDA_R_4F_E2M1, 4, -1};
   fprintf(stderr, "unknown dtype: %s\n", s.c_str()); std::exit(2);
+}
+
+// Total bytes needed for `elements` of the given type, rounded up. Handles
+// sub-byte types correctly (FP4: 2 elements per byte).
+static size_t dt_bytes(size_t elements, const DtypeSpec& d) {
+  return (elements * (size_t)d.bits + 7) / 8;
 }
 static cublasComputeType_t resolve_compute(const std::string& s) {
   if (s == "fp32") return CUBLAS_COMPUTE_32F;
@@ -72,6 +83,12 @@ __global__ void init_rand_kernel(uint8_t* dst, size_t n, uint64_t seed, int mode
   else if (mode == 5) reinterpret_cast<int8_t*>(dst)[i] = (int8_t)max(-127, min(127, (int)(f * 100.0f)));
 }
 static void init_random(void* d, size_t n, DtypeSpec dt, uint64_t seed) {
+  if (dt.mode < 0) {
+    // FP4 path — no random init kernel; just zero out the buffer. cuBLAS-Lt
+    // doesn't care about input values for tuning purposes, only sizes/strides.
+    CUDA_CHECK(cudaMemset(d, 0, dt_bytes(n, dt)));
+    return;
+  }
   int block = 256, grid = (int)((n + block - 1) / block);
   init_rand_kernel<<<grid, block>>>((uint8_t*)d, n, seed, dt.mode);
   CUDA_CHECK(cudaDeviceSynchronize());
@@ -143,12 +160,12 @@ int main(int argc, char** argv) {
   size_t b_cols = (opB == CUBLAS_OP_N) ? args.N : args.K;
 
   void *da, *db, *dd; void* dc = nullptr;
-  CUDA_CHECK(cudaMalloc(&da, a_rows * a_cols * a_dt.bytes));
-  CUDA_CHECK(cudaMalloc(&db, b_rows * b_cols * b_dt.bytes));
-  CUDA_CHECK(cudaMalloc(&dd, (size_t)args.M * args.N * c_dt.bytes));
+  CUDA_CHECK(cudaMalloc(&da, dt_bytes(a_rows * a_cols, a_dt)));
+  CUDA_CHECK(cudaMalloc(&db, dt_bytes(b_rows * b_cols, b_dt)));
+  CUDA_CHECK(cudaMalloc(&dd, dt_bytes((size_t)args.M * args.N, c_dt)));
   init_random(da, a_rows * a_cols, a_dt, args.seed);
   init_random(db, b_rows * b_cols, b_dt, args.seed + 1);
-  CUDA_CHECK(cudaMemset(dd, 0, (size_t)args.M * args.N * c_dt.bytes));
+  CUDA_CHECK(cudaMemset(dd, 0, dt_bytes((size_t)args.M * args.N, c_dt)));
 
   // L2 flush buffer.
   size_t l2_bytes = std::max((size_t)dprops.l2CacheSize * 2, (size_t)(32ull << 20));
@@ -163,17 +180,21 @@ int main(int argc, char** argv) {
   LT_CHECK(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSA, &opA, sizeof(opA)));
   LT_CHECK(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSB, &opB, sizeof(opB)));
 
-  // FP8/INT8 require A/B scale pointers, else heuristic returns NOT_SUPPORTED.
-  bool needs_scales = (a_dt.cuda == CUDA_R_8F_E4M3 || a_dt.cuda == CUDA_R_8F_E5M2 || a_dt.cuda == CUDA_R_8I);
+  // FP8/INT8/NVFP4 require A/B scale pointers, else heuristic returns
+  // NOT_SUPPORTED.
+  bool is_fp4   = (a_dt.cuda == CUDA_R_4F_E2M1 || b_dt.cuda == CUDA_R_4F_E2M1);
+  bool is_fp8_8 = (a_dt.cuda == CUDA_R_8F_E4M3 || a_dt.cuda == CUDA_R_8F_E5M2 || a_dt.cuda == CUDA_R_8I);
+  bool needs_scales = is_fp4 || is_fp8_8;
   void *d_sa = nullptr, *d_sb = nullptr;
   std::string effective_scale_mode = args.scale_mode;
   if (needs_scales && effective_scale_mode == "auto") {
-    // Default: per-tensor scalar on sm_89/sm_90 (Ada/Hopper), block-scaled
-    // UE8M0 vec-32 on sm_120 (Blackwell GB10/GB202+). Per-tensor on sm_120
-    // returns CUBLAS_STATUS_NOT_SUPPORTED (status=15) for FP8 since the
-    // hardware path is kind::mxf8f6f4 block-scale.
-    if (dprops.major >= 12) effective_scale_mode = "block_ue8m0_vec32";
-    else                    effective_scale_mode = "scalar";
+    // Default selection:
+    //   FP4 (NVFP4 e2m1)  → block_ue4m3_vec16 (mandatory; no per-tensor path)
+    //   FP8/INT8 sm_89/90 → SCALAR_32F per-tensor (legacy Ada/Hopper)
+    //   FP8/INT8 sm_120+  → block_ue8m0_vec32 (Blackwell kind::mxf8f6f4 path)
+    if      (is_fp4)             effective_scale_mode = "block_ue4m3_vec16";
+    else if (dprops.major >= 12) effective_scale_mode = "block_ue8m0_vec32";
+    else                         effective_scale_mode = "scalar";
   }
   if (needs_scales && effective_scale_mode == "scalar") {
     float one = 1.0f;
@@ -205,8 +226,61 @@ int main(int argc, char** argv) {
     cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_FAST_ACCUM, &fast_accum, sizeof(fast_accum));
     fprintf(stderr, "[tune_gemm] scale-mode=block_ue8m0_vec32 (a=%zuB, b=%zuB)\n",
             a_scale_bytes, b_scale_bytes);
+  } else if (needs_scales && effective_scale_mode == "block_ue4m3_vec16") {
+    // NVFP4 (CUDA_R_4F_E2M1) with VEC16_UE4M3 scales.
+    //
+    // KNOWN LIMITATION (2026-05-04 on cuBLAS 13.2.1 / sm_120 GB10):
+    // cublasLtMatmulAlgoGetHeuristic still returns CUBLAS_STATUS_INVALID_VALUE
+    // (status=7) for NVFP4 even with all of:
+    //   - aScalePointer/bScalePointer set, A/B/C/D/D_OUT_SCALE_MODE set
+    //   - cScalePointer/dScalePointer/dOutScalePointer explicitly nullptr
+    //   - POINTER_MODE_DEVICE, FAST_ACCUM=1, separate C/D layouts
+    //   - PreferenceInit, default col-major layouts
+    // The likely missing piece is the **swizzled scale tensor layout** that
+    // cuBLAS-Lt expects (the scale tensors are not flat (M, K/16) of UE4M3
+    // bytes; they're in a swizzled MX-spec layout that this flat memset
+    // doesn't produce). See TRT-LLM cpp/tensorrt_llm/thop/cublasFp4ScaledMM.cpp
+    // and the trtllm-gen scale-tensor swizzler for the actual layout. Until
+    // that's reverse-engineered, NVFP4 tuning via this binary returns 0
+    // candidates; fall back to AutoTuner-driven tactic search through TRT-LLM's
+    // CublasLtFP4GemmRunner instead.
+    //
+    // FP8 (block_ue8m0_vec32) does work correctly — see comment above.
+    if (args.K % 16 != 0) {
+      fprintf(stderr, "[tune_gemm] WARN: K=%d is not a multiple of 16 — NVFP4 vec16 "
+                      "scale layout assumes K%%16==0\n", args.K);
+    }
+    size_t k_blocks = (size_t)((args.K + 15) / 16);
+    size_t a_scale_bytes = k_blocks * (size_t)args.M;
+    size_t b_scale_bytes = k_blocks * (size_t)args.N;
+    CUDA_CHECK(cudaMalloc(&d_sa, a_scale_bytes));
+    CUDA_CHECK(cudaMalloc(&d_sb, b_scale_bytes));
+    CUDA_CHECK(cudaMemset(d_sa, 0x38, a_scale_bytes));
+    CUDA_CHECK(cudaMemset(d_sb, 0x38, b_scale_bytes));
+    LT_CHECK(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &d_sa, sizeof(d_sa)));
+    LT_CHECK(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &d_sb, sizeof(d_sb)));
+    int32_t mode_a = (int32_t)CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
+    int32_t mode_b = mode_a;
+    int32_t mode_scalar = (int32_t)CUBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F;
+    LT_CHECK(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &mode_a, sizeof(mode_a)));
+    LT_CHECK(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &mode_b, sizeof(mode_b)));
+    // FP4 heuristic also requires C/D/D_OUT scale modes set explicitly to
+    // SCALAR_32F with null pointers (per TRT-LLM cublasMMWrapper FP4 path).
+    LT_CHECK(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_C_SCALE_MODE, &mode_scalar, sizeof(mode_scalar)));
+    LT_CHECK(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_D_SCALE_MODE, &mode_scalar, sizeof(mode_scalar)));
+    LT_CHECK(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_D_OUT_SCALE_MODE, &mode_scalar, sizeof(mode_scalar)));
+    void* null_ptr = nullptr;
+    LT_CHECK(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_C_SCALE_POINTER, &null_ptr, sizeof(null_ptr)));
+    LT_CHECK(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_D_SCALE_POINTER, &null_ptr, sizeof(null_ptr)));
+    LT_CHECK(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_D_OUT_SCALE_POINTER, &null_ptr, sizeof(null_ptr)));
+    cublasLtPointerMode_t pmode = CUBLASLT_POINTER_MODE_DEVICE;
+    LT_CHECK(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_POINTER_MODE, &pmode, sizeof(pmode)));
+    int8_t fast_accum = 1;
+    cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_FAST_ACCUM, &fast_accum, sizeof(fast_accum));
+    fprintf(stderr, "[tune_gemm] scale-mode=block_ue4m3_vec16 (a=%zuB, b=%zuB)\n",
+            a_scale_bytes, b_scale_bytes);
   } else if (needs_scales) {
-    fprintf(stderr, "unsupported --scale-mode '%s' for FP8/INT8\n", effective_scale_mode.c_str());
+    fprintf(stderr, "unsupported --scale-mode '%s' for FP8/FP4/INT8\n", effective_scale_mode.c_str());
     std::exit(2);
   }
   // cuBLASLt is column-major natively. ld = rows for the in-memory shape of
@@ -216,19 +290,29 @@ int main(int argc, char** argv) {
   // unsupported config for sm_120 block-scaled FP8 (heuristic returns
   // CUBLAS_STATUS_NOT_SUPPORTED). Default col-major matches what
   // torch._scaled_mm emits in production.
-  cublasLtMatrixLayout_t la, lb, ld;
+  cublasLtMatrixLayout_t la, lb, lc, ld;
   LT_CHECK(cublasLtMatrixLayoutCreate(&la, a_dt.cuda, a_rows, a_cols, a_rows));
   LT_CHECK(cublasLtMatrixLayoutCreate(&lb, b_dt.cuda, b_rows, b_cols, b_rows));
+  // C and D are the same matrix in our tune (out-of-place=0 doesn't apply
+  // because dd is reused), but FP4 cuBLAS-Lt heuristic on sm_120 requires
+  // *distinct* layout descriptor objects for C and D — TRT-LLM's
+  // cublasMMWrapper::BlockScaleGemm creates them separately for the same
+  // reason. Other dtypes work either way; we always create both.
+  LT_CHECK(cublasLtMatrixLayoutCreate(&lc, c_dt.cuda, args.M, args.N, args.M));
   LT_CHECK(cublasLtMatrixLayoutCreate(&ld, c_dt.cuda, args.M, args.N, args.M));
 
   // Ask cuBLASLt for the top N candidates.
   cublasLtMatmulPreference_t pref;
   LT_CHECK(cublasLtMatmulPreferenceCreate(&pref));
+  // PreferenceInit zero-initializes all fields; matches TRT-LLM's getTactics
+  // setup. Some FP4 heuristic paths reject the request when fields aren't
+  // explicitly default-initialized.
+  LT_CHECK(cublasLtMatmulPreferenceInit(pref));
   LT_CHECK(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
                                                 &args.max_workspace, sizeof(args.max_workspace)));
   std::vector<cublasLtMatmulHeuristicResult_t> hres(args.request_count);
   int returned = 0;
-  cublasStatus_t hs = cublasLtMatmulAlgoGetHeuristic(h, op_desc, la, lb, ld, ld, pref,
+  cublasStatus_t hs = cublasLtMatmulAlgoGetHeuristic(h, op_desc, la, lb, lc, ld, pref,
                                                     args.request_count, hres.data(), &returned);
   if (hs != CUBLAS_STATUS_SUCCESS) {
     fprintf(stderr, "cublasLtMatmulAlgoGetHeuristic status=%d\n", (int)hs);
@@ -248,7 +332,21 @@ int main(int argc, char** argv) {
   std::vector<Row> rows;
   rows.reserve(returned);
 
-  float alpha = 1.0f, beta = 0.0f;
+  // alpha/beta: passed by pointer to cublasLtMatmul. Default cuBLASLt mode is
+  // POINTER_MODE_HOST so &h_alpha/&h_beta works directly. The FP4 path above
+  // sets POINTER_MODE_DEVICE — for that case we mirror the values into device
+  // memory and pass those pointers instead.
+  float h_alpha = 1.0f, h_beta = 0.0f;
+  float *d_alpha = nullptr, *d_beta = nullptr;
+  bool device_pointers = (is_fp4 && effective_scale_mode == "block_ue4m3_vec16");
+  if (device_pointers) {
+    CUDA_CHECK(cudaMalloc(&d_alpha, sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_beta,  sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(d_alpha, &h_alpha, sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_beta,  &h_beta,  sizeof(float), cudaMemcpyHostToDevice));
+  }
+  const float* alpha_p = device_pointers ? (const float*)d_alpha : &h_alpha;
+  const float* beta_p  = device_pointers ? (const float*)d_beta  : &h_beta;
   for (int i = 0; i < returned; ++i) {
     Row r{};
     r.rank_heuristic = i;
@@ -263,7 +361,7 @@ int main(int argc, char** argv) {
     cublasLtMatmulAlgoConfigGetAttribute(&hres[i].algo, CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME, &v, sizeof(v), nullptr); r.reduction_scheme = v;
 
     // Launch test (verifies the algo accepts our shape/dtype before benching).
-    cublasStatus_t st = cublasLtMatmul(h, op_desc, &alpha, da, la, db, lb, &beta, dd, ld, dd, ld,
+    cublasStatus_t st = cublasLtMatmul(h, op_desc, alpha_p, da, la, db, lb, beta_p, dd, lc, dd, ld,
                                        &hres[i].algo, d_workspace, args.max_workspace, s);
     if (st != CUBLAS_STATUS_SUCCESS) {
       r.launch_ok = false; r.launch_status = (int)st;
@@ -277,7 +375,7 @@ int main(int argc, char** argv) {
     for (int rep = 0; rep < args.repeats; ++rep) {
       for (int w = 0; w < args.warmup; ++w) {
         cudaMemsetAsync(d_l2, 0, l2_bytes, s);
-        cublasLtMatmul(h, op_desc, &alpha, da, la, db, lb, &beta, dd, ld, dd, ld,
+        cublasLtMatmul(h, op_desc, alpha_p, da, la, db, lb, beta_p, dd, lc, dd, ld,
                        &hres[i].algo, d_workspace, args.max_workspace, s);
       }
       CUDA_CHECK(cudaStreamSynchronize(s));
@@ -286,7 +384,7 @@ int main(int argc, char** argv) {
       for (int j = 0; j < args.iters; ++j) {
         cudaMemsetAsync(d_l2, 0, l2_bytes, s);
         cudaEventRecord(es[j], s);
-        cublasLtMatmul(h, op_desc, &alpha, da, la, db, lb, &beta, dd, ld, dd, ld,
+        cublasLtMatmul(h, op_desc, alpha_p, da, la, db, lb, beta_p, dd, lc, dd, ld,
                        &hres[i].algo, d_workspace, args.max_workspace, s);
         cudaEventRecord(ee[j], s);
       }
@@ -396,12 +494,13 @@ int main(int argc, char** argv) {
   printf("}\n");
 
   cublasLtMatmulPreferenceDestroy(pref);
-  cublasLtMatrixLayoutDestroy(la); cublasLtMatrixLayoutDestroy(lb); cublasLtMatrixLayoutDestroy(ld);
+  cublasLtMatrixLayoutDestroy(la); cublasLtMatrixLayoutDestroy(lb); cublasLtMatrixLayoutDestroy(lc); cublasLtMatrixLayoutDestroy(ld);
   cublasLtMatmulDescDestroy(op_desc);
   cublasLtDestroy(h);
   cudaStreamDestroy(s);
   cudaFree(d_workspace); cudaFree(d_l2);
   cudaFree(da); cudaFree(db); cudaFree(dd);
   if (d_sa) cudaFree(d_sa); if (d_sb) cudaFree(d_sb);
+  if (d_alpha) cudaFree(d_alpha); if (d_beta) cudaFree(d_beta);
   return 0;
 }
