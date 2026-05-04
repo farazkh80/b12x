@@ -321,6 +321,7 @@ int main(int argc, char** argv) {
   struct Row {
     int rank_heuristic;
     int algo_id, tile_id, stages_id, splitk_num, swizzling, reduction_scheme;
+    int custom_option, cluster_shape_id;
     size_t workspace_bytes;
     float wave_count;
     double median_us, mean_us, min_us, spread_pct;
@@ -357,6 +358,11 @@ int main(int argc, char** argv) {
     cublasLtMatmulAlgoConfigGetAttribute(&hres[i].algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &v, sizeof(v), nullptr); r.splitk_num = v;
     cublasLtMatmulAlgoConfigGetAttribute(&hres[i].algo, CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING, &v, sizeof(v), nullptr); r.swizzling = v;
     cublasLtMatmulAlgoConfigGetAttribute(&hres[i].algo, CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME, &v, sizeof(v), nullptr); r.reduction_scheme = v;
+    // CUSTOM_OPTION + CLUSTER_SHAPE_ID are required to populate
+    // TensorRT-LLM's cublas_lut::*_algo_list entries (8 fields per entry,
+    // last two being m_custom and m_cga). May not be set on all algos.
+    v = 0; cublasLtMatmulAlgoConfigGetAttribute(&hres[i].algo, CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION, &v, sizeof(v), nullptr); r.custom_option = v;
+    v = 0; cublasLtMatmulAlgoConfigGetAttribute(&hres[i].algo, CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID, &v, sizeof(v), nullptr); r.cluster_shape_id = v;
 
     // Launch test (verifies the algo accepts our shape/dtype before benching).
     cublasStatus_t st = cublasLtMatmul(h, op_desc, alpha_p, da, la, db, lb, beta_p, dd, lc, dd, ld,
@@ -440,9 +446,11 @@ int main(int argc, char** argv) {
     const auto& r = rows[i];
     printf("    {\"rank_measured\": %zu, \"rank_heuristic\": %d, \"algo_id\": %d, \"tile_id\": %d, "
            "\"stages_id\": %d, \"splitk_num\": %d, \"swizzling\": %d, \"reduction_scheme\": %d, "
+           "\"custom_option\": %d, \"cluster_shape_id\": %d, "
            "\"workspace_bytes\": %zu, \"wave_count\": %.4f, ",
            i, r.rank_heuristic, r.algo_id, r.tile_id, r.stages_id, r.splitk_num,
-           r.swizzling, r.reduction_scheme, r.workspace_bytes, r.wave_count);
+           r.swizzling, r.reduction_scheme, r.custom_option, r.cluster_shape_id,
+           r.workspace_bytes, r.wave_count);
     if (r.launch_ok) {
       double spd = (baseline_us > 0) ? (baseline_us / r.median_us) : 0.0;
       printf("\"median_us\": %.4f, \"mean_us\": %.4f, \"min_us\": %.4f, \"spread_pct\": %.4f, "
@@ -483,9 +491,15 @@ int main(int argc, char** argv) {
     double spd = (baseline_us > 0) ? (baseline_us / r.median_us) : 0.0;
     printf("  \"best\": {\"rank_heuristic\": %d, \"rank_measured\": 0, \"algo_id\": %d, "
            "\"tile_id\": %d, \"stages_id\": %d, \"splitk_num\": %d, \"swizzling\": %d, "
-           "\"median_us\": %.4f, \"speedup_vs_heuristic_baseline\": %.4f}\n",
+           "\"reduction_scheme\": %d, \"custom_option\": %d, \"cluster_shape_id\": %d, "
+           "\"median_us\": %.4f, \"speedup_vs_heuristic_baseline\": %.4f, "
+           "\"trtllm_lut_entry\": [%d, %d, %d, %d, %d, %d, %d, %d]}\n",
            r.rank_heuristic, r.algo_id, r.tile_id, r.stages_id, r.splitk_num, r.swizzling,
-           r.median_us, spd);
+           r.reduction_scheme, r.custom_option, r.cluster_shape_id,
+           r.median_us, spd,
+           // TRT-LLM LUT 8-tuple: {algo, tile, stages, numsK, reduction, swizzle, custom, cga}
+           r.algo_id, r.tile_id, r.stages_id, r.splitk_num,
+           r.reduction_scheme, r.swizzling, r.custom_option, r.cluster_shape_id);
   } else {
     printf("  \"best\": null\n");
   }
