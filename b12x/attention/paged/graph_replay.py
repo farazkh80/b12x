@@ -10,6 +10,8 @@ import triton.language as tl
 
 _DECODE_BLOCK_CHUNKS = 128
 _DECODE_BLOCK_PAGES = 128
+_PREFILL_BLOCK_WORK_ITEMS = 128
+_PREFILL_BLOCK_ROWS = 128
 
 
 @triton.jit
@@ -120,6 +122,126 @@ def update_regular_decode_graph_metadata_triton(
     num_chunks = tl.maximum((effective_pages * PAGE_SIZE + kv_chunk_size - 1) // kv_chunk_size, 1)
 
     tl.store(merge_indptr_ptr + req_idx + 1, num_chunks)
+
+
+@triton.jit
+def update_prefill_graph_work_metadata_triton(
+    cache_seqlens_ptr,
+    cu_seqlens_q_ptr,
+    request_indices_ptr,
+    qo_tile_indices_ptr,
+    kv_tile_indices_ptr,
+    o_indptr_ptr,
+    block_valid_mask_ptr,
+    kv_chunk_size_ptr,
+    kv_window_start_tokens_ptr,
+    work_items_capacity: tl.constexpr,
+    block_valid_capacity: tl.constexpr,
+    BATCH: tl.constexpr,
+    MAX_Q_TILES_PER_REQ: tl.constexpr,
+    MAX_CHUNKS_PER_Q_TILE: tl.constexpr,
+    CTA_TILE_Q: tl.constexpr,
+    GQA_GROUP_SIZE: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    WINDOW_LEFT: tl.constexpr,
+    SPLIT_KV: tl.constexpr,
+    BLOCK_WORK_ITEMS: tl.constexpr,
+):
+    block_idx = tl.program_id(axis=0)
+    offsets = block_idx * BLOCK_WORK_ITEMS + tl.arange(0, BLOCK_WORK_ITEMS)
+    slots_per_req = MAX_Q_TILES_PER_REQ * MAX_CHUNKS_PER_Q_TILE
+    req_idx = offsets // slots_per_req
+    req_local = offsets - req_idx * slots_per_req
+    q_tile_idx = req_local // MAX_CHUNKS_PER_Q_TILE
+    kv_tile_idx = req_local - q_tile_idx * MAX_CHUNKS_PER_Q_TILE
+
+    in_block_capacity = offsets < block_valid_capacity
+    in_work_capacity = offsets < work_items_capacity
+    in_batch = req_idx < BATCH
+    usable = in_block_capacity & in_work_capacity & in_batch
+
+    q_start = tl.load(cu_seqlens_q_ptr + req_idx, mask=usable, other=0).to(tl.int32)
+    q_end = tl.load(cu_seqlens_q_ptr + req_idx + 1, mask=usable, other=0).to(
+        tl.int32
+    )
+    q_len = tl.maximum(q_end - q_start, 0)
+    cache_len = tl.load(cache_seqlens_ptr + req_idx, mask=usable, other=0).to(tl.int32)
+
+    packed_q_len = q_len * GQA_GROUP_SIZE
+    num_q_tiles = (packed_q_len + CTA_TILE_Q - 1) // CTA_TILE_Q
+    num_pages = tl.maximum((cache_len + PAGE_SIZE - 1) // PAGE_SIZE, 1)
+
+    window_start_page = tl.full((BLOCK_WORK_ITEMS,), 0, tl.int32)
+    if WINDOW_LEFT >= 0:
+        first_causal_key = tl.maximum(cache_len - tl.maximum(q_len, 1), 0)
+        first_window_key = tl.maximum(first_causal_key - WINDOW_LEFT, 0)
+        window_start_page = first_window_key // PAGE_SIZE
+        window_start_page = tl.minimum(window_start_page, tl.maximum(num_pages - 1, 0))
+    effective_pages = tl.maximum(num_pages - window_start_page, 1)
+
+    kv_chunk_size = tl.load(kv_chunk_size_ptr).to(tl.int32)
+    chunk_pages = tl.maximum((kv_chunk_size + PAGE_SIZE - 1) // PAGE_SIZE, 1)
+    num_chunks = tl.full((BLOCK_WORK_ITEMS,), 1, tl.int32)
+    if SPLIT_KV:
+        num_chunks = tl.maximum((effective_pages + chunk_pages - 1) // chunk_pages, 1)
+
+    active = (
+        usable
+        & (q_tile_idx < num_q_tiles)
+        & (kv_tile_idx < num_chunks)
+        & (q_len > 0)
+        & (cache_len > 0)
+    )
+    tl.store(block_valid_mask_ptr + offsets, active.to(tl.int32), mask=in_block_capacity)
+    tl.store(request_indices_ptr + offsets, req_idx.to(tl.int32), mask=in_work_capacity)
+    tl.store(qo_tile_indices_ptr + offsets, q_tile_idx.to(tl.int32), mask=in_work_capacity)
+    tl.store(kv_tile_indices_ptr + offsets, kv_tile_idx.to(tl.int32), mask=in_work_capacity)
+
+    first_slot_for_req = usable & (req_local == 0)
+    tl.store(
+        kv_window_start_tokens_ptr + req_idx,
+        (window_start_page * PAGE_SIZE).to(tl.int32),
+        mask=first_slot_for_req,
+    )
+    tl.store(
+        o_indptr_ptr + req_idx + 1,
+        (q_len * num_chunks).to(tl.int32),
+        mask=first_slot_for_req,
+    )
+    tl.store(o_indptr_ptr + offsets, 0, mask=offsets == 0)
+
+
+@triton.jit
+def update_prefill_graph_row_indptr_triton(
+    cu_seqlens_q_ptr,
+    o_indptr_ptr,
+    merge_indptr_ptr,
+    BATCH: tl.constexpr,
+    MAX_Q_ROWS_PER_REQ: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+):
+    req_idx = tl.program_id(axis=0)
+    row_block_idx = tl.program_id(axis=1)
+    rows = row_block_idx * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+
+    q_start = tl.load(cu_seqlens_q_ptr + req_idx).to(tl.int32)
+    q_end = tl.load(cu_seqlens_q_ptr + req_idx + 1).to(tl.int32)
+    q_len = tl.maximum(q_end - q_start, 0)
+    request_partial_start = tl.load(o_indptr_ptr + req_idx).to(tl.int32)
+    request_partial_end = tl.load(o_indptr_ptr + req_idx + 1).to(tl.int32)
+    safe_q_len = tl.maximum(q_len, 1)
+    num_chunks = tl.maximum(
+        (request_partial_end - request_partial_start) // safe_q_len, 1
+    )
+
+    row_mask = rows < q_len
+    tl.store(
+        merge_indptr_ptr + q_start + rows + 1,
+        request_partial_start + (rows + 1) * num_chunks,
+        mask=row_mask,
+    )
+    if BATCH > 0:
+        tl.store(merge_indptr_ptr, 0, mask=(req_idx == 0) & (row_block_idx == 0))
 
 
 def make_decode_chunk_pages_lut_tensor(
@@ -504,3 +626,122 @@ def update_decode_graph_chunk_metadata(
     )
     o_indptr[: bs + 1].copy_(merge_indptr[: bs + 1])
     kv_chunk_size_ptr.copy_(decode_chunk_pages * page_size)
+
+
+def update_prefill_graph_chunk_metadata(
+    *,
+    cache_seqlens: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    request_indices: torch.Tensor,
+    qo_tile_indices: torch.Tensor,
+    kv_tile_indices: torch.Tensor,
+    merge_indptr: torch.Tensor,
+    o_indptr: torch.Tensor,
+    block_valid_mask: torch.Tensor,
+    kv_chunk_size_ptr: torch.Tensor,
+    kv_window_start_tokens: torch.Tensor,
+    total_num_rows_ptr: torch.Tensor,
+    batch: int,
+    max_q_tiles_per_req: int,
+    max_chunks_per_q_tile: int,
+    max_q_rows_per_req: int,
+    cta_tile_q: int,
+    gqa_group_size: int,
+    page_size: int,
+    split_kv: bool,
+    window_left: int = -1,
+) -> None:
+    device = cache_seqlens.device
+    if cu_seqlens_q.device != device:
+        raise ValueError("cu_seqlens_q and cache_seqlens must be on the same device")
+    if request_indices.device != device:
+        raise ValueError("request_indices and cache_seqlens must be on the same device")
+    if qo_tile_indices.device != device or kv_tile_indices.device != device:
+        raise ValueError("tile index buffers and cache_seqlens must be on the same device")
+    if merge_indptr.device != device or o_indptr.device != device:
+        raise ValueError("indptr buffers and cache_seqlens must be on the same device")
+    if block_valid_mask.device != device or kv_chunk_size_ptr.device != device:
+        raise ValueError("prefill graph buffers and cache_seqlens must be on the same device")
+    if kv_window_start_tokens.device != device or total_num_rows_ptr.device != device:
+        raise ValueError("prefill graph scalar buffers and cache_seqlens must be on the same device")
+    if page_size <= 0:
+        raise ValueError("page_size must be positive")
+    if cta_tile_q <= 0:
+        raise ValueError("cta_tile_q must be positive")
+    if gqa_group_size <= 0:
+        raise ValueError("gqa_group_size must be positive")
+    if window_left < -1:
+        raise ValueError("window_left must be -1 or non-negative")
+
+    bs = int(batch)
+    if bs <= 0:
+        raise ValueError("prefill graph replay requires batch > 0")
+    if int(cache_seqlens.shape[0]) < bs:
+        raise ValueError("cache_seqlens is smaller than the graph batch")
+    if int(cu_seqlens_q.shape[0]) < bs + 1:
+        raise ValueError("cu_seqlens_q is smaller than the graph batch")
+    work_items_capacity = int(request_indices.shape[0])
+    block_valid_capacity = int(block_valid_mask.shape[0])
+    if int(qo_tile_indices.shape[0]) != work_items_capacity or int(kv_tile_indices.shape[0]) != work_items_capacity:
+        raise RuntimeError("prefill graph tile index buffers must match request_indices shape")
+    if max_q_tiles_per_req <= 0:
+        raise ValueError("max_q_tiles_per_req must be positive")
+    if max_chunks_per_q_tile <= 0:
+        raise ValueError("max_chunks_per_q_tile must be positive")
+    if max_q_rows_per_req <= 0:
+        raise ValueError("max_q_rows_per_req must be positive")
+    required_work_items = bs * int(max_q_tiles_per_req) * int(max_chunks_per_q_tile)
+    if required_work_items > work_items_capacity:
+        raise RuntimeError(
+            "prefill graph workspace request_indices capacity is too small for the graph plan"
+        )
+    if required_work_items > block_valid_capacity:
+        raise RuntimeError(
+            "prefill graph workspace block_valid capacity is too small for the graph plan"
+        )
+    if int(o_indptr.shape[0]) < bs + 1:
+        raise RuntimeError("prefill graph workspace o_indptr capacity is too small")
+    if int(kv_window_start_tokens.shape[0]) < bs:
+        raise RuntimeError(
+            "prefill graph workspace kv_window_start_tokens capacity is too small"
+        )
+
+    work_blocks = triton.cdiv(block_valid_capacity, _PREFILL_BLOCK_WORK_ITEMS)
+    update_prefill_graph_work_metadata_triton[(work_blocks,)](
+        cache_seqlens,
+        cu_seqlens_q,
+        request_indices,
+        qo_tile_indices,
+        kv_tile_indices,
+        o_indptr,
+        block_valid_mask,
+        kv_chunk_size_ptr,
+        kv_window_start_tokens,
+        work_items_capacity=work_items_capacity,
+        block_valid_capacity=block_valid_capacity,
+        BATCH=bs,
+        MAX_Q_TILES_PER_REQ=int(max_q_tiles_per_req),
+        MAX_CHUNKS_PER_Q_TILE=int(max_chunks_per_q_tile),
+        CTA_TILE_Q=int(cta_tile_q),
+        GQA_GROUP_SIZE=int(gqa_group_size),
+        PAGE_SIZE=int(page_size),
+        WINDOW_LEFT=int(window_left),
+        SPLIT_KV=bool(split_kv),
+        BLOCK_WORK_ITEMS=_PREFILL_BLOCK_WORK_ITEMS,
+    )
+    torch.cumsum(
+        o_indptr[1 : bs + 1],
+        dim=0,
+        out=o_indptr[1 : bs + 1],
+    )
+    total_num_rows_ptr[:1].copy_(cu_seqlens_q[bs : bs + 1])
+
+    row_blocks = triton.cdiv(int(max_q_rows_per_req), _PREFILL_BLOCK_ROWS)
+    update_prefill_graph_row_indptr_triton[(bs, row_blocks)](
+        cu_seqlens_q,
+        o_indptr,
+        merge_indptr,
+        BATCH=bs,
+        MAX_Q_ROWS_PER_REQ=int(max_q_rows_per_req),
+        BLOCK_ROWS=_PREFILL_BLOCK_ROWS,
+    )

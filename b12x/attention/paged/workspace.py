@@ -480,6 +480,9 @@ class PagedAttentionWorkspace:
     _decode_graph_max_chunks_per_req: int | None = None
     _use_regular_decode_graph_replay: bool = False
     _decode_graph_metadata_captured_in_graph: bool = False
+    _prefill_graph_max_q_tiles_per_req: int | None = None
+    _prefill_graph_max_chunks_per_q_tile: int | None = None
+    _prefill_graph_max_q_rows_per_req: int | None = None
     _live_plane_tma_desc_cache: dict[
         tuple[int, int, tuple[int, ...], tuple[int, ...], int, int],
         tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor, torch.Tensor],
@@ -941,6 +944,42 @@ class PagedAttentionWorkspace:
             self.total_num_rows_ptr[0] = int(self._plan.total_q)
         return self
 
+    def update_prefill_graph_replay_metadata(
+        self,
+        page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        *,
+        window_left: int = -1,
+    ) -> PagedAttentionWorkspace:
+        if not self.use_cuda_graph:
+            raise RuntimeError(
+                "update_prefill_graph_replay_metadata is only valid for graph-mode workspaces"
+            )
+        if self.mode not in ("extend", "verify"):
+            raise RuntimeError(
+                "update_prefill_graph_replay_metadata is only valid for extend/verify workspaces"
+            )
+        if self._plan is None:
+            raise RuntimeError("prefill graph workspace has not been prepared")
+        if int(window_left) != int(self._plan.window_left):
+            raise ValueError(
+                f"prefill graph replay workspace was prepared with window_left={self._plan.window_left}, "
+                f"got window_left={int(window_left)}"
+            )
+        if self.page_table is None:
+            raise RuntimeError("prefill graph workspace is missing page_table")
+        if self.cache_seqlens is None:
+            raise RuntimeError("prefill graph workspace is missing cache_seqlens")
+        if self.cu_seqlens_q is None:
+            raise RuntimeError("prefill graph workspace is missing cu_seqlens_q")
+
+        with record_function("paged_workspace.copy_runtime_metadata"):
+            self._copy_runtime_metadata(page_table, cache_seqlens, cu_seqlens_q)
+        with record_function("paged_workspace.update_prefill_graph_replay_metadata"):
+            self._update_prefill_graph_replay_metadata_from_runtime()
+        return self
+
     def prepare_for_cuda_graph_replay(
         self,
         page_table: torch.Tensor,
@@ -1075,6 +1114,65 @@ class PagedAttentionWorkspace:
             window_left=window_left,
         )
         self._validate_decode_graph_replay_capacity(batch=batch)
+        return self
+
+    def prepare_prefill_graph_replay_state(
+        self,
+        *,
+        batch: int,
+        total_q_capacity: int,
+        max_page_table_width: int,
+        max_cache_seqlen: int,
+        cu_seqlens_q: torch.Tensor,
+        window_left: int = -1,
+    ) -> PagedAttentionWorkspace:
+        if not self.use_cuda_graph:
+            raise RuntimeError(
+                "prepare_prefill_graph_replay_state is only valid for graph-mode workspaces"
+            )
+        if self.mode not in ("extend", "verify"):
+            raise RuntimeError(
+                "prepare_prefill_graph_replay_state is only valid for extend/verify workspaces"
+            )
+        if batch <= 0:
+            raise ValueError("batch must be positive")
+        if total_q_capacity <= 0:
+            raise ValueError("total_q_capacity must be positive")
+        if max_page_table_width <= 0:
+            raise ValueError("max_page_table_width must be positive")
+        if max_cache_seqlen <= 0:
+            raise ValueError("max_cache_seqlen must be positive")
+        if window_left < -1:
+            raise ValueError(
+                "window_left must be -1 for full attention or a non-negative token count"
+            )
+        if tuple(cu_seqlens_q.shape) != (int(batch) + 1,):
+            raise ValueError("cu_seqlens_q shape must match the graph batch")
+
+        max_cache_seqlens = torch.full(
+            (batch,),
+            int(max_cache_seqlen),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        num_cache_pages = (
+            int(self._plan_k_cache.shape[0]) if self._plan_k_cache is not None else 0
+        )
+        if num_cache_pages <= 0:
+            raise RuntimeError("paged workspace planning contract is not initialized")
+        max_page_ids = torch.arange(
+            max_page_table_width, dtype=torch.int32, device=self.device
+        )
+        max_page_table = (
+            (max_page_ids % num_cache_pages).unsqueeze(0).expand(batch, -1).contiguous()
+        )
+        self.prepare(
+            max_page_table,
+            max_cache_seqlens,
+            cu_seqlens_q,
+            window_left=window_left,
+        )
+        self._cache_prefill_graph_replay_shape_from_plan()
         return self
 
     def prepare_for_capacity(
@@ -1596,6 +1694,96 @@ class PagedAttentionWorkspace:
             self.tmp_output = None
             self.tmp_lse = None
 
+    def _cache_prefill_graph_replay_shape_from_plan(self) -> None:
+        if self._plan is None:
+            raise RuntimeError("prefill graph replay plan has not been prepared")
+        if self.mode not in ("extend", "verify") or not self.use_cuda_graph:
+            raise RuntimeError(
+                "prefill graph replay shape is only valid for graph extend/verify"
+            )
+        active_work_items = [
+            (request_idx, q_tile_idx, kv_tile_idx)
+            for request_idx, q_tile_idx, kv_tile_idx, valid in zip(
+                self._plan.request_indices,
+                self._plan.qo_tile_indices,
+                self._plan.kv_tile_indices,
+                self._plan.block_valid_mask,
+                strict=False,
+            )
+            if valid
+        ]
+        if not active_work_items:
+            raise RuntimeError("prefill graph replay plan contains no active work")
+        max_q_tiles_per_req = max(q_tile_idx for _, q_tile_idx, _ in active_work_items) + 1
+        max_chunks_per_q_tile = max(kv_tile_idx for _, _, kv_tile_idx in active_work_items) + 1
+        max_q_rows_per_req = max(
+            1,
+            (
+                int(max_q_tiles_per_req) * int(self._plan.cta_tile_q)
+                + int(self._plan.gqa_group_size)
+                - 1
+            )
+            // int(self._plan.gqa_group_size),
+        )
+        self._prefill_graph_max_q_tiles_per_req = int(max_q_tiles_per_req)
+        self._prefill_graph_max_chunks_per_q_tile = int(max_chunks_per_q_tile)
+        self._prefill_graph_max_q_rows_per_req = int(max_q_rows_per_req)
+
+    def _update_prefill_graph_replay_metadata_from_runtime(self) -> None:
+        if self._plan is None:
+            raise RuntimeError("prefill graph workspace has not been prepared")
+        if self.cache_seqlens is None:
+            raise RuntimeError("prefill graph workspace is missing cache_seqlens")
+        if self.cu_seqlens_q is None:
+            raise RuntimeError("prefill graph workspace is missing cu_seqlens_q")
+        if self.request_indices is None:
+            raise RuntimeError("prefill graph workspace is missing request indices")
+        if self.qo_tile_indices is None or self.kv_tile_indices is None:
+            raise RuntimeError("prefill graph workspace is missing tile indices")
+        if self.merge_indptr is None or self.o_indptr is None:
+            raise RuntimeError("prefill graph workspace is missing indptr buffers")
+        if self.kv_chunk_size_ptr is None:
+            raise RuntimeError("prefill graph workspace is missing kv_chunk_size_ptr")
+        if self.total_num_rows_ptr is None:
+            raise RuntimeError("prefill graph workspace is missing total_num_rows_ptr")
+        if self.block_valid_mask is None:
+            raise RuntimeError("prefill graph workspace is missing block_valid_mask")
+        if self.kv_window_start_tokens is None:
+            raise RuntimeError(
+                "prefill graph workspace is missing kv_window_start_tokens"
+            )
+        if (
+            self._prefill_graph_max_q_tiles_per_req is None
+            or self._prefill_graph_max_chunks_per_q_tile is None
+            or self._prefill_graph_max_q_rows_per_req is None
+        ):
+            self._cache_prefill_graph_replay_shape_from_plan()
+
+        from .graph_replay import update_prefill_graph_chunk_metadata
+
+        update_prefill_graph_chunk_metadata(
+            cache_seqlens=self.cache_seqlens,
+            cu_seqlens_q=self.cu_seqlens_q,
+            request_indices=self.request_indices,
+            qo_tile_indices=self.qo_tile_indices,
+            kv_tile_indices=self.kv_tile_indices,
+            merge_indptr=self.merge_indptr,
+            o_indptr=self.o_indptr,
+            block_valid_mask=self.block_valid_mask,
+            kv_chunk_size_ptr=self.kv_chunk_size_ptr,
+            kv_window_start_tokens=self.kv_window_start_tokens,
+            total_num_rows_ptr=self.total_num_rows_ptr,
+            batch=int(self._plan.page_table_shape[0]),
+            max_q_tiles_per_req=int(self._prefill_graph_max_q_tiles_per_req),
+            max_chunks_per_q_tile=int(self._prefill_graph_max_chunks_per_q_tile),
+            max_q_rows_per_req=int(self._prefill_graph_max_q_rows_per_req),
+            cta_tile_q=int(self._plan.cta_tile_q),
+            gqa_group_size=int(self._plan.gqa_group_size),
+            page_size=int(self.page_size),
+            split_kv=bool(self._plan.split_kv),
+            window_left=int(self._plan.window_left),
+        )
+
     def _validate_decode_graph_replay_capacity(
         self,
         *,
@@ -1724,6 +1912,9 @@ class PagedAttentionWorkspace:
         assert self.block_valid_mask is not None
 
         self._use_regular_decode_graph_replay = False
+        self._prefill_graph_max_q_tiles_per_req = None
+        self._prefill_graph_max_chunks_per_q_tile = None
+        self._prefill_graph_max_q_rows_per_req = None
 
         with record_function("paged_workspace.plan_metadata_to_device"):
             request_indices = _copy_int_metadata(
