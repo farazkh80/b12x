@@ -1,0 +1,19 @@
+{
+  "slug": "fp8-4-track-corrected",
+  "started_at": "2026-05-02T07:28:26Z",
+  "ended_at": "2026-05-02T08:52:42Z",
+  "b12x_hash_at_start": "2461f83cb2cb0062552795a79c8d96af014dfa30",
+  "b12x_hash_at_end": "932e801ccdcd98ebfa73e1883bd40a7c995fbe41",
+  "parent_hash_at_start": null,
+  "session_id": "defbca5dd64442e8",
+  "status": "completed",
+  "outcome_summary": "Corrected headline shape to (M=32, K=5376, N=5376) — the production nsys profile shape. Ran all 4 tracks with 3 steps each. None met the 70-80 µs target. Best: T1 Step 2 TileN=64 at 179.20 µs eager (parity with torch._scaled_mm 180 µs but graph regressed; not promoted). T2 Cutlass C++ atom 362 µs (correct, slow). T3 Triton aborted at Step 1 (silently upcast FP8 to FP16). T4 CuTeDSL inline_asm helper 206 µs (correct, slow but useful infrastructure). Recommendation: keep cuBLASLt, do not promote anything from these 4 tracks.",
+  "produced_artifacts": [
+    "b12x/.n3/runs/tracks/T{1,2,3,4}/SUMMARY.md",
+    "b12x/.n3/runs/tracks/COMPARISON.md",
+    "b12x/gemm/fp8_dense_sm120_cute_ext.cu",
+    "b12x/gemm/fp8_dense_sm120_cute.py",
+    "b12x/gemm/fp8_dense_triton.py",
+    "b12x/cute/fp4.py (f8f6f4_mma_m16n8k32_f32_e4m3 helper)"
+  ]
+}

@@ -1,0 +1,78 @@
+CONFIG 64,64,128,2
+correct {'max_abs': 0.5, 'mean_abs': 3.1137219593802e-06, 'cos': 1.0}
+torch {'median': 93.56991767883301, 'min': 92.07615852355957, 'all': [93.56991767883301, 92.07615852355957, 96.51328086853027, 92.15999603271484, 94.68095779418945]}
+cutlass {'median': 100.20928382873535, 'min': 97.33311653137207, 'all': [100.20928382873535, 98.02047729492188, 97.33311653137207, 102.65536308288574, 101.08480453491211]}
+ratio 1.0709562038163924
+CONFIG 64,128,64,2
+correct {'max_abs': 0.5, 'mean_abs': 3.1137219593802e-06, 'cos': 1.0}
+torch {'median': 90.56063652038574, 'min': 90.53248405456543, 'all': [90.56063652038574, 90.53248405456543, 90.59200286865234, 90.55295944213867, 97.6358413696289]}
+cutlass {'median': 121.07647895812988, 'min': 115.04960060119629, 'all': [121.4310359954834, 115.46048164367676, 122.25024223327637, 121.07647895812988, 115.04960060119629]}
+ratio 1.3369658563616085
+CONFIG 64,128,128,2
+correct {'max_abs': 0.5, 'mean_abs': 3.1137219593802e-06, 'cos': 1.0}
+torch {'median': 92.04992294311523, 'min': 91.8892765045166, 'all': [92.29184150695801, 92.04992294311523, 92.05183982849121, 92.01727867126465, 91.8892765045166]}
+cutlass {'median': 104.63423728942871, 'min': 103.40352058410645, 'all': [103.40352058410645, 104.63423728942871, 108.24576377868652, 104.90816116333008, 104.28352355957031]}
+ratio 1.1367118400967082
+CONFIG 64,256,64,2
+correct {'max_abs': 0.5, 'mean_abs': 3.1137219593802e-06, 'cos': 1.0}
+torch {'median': 77.41439819335938, 'min': 77.259521484375, 'all': [77.81311988830566, 77.40863800048828, 77.259521484375, 77.46111869812012, 77.41439819335938]}
+cutlass {'median': 96.87999725341797, 'min': 95.28384208679199, 'all': [96.87999725341797, 107.84768104553223, 95.35103797912598, 95.28384208679199, 108.50560188293457]}
+ratio 1.2514467529856528
+CONFIG 64,256,128,2
+correct {'max_abs': 0.5, 'mean_abs': 3.1137219593802e-06, 'cos': 1.0}
+torch {'median': 89.46368217468262, 'min': 89.24415588378906, 'all': [89.60448265075684, 89.34464454650879, 99.8310375213623, 89.24415588378906, 89.46368217468262]}
+cutlass {'median': 102.73983955383301, 'min': 99.27616119384766, 'all': [102.73983955383301, 106.3372802734375, 99.27616119384766, 100.60928344726562, 106.03263854980469]}
+ratio 1.1483971714156365
+CONFIG 64,128,256,2
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/cpp_extension.py", line 2753, in _run_ninja_build
+    subprocess.run(
+  File "/usr/lib/python3.12/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['ninja', '-v']' returned non-zero exit status 2.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/farazkh_scratch/agentic-dev/avo-b12x-trt/b12x/.n3/runs/tracks/cutlass_collective_tune.py", line 68, in <module>
+    main()
+  File "/home/farazkh_scratch/agentic-dev/avo-b12x-trt/b12x/.n3/runs/tracks/cutlass_collective_tune.py", line 40, in main
+    out = fp8_dense_gemm_cutlass_collective(a, b, scale_a, scale_b)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/farazkh_scratch/agentic-dev/avo-b12x-trt/b12x/b12x/gemm/fp8_dense_cutlass_collective.py", line 87, in fp8_dense_gemm_cutlass_collective
+    _load_extension().fp8_dense_gemm(a, b, scale_a.reshape(1).contiguous(), scale_b.reshape(1).contiguous(), out)
+    ^^^^^^^^^^^^^^^^^
+  File "/home/farazkh_scratch/agentic-dev/avo-b12x-trt/b12x/b12x/gemm/fp8_dense_cutlass_collective.py", line 59, in _load_extension
+    return load(
+           ^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/cpp_extension.py", line 1804, in load
+    return _jit_compile(
+           ^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/cpp_extension.py", line 2247, in _jit_compile
+    _write_ninja_file_and_build_library(
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/cpp_extension.py", line 2408, in _write_ninja_file_and_build_library
+    _run_ninja_build(
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/cpp_extension.py", line 2770, in _run_ninja_build
+    raise RuntimeError(message) from e
+RuntimeError: Error building extension 'b12x_fp8_dense_cutlass_collective_ext': [1/2] /usr/local/cuda/bin/nvcc -MD -MF fp8_dense_cutlass_collective_ext.cuda.o.d -DTORCH_EXTENSION_NAME=b12x_fp8_dense_cutlass_collective_ext -DTORCH_API_INCLUDE_EXTENSION_H -I/usr/local/lib/python3.12/dist-packages/tensorrt_llm/include/trtllm_gen_kernels/fmha/cutlass/include -isystem /usr/local/lib/python3.12/dist-packages/torch/include -isystem /usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include -isystem /usr/local/cuda/include -isystem /usr/include/python3.12 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options '-fPIC' -O3 --expt-relaxed-constexpr --use_fast_math -gencode=arch=compute_121a,code=sm_121a -DB12X_CUTLASS_TILE_M=64 -DB12X_CUTLASS_TILE_N=128 -DB12X_CUTLASS_TILE_K=256 -DB12X_CUTLASS_SCHED_STAGES=2 -std=c++17 -c /home/farazkh_scratch/agentic-dev/avo-b12x-trt/b12x/b12x/gemm/fp8_dense_cutlass_collective_ext.cu -o fp8_dense_cutlass_collective_ext.cuda.o 
+FAILED: [code=2] fp8_dense_cutlass_collective_ext.cuda.o 
+/usr/local/cuda/bin/nvcc -MD -MF fp8_dense_cutlass_collective_ext.cuda.o.d -DTORCH_EXTENSION_NAME=b12x_fp8_dense_cutlass_collective_ext -DTORCH_API_INCLUDE_EXTENSION_H -I/usr/local/lib/python3.12/dist-packages/tensorrt_llm/include/trtllm_gen_kernels/fmha/cutlass/include -isystem /usr/local/lib/python3.12/dist-packages/torch/include -isystem /usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include -isystem /usr/local/cuda/include -isystem /usr/include/python3.12 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options '-fPIC' -O3 --expt-relaxed-constexpr --use_fast_math -gencode=arch=compute_121a,code=sm_121a -DB12X_CUTLASS_TILE_M=64 -DB12X_CUTLASS_TILE_N=128 -DB12X_CUTLASS_TILE_K=256 -DB12X_CUTLASS_SCHED_STAGES=2 -std=c++17 -c /home/farazkh_scratch/agentic-dev/avo-b12x-trt/b12x/b12x/gemm/fp8_dense_cutlass_collective_ext.cu -o fp8_dense_cutlass_collective_ext.cuda.o 
+/usr/local/lib/python3.12/dist-packages/tensorrt_llm/include/trtllm_gen_kernels/fmha/cutlass/include/cutlass/gemm/collective/sm120_mma_tma.hpp(152): error: static assertion failed with "Specialization requires Stages set to value 2 or more."
+    static_assert(DispatchPolicy::Stages >= 2, "Specialization requires Stages set to value 2 or more.");
+    ^
+          detected during instantiation of class "cutlass::gemm::collective::CollectiveMma<cutlass::gemm::MainloopSm120TmaWarpSpecialized<Stages, SchedulerPipelineStageCount, ClusterShape, KernelScheduleType>, TileShape_, ElementA_, StrideA_, ElementB_, StrideB_, TiledMma_, GmemTiledCopyA_, SmemLayoutAtomA_, SmemCopyAtomA_, TransformA_, GmemTiledCopyB_, SmemLayoutAtomB_, SmemCopyAtomB_, TransformB_> [with Stages=1, SchedulerPipelineStageCount=2, ClusterShape=b12x_fp8_dense_cutlass_collective::<unnamed>::ClusterShape, KernelScheduleType=cutlass::gemm::KernelTmaWarpSpecializedPingpongSm120<2>, TileShape_=b12x_fp8_dense_cutlass_collective::<unnamed>::MmaTileShape, ElementA_=b12x_fp8_dense_cutlass_collective::<unnamed>::ElementA, StrideA_=cute::tuple<int64_t, cute::C<1>, int64_t>, ElementB_=b12x_fp8_dense_cutlass_collective::<unnamed>::ElementB, StrideB_=cute::tuple<int64_t, cute::C<1>, int64_t>, TiledMma_=cute::TiledMMA<cute::MMA_Atom<cute::SM120_16x8x32_TN<cutlass::float_e4m3_t, cutlass::float_e4m3_t, float>>, cute::Layout<cute::tuple<cute::_2, cute::_2, cute::C<1>>, cute::tuple<cute::_1, cute::_2, cute::C<0>>>, cute::tuple<cute::_64, cute::_32, cute::_32>>, GmemTiledCopyA_=cute::SM90_TMA_LOAD, SmemLayoutAtomA_=cute::ComposedLayout<cute::Swizzle<3, 4, 3>, cute::smem_ptr_flag_bits<8>, cute::Layout<cute::tuple<cute::_8, cute::_128>, cute::tuple<cute::_128, cute::_1>>>, SmemCopyAtomA_=cute::Copy_Atom<cute::SM75_U32x4_LDSM_N, uint8_t>, TransformA_=cute::identity, GmemTiledCopyB_=cute::SM90_TMA_LOAD, SmemLayoutAtomB_=cute::ComposedLayout<cute::Swizzle<3, 4, 3>, cute::smem_ptr_flag_bits<8>, cute::Layout<cute::tuple<cute::_8, cute::_128>, cute::tuple<cute::_128, cute::_1>>>, SmemCopyAtomB_=cute::Copy_Atom<cute::SM75_U32x4_LDSM_N, uint8_t>, TransformB_=cute::identity]" at line 101 of /home/farazkh_scratch/agentic-dev/avo-b12x-trt/b12x/b12x/gemm/fp8_dense_cutlass_collective_ext.cu
+
+1 error detected in the compilation of "/home/farazkh_scratch/agentic-dev/avo-b12x-trt/b12x/b12x/gemm/fp8_dense_cutlass_collective_ext.cu".
+ninja: build stopped: subcommand failed.
+
+FAILED 64,128,256,2
+CONFIG 64,128,128,3
+correct {'max_abs': 0.5, 'mean_abs': 3.1137219593802e-06, 'cos': 1.0}
+torch {'median': 67.09440231323242, 'min': 66.90879821777344, 'all': [67.07839965820312, 66.90879821777344, 67.19808101654053, 67.09440231323242, 69.93728160858154]}
+cutlass {'median': 76.12160205841064, 'min': 73.96096229553223, 'all': [76.95871829986572, 76.12160205841064, 73.96096229553223, 74.3884801864624, 82.1945571899414]}
+ratio 1.1345447523779173
+CONFIG 64,256,128,3
+correct {'max_abs': 0.5, 'mean_abs': 3.1137219593802e-06, 'cos': 1.0}
+torch {'median': 80.15168190002441, 'min': 79.97824192047119, 'all': [80.1369571685791, 80.15168190002441, 80.15935897827148, 80.20735740661621, 79.97824192047119]}
+cutlass {'median': 89.54751968383789, 'min': 89.23328399658203, 'all': [89.54751968383789, 90.11712074279785, 101.21472358703613, 89.28832054138184, 89.23328399658203]}
+ratio 1.1172257095681808

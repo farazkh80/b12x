@@ -1,0 +1,193 @@
+[spark] container 'avo-b12x-spark-fkhoubsirat' already running on p4242-0053
+Running 7 items in this shard
+FFFF..F                                                                  [100%]
+=================================== FAILURES ===================================
+________________ test_fp8_dense_gemm_matches_scaled_mm[shape0] _________________
+
+shape = (1, 64, 64)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+    @pytest.mark.parametrize("shape", [(1, 64, 64), (8, 128, 128), (32, 256, 256)])
+    def test_fp8_dense_gemm_matches_scaled_mm(shape: tuple[int, int, int]) -> None:
+        require_sm120()
+        m, k, n = shape
+        a, scale_a = _make_fp8((m, k), 1)
+        b, scale_b = _make_fp8((n, k), 2)
+    
+>       out = fp8_dense_gemm(a, b, scale_a, scale_b)
+
+tests/test_fp8_dense_gemm.py:28: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+b12x/gemm/fp8_dense.py:694: in fp8_dense_gemm
+    compiled = cute.compile(kernel, a_cute, b_cute, scale_a_cute, scale_b_cute, out_cute, stream)
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/base_dsl/compiler.py:578: in __call__
+    return self._compile(*args, **kwargs)
+b12x/cute/runtime_patches.py:605: in patched_compile
+    compiled = _load_cute_compile_from_disk(cache_key)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+cache_key = 'aa4eae2e1fccef33289e7fd36ad6e0d15ee9774ccdf71edadb5e7cbac848f8b4'
+
+    def _load_cute_compile_from_disk(cache_key: str):
+>       from cutlass.base_dsl.export.external_binary_module import ExternalBinaryModule
+E       ModuleNotFoundError: No module named 'cutlass.base_dsl.export.external_binary_module'
+
+b12x/cute/runtime_patches.py:432: ModuleNotFoundError
+________________ test_fp8_dense_gemm_matches_scaled_mm[shape1] _________________
+
+shape = (8, 128, 128)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+    @pytest.mark.parametrize("shape", [(1, 64, 64), (8, 128, 128), (32, 256, 256)])
+    def test_fp8_dense_gemm_matches_scaled_mm(shape: tuple[int, int, int]) -> None:
+        require_sm120()
+        m, k, n = shape
+        a, scale_a = _make_fp8((m, k), 1)
+        b, scale_b = _make_fp8((n, k), 2)
+    
+>       out = fp8_dense_gemm(a, b, scale_a, scale_b)
+
+tests/test_fp8_dense_gemm.py:28: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+b12x/gemm/fp8_dense.py:694: in fp8_dense_gemm
+    compiled = cute.compile(kernel, a_cute, b_cute, scale_a_cute, scale_b_cute, out_cute, stream)
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/base_dsl/compiler.py:578: in __call__
+    return self._compile(*args, **kwargs)
+b12x/cute/runtime_patches.py:605: in patched_compile
+    compiled = _load_cute_compile_from_disk(cache_key)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+cache_key = '50d515634514a0fdb0e2f6348b8941a887b12a09f873dbf6ff78d256567eda03'
+
+    def _load_cute_compile_from_disk(cache_key: str):
+>       from cutlass.base_dsl.export.external_binary_module import ExternalBinaryModule
+E       ModuleNotFoundError: No module named 'cutlass.base_dsl.export.external_binary_module'
+
+b12x/cute/runtime_patches.py:432: ModuleNotFoundError
+________________ test_fp8_dense_gemm_matches_scaled_mm[shape2] _________________
+
+shape = (32, 256, 256)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+    @pytest.mark.parametrize("shape", [(1, 64, 64), (8, 128, 128), (32, 256, 256)])
+    def test_fp8_dense_gemm_matches_scaled_mm(shape: tuple[int, int, int]) -> None:
+        require_sm120()
+        m, k, n = shape
+        a, scale_a = _make_fp8((m, k), 1)
+        b, scale_b = _make_fp8((n, k), 2)
+    
+>       out = fp8_dense_gemm(a, b, scale_a, scale_b)
+
+tests/test_fp8_dense_gemm.py:28: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+b12x/gemm/fp8_dense.py:694: in fp8_dense_gemm
+    compiled = cute.compile(kernel, a_cute, b_cute, scale_a_cute, scale_b_cute, out_cute, stream)
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/base_dsl/compiler.py:578: in __call__
+    return self._compile(*args, **kwargs)
+b12x/cute/runtime_patches.py:605: in patched_compile
+    compiled = _load_cute_compile_from_disk(cache_key)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+cache_key = '5df11be23a976ee880203009d54fc621572870635c55280788654ac68bc5fde9'
+
+    def _load_cute_compile_from_disk(cache_key: str):
+>       from cutlass.base_dsl.export.external_binary_module import ExternalBinaryModule
+E       ModuleNotFoundError: No module named 'cutlass.base_dsl.export.external_binary_module'
+
+b12x/cute/runtime_patches.py:432: ModuleNotFoundError
+________________ test_fp8_dense_gemm_mma_matches_scaled_mm_tile ________________
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+    def test_fp8_dense_gemm_mma_matches_scaled_mm_tile() -> None:
+        require_sm120()
+        m, k, n = 16, 32, 32
+        a, scale_a = _make_fp8((m, k), 3)
+        b, scale_b = _make_fp8((n, k), 4)
+    
+        ref = torch._scaled_mm(
+            a,
+            b.t(),
+            scale_a=scale_a,
+            scale_b=scale_b,
+            out_dtype=torch.bfloat16,
+        )
+>       out = fp8_dense_gemm_mma(a, b, scale_a, scale_b)
+
+tests/test_fp8_dense_gemm.py:55: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+b12x/gemm/fp8_dense.py:627: in fp8_dense_gemm_mma
+    compiled = cute.compile(kernel, a_cute, b_cute, scale_a_cute, scale_b_cute, out_cute, stream)
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/base_dsl/compiler.py:578: in __call__
+    return self._compile(*args, **kwargs)
+b12x/cute/runtime_patches.py:605: in patched_compile
+    compiled = _load_cute_compile_from_disk(cache_key)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+cache_key = 'ff040e803c4131cc9230b60410d0995f934dd48330762f8630f659a6d60a738c'
+
+    def _load_cute_compile_from_disk(cache_key: str):
+>       from cutlass.base_dsl.export.external_binary_module import ExternalBinaryModule
+E       ModuleNotFoundError: No module named 'cutlass.base_dsl.export.external_binary_module'
+
+b12x/cute/runtime_patches.py:432: ModuleNotFoundError
+___________ test_fp8_dense_gemm_mma_restores_column_six_in_each_tile ___________
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+    def test_fp8_dense_gemm_mma_restores_column_six_in_each_tile() -> None:
+        require_sm120()
+        scale = torch.ones((1,), device="cuda", dtype=torch.float32)
+        a = torch.zeros((16, 32), device="cuda", dtype=torch.float32)
+        b = torch.zeros((32, 32), device="cuda", dtype=torch.float32)
+        a[:, 0] = 1.0
+        b[:, 0] = torch.arange(1, 33, device="cuda", dtype=torch.float32)
+    
+>       out = fp8_dense_gemm_mma(
+            a.to(torch.float8_e4m3fn).contiguous(),
+            b.to(torch.float8_e4m3fn).contiguous(),
+            scale,
+            scale,
+        )
+
+tests/test_fp8_dense_gemm.py:116: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+b12x/gemm/fp8_dense.py:627: in fp8_dense_gemm_mma
+    compiled = cute.compile(kernel, a_cute, b_cute, scale_a_cute, scale_b_cute, out_cute, stream)
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/base_dsl/compiler.py:578: in __call__
+    return self._compile(*args, **kwargs)
+b12x/cute/runtime_patches.py:605: in patched_compile
+    compiled = _load_cute_compile_from_disk(cache_key)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+cache_key = 'ff040e803c4131cc9230b60410d0995f934dd48330762f8630f659a6d60a738c'
+
+    def _load_cute_compile_from_disk(cache_key: str):
+>       from cutlass.base_dsl.export.external_binary_module import ExternalBinaryModule
+E       ModuleNotFoundError: No module named 'cutlass.base_dsl.export.external_binary_module'
+
+b12x/cute/runtime_patches.py:432: ModuleNotFoundError
+=============================== warnings summary ===============================
+../../../../../usr/local/lib/python3.12/dist-packages/Cython/Distutils/old_build_ext.py:15
+../../../../../usr/local/lib/python3.12/dist-packages/Cython/Distutils/old_build_ext.py:15
+  /usr/local/lib/python3.12/dist-packages/Cython/Distutils/old_build_ext.py:15: DeprecationWarning: dep_util is Deprecated. Use functions from setuptools instead.
+    from distutils.dep_util import newer, newer_group
+
+../../../../../usr/local/lib/python3.12/dist-packages/_pytest/cacheprovider.py:446
+  /usr/local/lib/python3.12/dist-packages/_pytest/cacheprovider.py:446: PytestCacheWarning: could not create cache path /home/farazkh_scratch/agentic-dev/avo-b12x-trt/b12x/.pytest_cache/v/cache/nodeids: [Errno 13] Permission denied: '/home/farazkh_scratch/agentic-dev/avo-b12x-trt/b12x/.pytest_cache'
+    config.cache.set("cache/nodeids", sorted(self.cached_nodeids))
+
+../../../../../usr/local/lib/python3.12/dist-packages/_pytest/cacheprovider.py:398
+  /usr/local/lib/python3.12/dist-packages/_pytest/cacheprovider.py:398: PytestCacheWarning: could not create cache path /home/farazkh_scratch/agentic-dev/avo-b12x-trt/b12x/.pytest_cache/v/cache/lastfailed: [Errno 13] Permission denied: '/home/farazkh_scratch/agentic-dev/avo-b12x-trt/b12x/.pytest_cache'
+    config.cache.set("cache/lastfailed", self.lastfailed)
+
+../../../../../usr/local/lib/python3.12/dist-packages/_pytest/stepwise.py:57
+  /usr/local/lib/python3.12/dist-packages/_pytest/stepwise.py:57: PytestCacheWarning: could not create cache path /home/farazkh_scratch/agentic-dev/avo-b12x-trt/b12x/.pytest_cache/v/cache/stepwise: [Errno 13] Permission denied: '/home/farazkh_scratch/agentic-dev/avo-b12x-trt/b12x/.pytest_cache'
+    session.config.cache.set(STEPWISE_CACHE_DIR, [])
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/test_fp8_dense_gemm.py::test_fp8_dense_gemm_matches_scaled_mm[shape0]
+FAILED tests/test_fp8_dense_gemm.py::test_fp8_dense_gemm_matches_scaled_mm[shape1]
+FAILED tests/test_fp8_dense_gemm.py::test_fp8_dense_gemm_matches_scaled_mm[shape2]
+FAILED tests/test_fp8_dense_gemm.py::test_fp8_dense_gemm_mma_matches_scaled_mm_tile
+FAILED tests/test_fp8_dense_gemm.py::test_fp8_dense_gemm_mma_restores_column_six_in_each_tile
+5 failed, 2 passed, 5 warnings in 2.85s

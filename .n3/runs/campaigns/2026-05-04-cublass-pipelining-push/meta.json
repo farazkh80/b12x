@@ -1,0 +1,25 @@
+{
+  "slug": "cublass-pipelining-push",
+  "started_at": "2026-05-04T15:00:00Z",
+  "ended_at": null,
+  "b12x_hash_at_start": "91141f41f337e166bdc81d248e46409587f26133",
+  "b12x_hash_at_end": null,
+  "parent_hash_at_start": "aef8a13225baa8ce468704327faa30cb7c94d9a7",
+  "parent_hash_at_end": null,
+  "session_id": null,
+  "status": "active",
+  "outcome_summary": null,
+  "starting_state": {
+    "headline_shape": "M=32,K=5376,N=5376",
+    "current_best_kernel": "cutlass_collective(64,64,256,8)",
+    "current_best_us": 180.35,
+    "torch_scaled_mm_us": 184.32,
+    "current_gain_pct": 2.15,
+    "dram_bound_floor_us": 108,
+    "remaining_pipeline_overhead_us": 72,
+    "achieved_dram_bw_gbps": 161,
+    "peak_dram_bw_gbps": 273,
+    "achieved_dram_pct": 60.8
+  },
+  "predecessor_campaign": "2026-05-02-cutlass-collective-deepdive"
+}

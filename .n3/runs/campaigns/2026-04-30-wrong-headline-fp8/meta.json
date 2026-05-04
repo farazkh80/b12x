@@ -1,0 +1,14 @@
+{
+  "slug": "wrong-headline-fp8",
+  "started_at": "2026-04-30T18:30:00Z",
+  "ended_at": "2026-05-01T12:32:49Z",
+  "b12x_hash_at_start": "2461f83cb2cb0062552795a79c8d96af014dfa30",
+  "b12x_hash_at_end": "2461f83cb2cb0062552795a79c8d96af014dfa30",
+  "parent_hash_at_start": null,
+  "session_id": "7ef7fa6a46ba4bc6",
+  "status": "archived",
+  "outcome_summary": "Followed the original 'closest above 80 µs' rule and picked headline shape (M=1, K=4096, N=4096). The inline-PTX kernel was hand-tuned for (M=32, K=5376, N=5376), so on M=1 it pads to M=16 and runs 270 µs vs 124 µs torch._scaled_mm. AVO chased a 'small-M decode fast path' rabbit hole, regressed in Step 2, reverted, used 2 of 3 Track 1 steps before being archived. Also produced the verified CuTeDSL/cutlass FP8 atom-availability diagnosis (no warp-level FP8 atom on sm_120 in cutlass-dsl 4.3.4; tcgen05 atoms are sm_100f-only). That diagnosis was kept and informed all later campaigns.",
+  "produced_artifacts": [
+    "b12x/.n3/runs/tracks/T1/_archived_wrong_headline/step{1,2,3}/"
+  ]
+}

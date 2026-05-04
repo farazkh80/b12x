@@ -1,0 +1,19 @@
+{
+  "slug": "cutlass-collective-deepdive",
+  "started_at": "2026-05-02T10:00:00Z",
+  "ended_at": "2026-05-02T11:30:00Z",
+  "b12x_hash_at_start": "932e801ccdcd98ebfa73e1883bd40a7c995fbe41",
+  "b12x_hash_at_end": "91141f41f337e166bdc81d248e46409587f26133",
+  "parent_hash_at_start": null,
+  "session_id": "defbca5dd64442e8",
+  "status": "completed",
+  "outcome_summary": "Built fp8_dense_cutlass_collective_ext.cu wrapping CUTLASS CollectiveBuilder + SM120_16x8x32_TN atom. Swept 21 tile/stage configs. Best correct: (128, 64, 128, 2) at 88.10 µs hot-cache vs torch._scaled_mm 79.57 µs (10% slower). No L2 flush — hot-cache numbers only. Did not promote.",
+  "produced_artifacts": [
+    "b12x/gemm/fp8_dense_cutlass_collective_ext.cu",
+    "b12x/gemm/fp8_dense_cutlass_collective.py",
+    "b12x/.n3/runs/tracks/cutlass_collective_tune.{py,log}",
+    "b12x/.n3/runs/tracks/cutlass_collective_tune2.log",
+    "b12x/.n3/runs/tracks/cutlass_collective_{smoke,benchmark,best_verify,...}.log"
+  ],
+  "carried_forward_to": "2026-05-04-cublass-pipelining-push"
+}
