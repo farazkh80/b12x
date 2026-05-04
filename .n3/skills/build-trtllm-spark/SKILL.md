@@ -139,14 +139,30 @@ revert (the install path is in the workspace bind-mount, persistent).
 
 ## Time / disk footprint
 
-- Wall-time:
-  - Cold cache: **~42 min** (sm_121 only, `-j 12` on GB10).
-  - Warm cache after header-only edit (e.g. `cublasScaledMMLut.h`): **~5-10 min**.
-- Disk:
-  - `$WORKSPACE/.n3/ccache/`: grows to ~0.5-1 GiB after one cold build, capped
-    at 5 GiB by ccache default.
-  - `$WORKSPACE/TensorRT-LLM/cpp/build/`: ~10 GiB of build artifacts.
-  - `$WORKSPACE/TensorRT-LLM/tensorrt_llm/libs/`: ~700 MB of installed `.so`s.
+Wall-times verified 2026-05-04 on GB10 with `-j 12`:
+
+| scenario | total | what dominates |
+|---|---:|---|
+| **Cold build** (empty ccache, no prior build artifacts) | **~42 min** | ~30 min cutlass + fmha CUDA template TUs |
+| **Warm rebuild** after a single header edit (e.g. `cublasScaledMMLut.h`) | **~13 min** | ~3 min CMake reconfigure, ~3 min compile (2 dependent TUs), **~7 min wheel packaging** (cutlass/fmha header copy + zip; runs twice due to TRT-LLM's build-then-install flow) |
+
+**ccache contribution is ~zero on warm rebuild.** The speedup comes from
+**ninja's incremental decisions** — for unmodified TUs ninja never invokes
+nvcc, so there's nothing for ccache to short-circuit. ccache populates ~0.4
+GiB during the cold build but warm-rebuild hit rate is <1 % (verified
+`ccache -s`). The cache earns its keep when you DO need to recompile a
+previously-built TU (e.g., revert a change), not on incremental builds.
+
+The dominant cost on warm rebuilds is the **wheel-packaging phase**
+(setuptools `bdist_wheel` copies ~30k cutlass headers/docs into the wheel
+build tree, twice — once for the wheel, once for the editable-install
+isolation env). This is independent of whether anything actually recompiled.
+
+Disk:
+- `$WORKSPACE/.n3/ccache/`: grows to ~0.4-1 GiB after one cold build, capped
+  at 5 GiB by ccache default.
+- `$WORKSPACE/TensorRT-LLM/cpp/build/`: ~10 GiB of CMake build artifacts.
+- `$WORKSPACE/TensorRT-LLM/tensorrt_llm/libs/`: ~700 MB of installed `.so`s.
 
 ## Files in the skill
 
