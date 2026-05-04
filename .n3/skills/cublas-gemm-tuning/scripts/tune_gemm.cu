@@ -229,23 +229,19 @@ int main(int argc, char** argv) {
   } else if (needs_scales && effective_scale_mode == "block_ue4m3_vec16") {
     // NVFP4 (CUDA_R_4F_E2M1) with VEC16_UE4M3 scales.
     //
-    // KNOWN LIMITATION (2026-05-04 on cuBLAS 13.2.1 / sm_120 GB10):
-    // cublasLtMatmulAlgoGetHeuristic still returns CUBLAS_STATUS_INVALID_VALUE
-    // (status=7) for NVFP4 even with all of:
-    //   - aScalePointer/bScalePointer set, A/B/C/D/D_OUT_SCALE_MODE set
-    //   - cScalePointer/dScalePointer/dOutScalePointer explicitly nullptr
-    //   - POINTER_MODE_DEVICE, FAST_ACCUM=1, separate C/D layouts
-    //   - PreferenceInit, default col-major layouts
-    // The likely missing piece is the **swizzled scale tensor layout** that
-    // cuBLAS-Lt expects (the scale tensors are not flat (M, K/16) of UE4M3
-    // bytes; they're in a swizzled MX-spec layout that this flat memset
-    // doesn't produce). See TRT-LLM cpp/tensorrt_llm/thop/cublasFp4ScaledMM.cpp
-    // and the trtllm-gen scale-tensor swizzler for the actual layout. Until
-    // that's reverse-engineered, NVFP4 tuning via this binary returns 0
-    // candidates; fall back to AutoTuner-driven tactic search through TRT-LLM's
-    // CublasLtFP4GemmRunner instead.
-    //
-    // FP8 (block_ue8m0_vec32) does work correctly — see comment above.
+    // The full set of attributes cuBLAS-Lt's NVFP4 heuristic requires on
+    // sm_120 (verified by mirroring TRT-LLM's cublasMMWrapper FP4 path):
+    //   - aScalePointer/bScalePointer to flat (M, K/16) and (N, K/16)
+    //     UE4M3 byte tensors. NO special swizzling — flat 0x38 bytes
+    //     (= 1.0 in UE4M3 since exp=7=bias and mantissa=0) are accepted.
+    //   - A/B_SCALE_MODE = VEC16_UE4M3
+    //   - C/D/D_OUT_SCALE_MODE = SCALAR_32F
+    //   - cScalePointer/dScalePointer/dOutScalePointer = nullptr
+    //   - POINTER_MODE_DEVICE (alpha/beta read from device memory)
+    //   - **FAST_ACCUM = 0** (FP8 needs FAST_ACCUM=1, FP4 needs 0;
+    //     this is the difference that took the longest to find)
+    //   - Separate Cdesc and Ddesc layout objects (not the same pointer)
+    //   - cublasLtMatmulPreferenceInit() before SetAttribute calls
     if (args.K % 16 != 0) {
       fprintf(stderr, "[tune_gemm] WARN: K=%d is not a multiple of 16 — NVFP4 vec16 "
                       "scale layout assumes K%%16==0\n", args.K);
@@ -275,7 +271,9 @@ int main(int argc, char** argv) {
     LT_CHECK(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_D_OUT_SCALE_POINTER, &null_ptr, sizeof(null_ptr)));
     cublasLtPointerMode_t pmode = CUBLASLT_POINTER_MODE_DEVICE;
     LT_CHECK(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_POINTER_MODE, &pmode, sizeof(pmode)));
-    int8_t fast_accum = 1;
+    // TRT-LLM's BlockScaleGemm calls createDescriptors with fastAcc=0 for FP4
+    // and never overrides; FAST_ACCUM=1 is FP8-specific.
+    int8_t fast_accum = 0;
     cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_FAST_ACCUM, &fast_accum, sizeof(fast_accum));
     fprintf(stderr, "[tune_gemm] scale-mode=block_ue4m3_vec16 (a=%zuB, b=%zuB)\n",
             a_scale_bytes, b_scale_bytes);
