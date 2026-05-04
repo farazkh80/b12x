@@ -1,0 +1,8 @@
+# Default extra-llm-api options for trtllm-bench runs driven by the
+# trtllm-bench AVO skill. Conservative defaults that work on GB10/Spark with
+# NVFP4 hybrid-Mamba models like Nemotron Nano 3.
+kv_cache_config:
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.2
+enable_iter_perf_stats: true
+enable_chunked_prefill: true
