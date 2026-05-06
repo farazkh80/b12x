@@ -28,6 +28,7 @@ from b12x.integration.tp_moe import (
     TPMoEArenaLayout,
     TPMoEWorkspacePool,
     allocate_tp_moe_workspace_pool,
+    default_moe_quant_mode,
     plan_tp_moe_arena_layout,
 )
 
@@ -50,6 +51,7 @@ def _device_key(device: torch.device | str) -> tuple[torch.device, int]:
 class B12XMoEArenaCaps:
     device: torch.device
     dtype: torch.dtype
+    quant_mode: str | None = None
     weight_E: int
     k: int
     n: int
@@ -61,6 +63,14 @@ class B12XMoEArenaCaps:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "device", _canonical_device(self.device))
+        quant_mode = (
+            default_moe_quant_mode()
+            if self.quant_mode is None
+            else str(self.quant_mode).lower()
+        )
+        if quant_mode not in {"nvfp4", "w4a16"}:
+            raise ValueError(f"unsupported quant_mode {self.quant_mode!r}")
+        object.__setattr__(self, "quant_mode", quant_mode)
         object.__setattr__(self, "weight_E", max(int(self.weight_E), 1))
         object.__setattr__(self, "k", max(int(self.k), 1))
         object.__setattr__(self, "n", max(int(self.n), 1))
@@ -87,6 +97,7 @@ class B12XMoEArenaCaps:
             core_token_counts=self.core_token_counts,
             route_num_experts=self.route_num_experts,
             route_logits_dtype=self.route_logits_dtype,
+            quant_mode=self.quant_mode,
         )
 
 
@@ -113,6 +124,142 @@ class B12XJointArenaSpec:
             raise ValueError(
                 f"MoE caps device {self.moe_caps.device} does not match joint arena device {device}"
             )
+
+
+def _field_matches(existing: object, requested: object, field: str) -> bool:
+    return getattr(existing, field) == getattr(requested, field)
+
+
+def _fields_match(existing: object, requested: object, fields: tuple[str, ...]) -> bool:
+    return all(_field_matches(existing, requested, field) for field in fields)
+
+
+def _fields_cover(existing: object, requested: object, fields: tuple[str, ...]) -> bool:
+    return all(getattr(existing, field) >= getattr(requested, field) for field in fields)
+
+
+def _attention_caps_cover(
+    existing: B12XAttentionArenaCaps | None,
+    requested: B12XAttentionArenaCaps | None,
+) -> bool:
+    if requested is None:
+        return True
+    if existing is None:
+        return False
+    if not _fields_match(
+        existing,
+        requested,
+        (
+            "device",
+            "dtype",
+            "kv_dtype",
+            "num_q_heads",
+            "head_dim",
+            "topk",
+            "page_size",
+            "padded_heads",
+        ),
+    ):
+        return False
+    if requested.reserve_extend_indexer_logits and not existing.reserve_extend_indexer_logits:
+        return False
+    return _fields_cover(
+        existing,
+        requested,
+        (
+            "indexer_num_q_heads",
+            "max_v_head_dim",
+            "max_page_table_width",
+            "extend_max_total_q",
+            "extend_max_batch",
+            "extend_max_kv_rows",
+            "paged_max_q_rows",
+            "paged_max_batch",
+            "max_chunks_per_row",
+            "extend_indexer_tile_logits_k_rows",
+        ),
+    )
+
+
+def _paged_attention_caps_cover(
+    existing: PagedAttentionArenaCaps | None,
+    requested: PagedAttentionArenaCaps | None,
+) -> bool:
+    if requested is None:
+        return True
+    if existing is None:
+        return False
+    if not _fields_match(
+        existing,
+        requested,
+        ("device", "dtype", "kv_dtype", "page_size"),
+    ):
+        return False
+    return _fields_cover(
+        existing,
+        requested,
+        (
+            "num_q_heads",
+            "num_kv_heads",
+            "head_dim_qk",
+            "max_head_dim_vo",
+            "max_total_q",
+            "max_batch",
+            "max_page_table_width",
+            "max_work_items",
+            "max_partial_rows",
+        ),
+    )
+
+
+def _moe_route_num_experts(caps: B12XMoEArenaCaps) -> int:
+    return int(caps.route_num_experts if caps.route_num_experts is not None else caps.weight_E)
+
+
+def _moe_route_logits_dtype(caps: B12XMoEArenaCaps) -> torch.dtype:
+    return caps.route_logits_dtype or caps.dtype
+
+
+def _moe_caps_cover(
+    existing: B12XMoEArenaCaps | None,
+    requested: B12XMoEArenaCaps | None,
+) -> bool:
+    if requested is None:
+        return True
+    if existing is None:
+        return False
+    if not _fields_match(
+        existing,
+        requested,
+        ("device", "dtype", "quant_mode", "weight_E", "k", "n", "num_topk"),
+    ):
+        return False
+    if _moe_route_num_experts(existing) != _moe_route_num_experts(requested):
+        return False
+    if _moe_route_logits_dtype(existing) != _moe_route_logits_dtype(requested):
+        return False
+    existing_layout = existing.layout()
+    requested_layout = requested.layout()
+    return (
+        existing_layout.route_workspace_nbytes >= requested_layout.route_workspace_nbytes
+        and existing_layout.core_workspace_nbytes >= requested_layout.core_workspace_nbytes
+    )
+
+
+def _joint_arena_spec_covers(
+    existing: B12XJointArenaSpec,
+    requested: B12XJointArenaSpec,
+) -> bool:
+    if existing.device != requested.device:
+        return False
+    return (
+        _attention_caps_cover(existing.attention_caps, requested.attention_caps)
+        and _paged_attention_caps_cover(
+            existing.paged_attention_caps,
+            requested.paged_attention_caps,
+        )
+        and _moe_caps_cover(existing.moe_caps, requested.moe_caps)
+    )
 
 
 @dataclass(kw_only=True)
@@ -261,7 +408,7 @@ def ensure_b12x_execution_lane_arena(spec: B12XJointArenaSpec) -> B12XExecutionL
             )
         arena = B12XExecutionLaneArena.allocate(spec)
         return _install_b12x_execution_lane_arena(canonical_device, arena)
-    if lane.arena.spec != spec:
+    if lane.arena.spec != spec and not _joint_arena_spec_covers(lane.arena.spec, spec):
         raise RuntimeError(
             "existing b12x execution lane arena has incompatible sizing caps for this device"
         )

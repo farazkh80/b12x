@@ -130,10 +130,11 @@ def test_sparse_moe_fp4_accepts_precomputed_router_logits() -> None:
         input_scales_static=False,
         fast_math=None,
         activation="silu",
+        quant_mode="nvfp4",
     ):
         del a1_gscale, w1_fp4, w1_blockscale, w1_alphas
         del a2_gscale, w2_fp4, w2_blockscale, w2_alphas
-        del input_scales_are_reciprocal, input_scales_static, fast_math, activation
+        del input_scales_are_reciprocal, input_scales_static, fast_math, activation, quant_mode
         captured["a"] = a
         captured["topk_weights"] = topk_weights
         captured["topk_ids"] = topk_ids
@@ -186,6 +187,7 @@ def test_sparse_moe_fp4_forwards_low_level_flags() -> None:
         input_scales_static=False,
         fast_math=None,
         activation="silu",
+        quant_mode="nvfp4",
     ):
         del args
         captured["workspace"] = workspace
@@ -194,6 +196,7 @@ def test_sparse_moe_fp4_forwards_low_level_flags() -> None:
         captured["input_scales_static"] = input_scales_static
         captured["fast_math"] = fast_math
         captured["activation"] = activation
+        captured["quant_mode"] = quant_mode
         if output is None:
             return torch.ones_like(hidden_states)
         output.fill_(1.0)
@@ -210,6 +213,7 @@ def test_sparse_moe_fp4_forwards_low_level_flags() -> None:
             input_scales_are_reciprocal=True,
             input_scales_static=True,
             fast_math=False,
+            quant_mode="w4a16",
         )
 
     assert actual is output
@@ -220,7 +224,52 @@ def test_sparse_moe_fp4_forwards_low_level_flags() -> None:
         "input_scales_static": True,
         "fast_math": False,
         "activation": "silu",
+        "quant_mode": "w4a16",
     }
+
+
+def test_sparse_moe_fp4_env_defaults_to_w4a16(monkeypatch) -> None:
+    monkeypatch.setenv("B12X_MOE_FORCE_A16", "1")
+    hidden_states = torch.randn(2, 4)
+    experts = _make_experts(hidden_size=4)
+    workspace = object()
+    routing = B12XTopKRouting(
+        topk_weights=torch.ones(2, 1, dtype=torch.float32),
+        topk_ids=torch.zeros(2, 1, dtype=torch.int64),
+    )
+    captured: list[object] = []
+
+    def fake_b12x_moe_fp4(
+        *args,
+        workspace,
+        output=None,
+        input_scales_are_reciprocal=False,
+        input_scales_static=False,
+        fast_math=None,
+        activation="silu",
+        quant_mode=None,
+    ):
+        del args, workspace, output
+        del input_scales_are_reciprocal, input_scales_static, fast_math, activation
+        captured.append(quant_mode)
+        return torch.ones_like(hidden_states)
+
+    with patch.object(tp_moe, "b12x_moe_fp4", fake_b12x_moe_fp4):
+        b12x_sparse_moe_fp4(
+            hidden_states,
+            experts=experts,
+            workspace=workspace,
+            routing=routing,
+        )
+        b12x_sparse_moe_fp4(
+            hidden_states,
+            experts=experts,
+            workspace=workspace,
+            routing=routing,
+            quant_mode="nvfp4",
+        )
+
+    assert captured == [None, "nvfp4"]
 
 
 def test_sparse_moe_fp4_scales_output_in_place() -> None:

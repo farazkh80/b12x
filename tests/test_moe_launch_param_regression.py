@@ -1,4 +1,4 @@
-"""Regression tests for Parameter-backed tp_moe launch arguments."""
+"""Regression tests for tp_moe launch arguments."""
 
 from __future__ import annotations
 
@@ -16,12 +16,16 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from benchmarks.benchmark_moe import MODEL_PATH, TP_RANK, TP_SIZE, ModelSpec
 
 
-def _skip_if_unavailable() -> None:
+def _skip_if_no_sm120() -> None:
     if not torch.cuda.is_available():
         pytest.skip("No CUDA")
     major, minor = torch.cuda.get_device_capability()
     if major != 12 or minor not in (0, 1):
         pytest.skip(f"Requires SM120 or SM121, got sm_{major}{minor}")
+
+
+def _skip_if_unavailable() -> None:
+    _skip_if_no_sm120()
     if not MODEL_PATH.exists():
         pytest.skip(f"Model not found at {MODEL_PATH}")
     if not (MODEL_PATH / "model.safetensors.index.json").exists():
@@ -128,6 +132,40 @@ def _run_parameter_launch_case(case: str) -> subprocess.CompletedProcess[str]:
         text=True,
         capture_output=True,
     )
+
+
+def _w4a16_direct_micro_launchable(m: int, n: int) -> bool:
+    from b12x.integration.tp_moe import (
+        _DIRECT_MICRO_BLOCK_DIM,
+        _compiled_direct_micro_accepts_block_dim,
+        _get_micro_kernel,
+        clear_tp_moe_caches,
+    )
+
+    clear_tp_moe_caches()
+    torch.empty(1, device="cuda")
+    compiled, _ = _get_micro_kernel(
+        256,
+        m,
+        4096,
+        n,
+        10,
+        topk_ids_dtype=torch.int32,
+        input_scales_are_reciprocal=False,
+        fast_math=True,
+        activation="silu",
+        quant_mode="w4a16",
+        device=torch.device("cuda"),
+    )
+    return _compiled_direct_micro_accepts_block_dim(compiled, _DIRECT_MICRO_BLOCK_DIM)
+
+
+def test_w4a16_direct_micro_resource_gate_rejects_wide_m4() -> None:
+    _skip_if_no_sm120()
+
+    assert _w4a16_direct_micro_launchable(4, 256)
+    assert _w4a16_direct_micro_launchable(2, 4096)
+    assert not _w4a16_direct_micro_launchable(4, 4096)
 
 
 @pytest.mark.parametrize("case", ["alphas", "scales"])

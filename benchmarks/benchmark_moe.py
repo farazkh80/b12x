@@ -29,6 +29,7 @@ from b12x.moe.fused.reference import (
     moe_reference_f32,
     moe_reference_nvfp4,
 )
+from b12x.moe.fused.w4a16.reference import moe_reference_w4a16
 from b12x.cute.fp4 import as_grouped_scale_view, swizzle_block_scale
 from b12x.cute.utils import get_hardware_info
 
@@ -735,6 +736,28 @@ def get_scale_contract_params(weights: ExpertWeights, scale_contract: str) -> Sc
     raise ValueError(f"Unsupported scale contract: {scale_contract}")
 
 
+def get_quant_mode_params(
+    weights: ExpertWeights,
+    scale_contract: str,
+    quant_mode: str,
+) -> ScaleContractParams:
+    params = get_scale_contract_params(weights, scale_contract)
+    quant_mode = quant_mode.lower()
+    if quant_mode == "nvfp4":
+        return params
+    if quant_mode == "w4a16":
+        # W4A16 keeps activations in BF16, so remove the activation input
+        # scale factor from the fused alpha and leave only the weight global
+        # scale component.
+        return ScaleContractParams(
+            a1_gscale=params.a1_gscale,
+            a2_gscale=params.a2_gscale,
+            g1_alphas=(params.g1_alphas / params.a1_gscale).to(torch.float32).contiguous(),
+            g2_alphas=(params.g2_alphas / params.a2_gscale).to(torch.float32).contiguous(),
+        )
+    raise ValueError(f"Unsupported quant mode: {quant_mode}")
+
+
 def bench_flashinfer(
     weights: ExpertWeights,
     x: torch.Tensor,
@@ -784,8 +807,24 @@ def make_oracle_reference(
     *,
     activation: str,
 ) -> torch.Tensor:
-    oracle_fn = moe_reference_nvfp4 if oracle_mode == "nvfp4" else moe_reference_f32
     spec = weights.spec
+    if oracle_mode == "w4a16":
+        return moe_reference_w4a16(
+            x,
+            weights.w13_weight,
+            weights.w13_blockscale_swizzled,
+            params.g1_alphas,
+            weights.w2_weight,
+            weights.w2_blockscale_swizzled,
+            params.g2_alphas,
+            topk_ids,
+            topk_weights,
+            spec.num_experts,
+            spec.hidden_size,
+            spec.I_tp,
+            activation=activation,
+        )
+    oracle_fn = moe_reference_nvfp4 if oracle_mode == "nvfp4" else moe_reference_f32
     return oracle_fn(
         x,
         weights.w13_weight,
@@ -823,6 +862,21 @@ ORACLE_TOLERANCES = {
     },
 }
 
+W4A16_ORACLE_TOLERANCES = {
+    "silu": {
+        "max_abs": None,
+        "rmse": None,
+        "mean_abs": None,
+        "cos_min": 0.9975,
+    },
+    "relu2": {
+        "max_abs": None,
+        "rmse": None,
+        "mean_abs": None,
+        "cos_min": 0.9900,
+    },
+}
+
 
 def format_oracle_metrics(name: str, metrics: OracleMetrics) -> str:
     return (
@@ -834,10 +888,15 @@ def format_oracle_metrics(name: str, metrics: OracleMetrics) -> str:
 
 
 def check_oracle_metrics(
-    label: str, metrics: OracleMetrics, batch_size: int, *, activation: str = "silu"
+    label: str,
+    metrics: OracleMetrics,
+    batch_size: int,
+    *,
+    activation: str = "silu",
+    oracle_mode: str = "nvfp4",
 ) -> list[str]:
     failures = []
-    tol = ORACLE_TOLERANCES[activation]
+    tol = W4A16_ORACLE_TOLERANCES[activation] if oracle_mode == "w4a16" else ORACLE_TOLERANCES[activation]
     if tol["max_abs"] is not None and metrics.max_abs > tol["max_abs"]:
         failures.append(f"  bs={batch_size} {label}: max_abs={metrics.max_abs:.5f} > {tol['max_abs']}")
     if tol["rmse"] is not None and metrics.rmse > tol["rmse"]:
@@ -926,6 +985,8 @@ def allocate_layer_chain_workspace(
     params_stack: Sequence[ScaleContractParams],
     x: torch.Tensor,
     topk_ids_per_layer: Sequence[torch.Tensor],
+    *,
+    quant_mode: str,
 ):
     from b12x.integration.tp_moe import allocate_tp_moe_workspace
 
@@ -939,6 +1000,7 @@ def allocate_layer_chain_workspace(
         weights_stack[0].w2_weight,
         topk_ids_per_layer[0],
         input_scales_static=True,
+        quant_mode=quant_mode,
     )
 
 
@@ -951,6 +1013,7 @@ def run_moe_layer_chain(
     *,
     activation: str,
     fast_math: bool,
+    quant_mode: str,
     output_buffers: Sequence[torch.Tensor] | None = None,
     workspace,
 ) -> list[torch.Tensor]:
@@ -989,6 +1052,7 @@ def run_moe_layer_chain(
             workspace=workspace,
             input_scales_static=True,
             activation=activation,
+            quant_mode=quant_mode,
         )
         layer_outputs.append(current)
     return layer_outputs
@@ -1003,6 +1067,7 @@ def capture_moe_layer_chain(
     *,
     activation: str,
     fast_math: bool,
+    quant_mode: str,
     output_buffers: Sequence[torch.Tensor],
     workspace,
 ) -> torch.cuda.CUDAGraph:
@@ -1016,6 +1081,7 @@ def capture_moe_layer_chain(
             topk_weights_per_layer,
             activation=activation,
             fast_math=fast_math,
+            quant_mode=quant_mode,
             output_buffers=output_buffers,
             workspace=workspace,
         )
@@ -1063,7 +1129,7 @@ def bench_multilayer_graph_mode(
     if args.reference != "none" or args.validate != "none":
         print("Note: multi-layer graph mode skips flashinfer/oracle checks and validates graph replay against an eager layer chain.")
     print("Multi-layer graph mode")
-    print("Backend: b12x auto")
+    print(f"Backend: b12x auto ({args.quant_mode})")
     print(f"Layers: {layer_start}..{layer_start + graph_num_layers - 1}")
     print(f"Patterns: disjoint, overlap, random")
     print()
@@ -1077,7 +1143,10 @@ def bench_multilayer_graph_mode(
         activation=args.activation,
         checkpoint_family=profile.checkpoint_family,
     )
-    params_stack = [get_scale_contract_params(weights, args.scale_contract) for weights in weights_stack]
+    params_stack = [
+        get_quant_mode_params(weights, args.scale_contract, args.quant_mode)
+        for weights in weights_stack
+    ]
 
     scenario_specs = [
         ("disjoint", "disjoint", 1100),
@@ -1113,6 +1182,7 @@ def bench_multilayer_graph_mode(
             params_stack,
             x_buf,
             topk_ids_bufs,
+            quant_mode=args.quant_mode,
         )
 
         run_moe_layer_chain(
@@ -1123,6 +1193,7 @@ def bench_multilayer_graph_mode(
             topk_weights_bufs,
             activation=args.activation,
             fast_math=args.fast_math,
+            quant_mode=args.quant_mode,
             output_buffers=graph_output_bufs,
             workspace=shared_workspace,
         )
@@ -1135,6 +1206,7 @@ def bench_multilayer_graph_mode(
             topk_weights_bufs,
             activation=args.activation,
             fast_math=args.fast_math,
+            quant_mode=args.quant_mode,
             output_buffers=graph_output_bufs,
             workspace=shared_workspace,
         )
@@ -1148,6 +1220,7 @@ def bench_multilayer_graph_mode(
                 topk_weights_bufs,
                 activation=args.activation,
                 fast_math=args.fast_math,
+                quant_mode=args.quant_mode,
                 output_buffers=eager_output_bufs,
                 workspace=shared_workspace,
             )
@@ -1241,6 +1314,9 @@ def bench_multilayer_graph_mode(
 
 
 def bench_e2e() -> None:
+    from b12x.integration.tp_moe import default_moe_quant_mode
+
+    quant_mode_default = default_moe_quant_mode()
     parser = argparse.ArgumentParser()
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=20)
@@ -1258,13 +1334,22 @@ def bench_e2e() -> None:
     parser.add_argument("--model-path", type=pathlib.Path, default=None)
     parser.add_argument("--layer-idx", type=int, default=None)
     parser.add_argument("--activation", choices=["silu", "relu2"], default="silu")
+    parser.add_argument(
+        "--quant-mode",
+        choices=["nvfp4", "w4a16"],
+        default=quant_mode_default,
+        help=(
+            "Backend math mode. w4a16 keeps activations BF16 and dequantizes "
+            "FP4 weights inline. B12X_MOE_FORCE_A16=1 changes this default to w4a16."
+        ),
+    )
     parser.add_argument("--graph-mode", choices=["single-op", "multi-layer"], default="single-op")
     parser.add_argument("--graph-num-layers", type=int, default=4)
     parser.add_argument("--graph-layer-start", type=int, default=0)
-    parser.add_argument("--reference", choices=["flashinfer", "none"], default="flashinfer")
+    parser.add_argument("--reference", choices=["flashinfer", "none"], default=None)
     parser.add_argument("--scale-contract", choices=["shared", "per-expert"], default="shared")
     parser.add_argument("--validate", choices=["none", "oracle"], default="oracle")
-    parser.add_argument("--oracle-mode", choices=["nvfp4", "f32"], default="nvfp4")
+    parser.add_argument("--oracle-mode", choices=["nvfp4", "w4a16", "f32"], default=None)
     parser.add_argument("--include-routing", action="store_true")
     parser.set_defaults(cuda_graph=True)
     parser.add_argument(
@@ -1307,6 +1392,10 @@ def bench_e2e() -> None:
         help="Bytes to touch when evicting L2; 0 uses 2x the reported L2 size.",
     )
     args = parser.parse_args()
+    if args.reference is None:
+        args.reference = "none" if args.quant_mode == "w4a16" else "flashinfer"
+    if args.oracle_mode is None:
+        args.oracle_mode = args.quant_mode
     batch_sizes = (
         args.batch_sizes
         if args.batch_sizes is not None
@@ -1318,6 +1407,8 @@ def bench_e2e() -> None:
 
     if args.scale_contract == "per-expert" and args.reference == "flashinfer":
         raise ValueError("--reference flashinfer is only valid with --scale-contract shared")
+    if args.reference == "flashinfer" and args.quant_mode != "nvfp4":
+        raise ValueError("--reference flashinfer is only valid with --quant-mode nvfp4")
     if args.reference == "flashinfer" and args.activation != "silu":
         raise ValueError("--reference flashinfer is only valid with --activation silu")
     if args.graph_only and not args.cuda_graph:
@@ -1341,8 +1432,9 @@ def bench_e2e() -> None:
     print(f"Model path: {model_path}")
     print(f"Layer: {layer_idx}")
     print(f"Activation: {args.activation}")
+    print(f"Quant mode: {args.quant_mode}")
     print(f"Batch-size profile: {args.batch_size_profile} -> {batch_sizes}")
-    print("Backend: b12x auto")
+    print(f"Backend: b12x auto ({args.quant_mode})")
     print(f"Reference: {args.reference}")
     print(f"Scale contract: {args.scale_contract}")
     print(f"Validation: {args.validate}")
@@ -1373,7 +1465,7 @@ def bench_e2e() -> None:
         activation=args.activation,
         checkpoint_family=model_profile.checkpoint_family,
     )
-    params = get_scale_contract_params(weights, args.scale_contract)
+    params = get_quant_mode_params(weights, args.scale_contract, args.quant_mode)
 
     from b12x.integration.tp_moe import (
         allocate_tp_moe_workspace,
@@ -1405,6 +1497,7 @@ def bench_e2e() -> None:
         workspace=warmup_workspace,
         fast_math=args.fast_math,
         activation=args.activation,
+        quant_mode=args.quant_mode,
     )
     torch.cuda.synchronize()
     print(" done.")
@@ -1419,7 +1512,7 @@ def bench_e2e() -> None:
                 model_path, rspec, layer_idx=layer_idx,
                 activation=args.activation, checkpoint_family=model_profile.checkpoint_family,
             )
-            rp = get_scale_contract_params(rw, args.scale_contract)
+            rp = get_quant_mode_params(rw, args.scale_contract, args.quant_mode)
             tp_parallel_ranks.append((rspec, rw, rp))
         # Warm up each rank's kernel
         for r, (rspec, rw, rp) in enumerate(tp_parallel_ranks):
@@ -1433,11 +1526,12 @@ def bench_e2e() -> None:
                 rp.g1_alphas, rp.a2_gscale, rw.w2_weight, rw.w2_blockscale_swizzled,
                 rp.g2_alphas, rk_weights, rk_ids,
                 workspace=ws_r, fast_math=args.fast_math, activation=args.activation,
+                quant_mode=args.quant_mode,
             )
         torch.cuda.synchronize()
         print(f" {spec.tp_size} ranks done.")
 
-    backend_label = "b12x"
+    backend_label = "b12x" if args.quant_mode == "nvfp4" else f"b12x-{args.quant_mode}"
 
     batch_results: dict[int, BatchResult] = {}
     accuracy_failures: list[str] = []
@@ -1474,6 +1568,7 @@ def bench_e2e() -> None:
                     fast_math=args.fast_math,
                     output=backend_output,
                     activation=args.activation,
+                    quant_mode=args.quant_mode,
                 )
 
             def impl_e2e() -> torch.Tensor:
@@ -1567,6 +1662,7 @@ def bench_e2e() -> None:
                 check_oracle_metrics(
                     f"{backend_label} vs oracle", backend_metrics, batch_size,
                     activation=args.activation,
+                    oracle_mode=args.oracle_mode,
                 )
             )
             if ref_output is not None and ref_name is not None:
@@ -1576,6 +1672,7 @@ def bench_e2e() -> None:
                     check_oracle_metrics(
                         f"{ref_name} vs oracle", ref_metrics, batch_size,
                         activation=args.activation,
+                        oracle_mode=args.oracle_mode,
                     )
                 )
 
@@ -1730,6 +1827,7 @@ def bench_e2e() -> None:
                         rp.g2_alphas, tp_topk_weights[r], tp_topk_ids[r],
                         workspace=tp_workspaces[r], output=tp_outputs[r],
                         fast_math=args.fast_math, activation=args.activation,
+                        quant_mode=args.quant_mode,
                     )
 
                 # Warm eager launches

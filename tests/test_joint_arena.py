@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
+import pytest
 import torch
 
 import b12x.integration.tp_moe as tp_moe
@@ -17,6 +20,8 @@ from b12x.integration.arena import (
     B12XExecutionLaneArena,
     B12XJointArenaSpec,
     B12XMoEArenaCaps,
+    _EXECUTION_LANES,
+    ensure_b12x_execution_lane_arena,
 )
 
 
@@ -160,6 +165,7 @@ def test_joint_arena_views_share_one_backing_allocation() -> None:
     a2_gscale = torch.ones(8, dtype=torch.float32, device=device)
     moe_ws = tp_moe._alloc_workspace(
         "static",
+        "nvfp4",
         8,
         8,
         16,
@@ -190,6 +196,7 @@ def test_joint_arena_views_share_one_backing_allocation() -> None:
 def test_moe_pool_keys_are_not_stream_partitioned() -> None:
     key = tp_moe._workspace_pool_key(
         "static",
+        quant_mode="nvfp4",
         state_E=4,
         weight_E=8,
         max_rows=4,
@@ -200,6 +207,21 @@ def test_moe_pool_keys_are_not_stream_partitioned() -> None:
         dtype=torch.bfloat16,
     )
     assert all("stream" not in repr(part).lower() for part in key)
+
+
+def test_moe_arena_caps_env_defaults_to_w4a16(monkeypatch) -> None:
+    monkeypatch.setenv("B12X_MOE_FORCE_A16", "1")
+    caps = B12XMoEArenaCaps(
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        weight_E=8,
+        k=16,
+        n=16,
+        num_topk=2,
+        max_tokens=4,
+    )
+
+    assert caps.quant_mode == "w4a16"
 
 
 def test_moe_arena_caps_cover_static_boundary_shapes() -> None:
@@ -232,6 +254,7 @@ def test_moe_arena_caps_cover_static_boundary_shapes() -> None:
     )
     core_plan = tp_moe._plan_core_workspace(
         plan.implementation,
+        plan.quant_mode,
         plan.state_E,
         plan.weight_E,
         plan.k,
@@ -264,6 +287,7 @@ def test_shared_moe_workspace_resets_overlaid_barrier_state() -> None:
     a2_gscale = torch.ones(8, dtype=torch.float32, device=device)
     moe_ws = tp_moe._alloc_workspace(
         "static",
+        "nvfp4",
         8,
         8,
         16,
@@ -286,3 +310,59 @@ def test_shared_moe_workspace_resets_overlaid_barrier_state() -> None:
     tp_moe._prepare_workspace_for_launch(moe_ws)
     assert int(moe_ws.barrier_count[0].item()) == 0
     assert int(moe_ws.barrier_epoch[0].item()) == 0
+
+
+def test_execution_lane_arena_reuses_target_for_smaller_draft_caps() -> None:
+    device = torch.device("cpu")
+    _EXECUTION_LANES.clear()
+    try:
+        target_spec = B12XJointArenaSpec(
+            device=device,
+            paged_attention_caps=_paged_attention_caps(device),
+            moe_caps=_moe_caps(device),
+        )
+        target_lane = ensure_b12x_execution_lane_arena(target_spec)
+
+        draft_spec = B12XJointArenaSpec(
+            device=device,
+            paged_attention_caps=replace(
+                _paged_attention_caps(device),
+                num_q_heads=2,
+                max_total_q=4,
+                max_batch=1,
+                max_work_items=8,
+                max_partial_rows=16,
+            ),
+            moe_caps=replace(_moe_caps(device), max_tokens=2),
+        )
+        draft_lane = ensure_b12x_execution_lane_arena(draft_spec)
+
+        assert draft_lane is target_lane
+        assert draft_lane.arena is target_lane.arena
+    finally:
+        _EXECUTION_LANES.clear()
+
+
+def test_execution_lane_arena_rejects_incompatible_draft_geometry() -> None:
+    device = torch.device("cpu")
+    _EXECUTION_LANES.clear()
+    try:
+        target_spec = B12XJointArenaSpec(
+            device=device,
+            paged_attention_caps=_paged_attention_caps(device),
+            moe_caps=_moe_caps(device),
+        )
+        ensure_b12x_execution_lane_arena(target_spec)
+
+        draft_spec = B12XJointArenaSpec(
+            device=device,
+            paged_attention_caps=replace(
+                _paged_attention_caps(device),
+                kv_dtype=torch.float32,
+            ),
+            moe_caps=_moe_caps(device),
+        )
+        with pytest.raises(RuntimeError, match="incompatible sizing caps"):
+            ensure_b12x_execution_lane_arena(draft_spec)
+    finally:
+        _EXECUTION_LANES.clear()
