@@ -377,6 +377,12 @@ def _normalize_quant_mode(quant_mode: str | None) -> str:
     return normalized
 
 
+def _assert_reciprocal_input_scale_contract(input_scales_are_reciprocal: bool | None) -> None:
+    assert input_scales_are_reciprocal is None or input_scales_are_reciprocal is True, (
+        "input_scales_are_reciprocal is deprecated; b12x always expects reciprocal input scales"
+    )
+
+
 def _get_activation_kernel_spec(
     activation: str,
     *,
@@ -3139,6 +3145,7 @@ def b12x_moe_fp4(
     *,
     workspace: TPMoEWorkspace | TPMoEWorkspacePool,
     output: torch.Tensor | None = None,
+    input_scales_are_reciprocal: bool | None = None,
     input_scales_static: bool = False,
     fast_math: bool | None = None,
     activation: str = "silu",
@@ -3150,6 +3157,7 @@ def b12x_moe_fp4(
     workloads use dynamic. Large token batches are chunked only when the chosen
     backend cannot describe the required work buffers in a single launch.
     """
+    _assert_reciprocal_input_scale_contract(input_scales_are_reciprocal)
     quant_mode_arg = quant_mode
     quant_mode = _normalize_quant_mode(quant_mode_arg)
     activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
@@ -3868,6 +3876,7 @@ def b12x_sparse_moe_fp4(
     routed_scaling_factor: float = 1.0,
     output: torch.Tensor | None = None,
     return_routing: bool = False,
+    input_scales_are_reciprocal: bool | None = None,
     input_scales_static: bool = False,
     fast_math: bool | None = None,
     activation: str = "silu",
@@ -3880,6 +3889,7 @@ def b12x_sparse_moe_fp4(
     can own `gate -> topk -> routed experts` at the sparse MoE block seam.
     """
 
+    _assert_reciprocal_input_scale_contract(input_scales_are_reciprocal)
     quant_mode_arg = quant_mode
     _normalize_quant_mode(quant_mode_arg)
 

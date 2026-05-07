@@ -8,6 +8,7 @@ import b12x.integration.tp_moe as tp_moe
 from b12x.integration.tp_moe import (
     B12XFP4ExpertWeights,
     B12XTopKRouting,
+    b12x_moe_fp4,
     b12x_route_experts_fast,
     b12x_sparse_moe_fp4,
 )
@@ -207,6 +208,7 @@ def test_sparse_moe_fp4_forwards_low_level_flags() -> None:
             workspace=workspace,
             routing=routing,
             output=output,
+            input_scales_are_reciprocal=True,
             input_scales_static=True,
             fast_math=False,
             quant_mode="w4a16",
@@ -221,6 +223,58 @@ def test_sparse_moe_fp4_forwards_low_level_flags() -> None:
         "activation": "silu",
         "quant_mode": "w4a16",
     }
+
+
+def test_moe_fp4_rejects_false_deprecated_reciprocal_flag() -> None:
+    hidden_states = torch.randn(2, 4)
+    experts = _make_experts(hidden_size=4)
+    routing = B12XTopKRouting(
+        topk_weights=torch.ones(2, 1, dtype=torch.float32),
+        topk_ids=torch.zeros(2, 1, dtype=torch.int64),
+    )
+
+    try:
+        b12x_moe_fp4(
+            hidden_states,
+            experts.a1_gscale,
+            experts.w1_fp4,
+            experts.w1_blockscale,
+            experts.w1_alphas,
+            experts.a2_gscale,
+            experts.w2_fp4,
+            experts.w2_blockscale,
+            experts.w2_alphas,
+            routing.topk_weights,
+            routing.topk_ids,
+            workspace=object(),
+            input_scales_are_reciprocal=False,
+        )
+    except AssertionError as exc:
+        assert "input_scales_are_reciprocal is deprecated" in str(exc)
+    else:
+        raise AssertionError("expected deprecated reciprocal flag validation to fire")
+
+
+def test_sparse_moe_fp4_rejects_false_deprecated_reciprocal_flag() -> None:
+    hidden_states = torch.randn(2, 4)
+    experts = _make_experts(hidden_size=4)
+    routing = B12XTopKRouting(
+        topk_weights=torch.ones(2, 1, dtype=torch.float32),
+        topk_ids=torch.zeros(2, 1, dtype=torch.int64),
+    )
+
+    try:
+        b12x_sparse_moe_fp4(
+            hidden_states,
+            experts=experts,
+            workspace=object(),
+            routing=routing,
+            input_scales_are_reciprocal=False,
+        )
+    except AssertionError as exc:
+        assert "input_scales_are_reciprocal is deprecated" in str(exc)
+    else:
+        raise AssertionError("expected deprecated reciprocal flag validation to fire")
 
 
 def test_sparse_moe_fp4_env_defaults_to_w4a16(monkeypatch) -> None:
