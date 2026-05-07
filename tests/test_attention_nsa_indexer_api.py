@@ -709,6 +709,54 @@ def test_sparse_nsa_index_extend_logits_cuda_matches_reference_for_dense_long_pr
     assert torch.isfinite(actual).all(), "kernel left finite positions as -inf"
 
 
+def test_sparse_nsa_index_extend_tiled_topk_cpu_matches_reference() -> None:
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(72_610)
+
+    q_rows = 4
+    num_heads = 3
+    k_rows = 17
+    topk = 6
+    q_fp8 = (torch.randn((q_rows, num_heads, 128), generator=gen, dtype=torch.float32) / 2).to(
+        torch.float8_e4m3fn
+    )
+    weights = torch.randn((q_rows, num_heads), generator=gen, dtype=torch.float32)
+    k = torch.randn((k_rows, 128), generator=gen, dtype=torch.float32) / 3
+    kv_fp8 = _quantize_rows_to_kv_fp8(k)
+    k_start = torch.tensor([0, 2, 7, 16], dtype=torch.int32)
+    k_end = torch.tensor([9, 12, 17, 17], dtype=torch.int32)
+    metadata = NSAIndexerExtendLogitsMetadata(k_start=k_start, k_end=k_end)
+    lengths = torch.empty((q_rows,), dtype=torch.int32)
+    output_indices = torch.empty((q_rows, topk), dtype=torch.int32)
+
+    actual = sparse_nsa_index_extend_tiled_topk(
+        q_fp8=q_fp8,
+        weights=weights,
+        kv_fp8=kv_fp8,
+        metadata=metadata,
+        topk=topk,
+        lengths=lengths,
+        output_indices=output_indices,
+    )
+    logits = sparse_nsa_index_extend_logits(
+        q_fp8=q_fp8,
+        weights=weights,
+        kv_fp8=kv_fp8,
+        metadata=metadata,
+    )
+    topk_pos = torch.argsort(logits, dim=1, descending=True, stable=True)[:, :topk]
+    topk_values = torch.gather(logits, 1, topk_pos)
+    expected = torch.where(
+        torch.isfinite(topk_values),
+        topk_pos.to(torch.int32),
+        torch.full_like(topk_pos, -1, dtype=torch.int32),
+    )
+
+    assert actual.data_ptr() == output_indices.data_ptr()
+    assert torch.equal(actual, expected)
+    assert torch.equal(lengths, k_end - k_start)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for tiled topk coverage")
 def test_sparse_nsa_index_extend_tiled_topk_matches_scatter_logits(monkeypatch) -> None:
     monkeypatch.setenv("B12X_NSA_EXTEND_TOPK_SUPERTILE_K", "3072")

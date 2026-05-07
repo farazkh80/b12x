@@ -218,7 +218,7 @@ def _cp_async_load_128b_pred(
         "{\n"
         " .reg .pred p;\n"
         " setp.ne.b32 p, $0, 0;\n"
-        " @p cp.async.cg.shared.global.L2::128B [$1], [$2], 16;\n"
+        " @p cp.async.ca.shared.global.L2::64B [$1], [$2], 16;\n"
         "}",
         "r,r,l",
         has_side_effects=True,
@@ -758,6 +758,15 @@ def _zero_output_frag(o_frag: cute.Tensor):
 
 
 @cute.jit
+def _zero_output_frag_b1(o_frag: cute.Tensor):
+    for mma_d in cutlass.range_constexpr(_MLA_VO_NUM_MMA_D):
+        o_frag[0, mma_d, 0] = Float32(0.0)
+        o_frag[0, mma_d, 1] = Float32(0.0)
+        o_frag[0, mma_d, 4] = Float32(0.0)
+        o_frag[0, mma_d, 5] = Float32(0.0)
+
+
+@cute.jit
 def _accumulate_scaled_score_frag(
     dst_frag: cute.Tensor,
     src_frag: cute.Tensor,
@@ -1012,6 +1021,65 @@ def _update_softmax_stats_b2(
 
 
 @cute.jit
+def _update_softmax_stats_b1(
+    score_frag: cute.Tensor,
+    m_frag: cute.Tensor,
+    d_frag: cute.Tensor,
+    o_rescale_frag: cute.Tensor,
+):
+    m_prev = Float32(m_frag[0, 0])
+    m_new = Float32(m_prev)
+    for mma_kv in cutlass.range_constexpr(_MLA_NUM_MMA_KV):
+        m_local = attention_utils.fmax(
+            attention_utils.fmax(
+                score_frag[0, mma_kv, 0],
+                score_frag[0, mma_kv, 1],
+            ),
+            attention_utils.fmax(
+                score_frag[0, mma_kv, 4],
+                score_frag[0, mma_kv, 5],
+            ),
+        )
+        m_new = attention_utils.fmax(m_new, m_local)
+    m_new = attention_utils.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=2))
+    m_new = attention_utils.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=1))
+
+    scale_term = (
+        Float32(1.0)
+        if m_prev == -Float32.inf
+        else _exp2_approx_ftz_f32(m_prev - m_new)
+    )
+    o_rescale_frag[0, 0] = scale_term
+    d_acc = Float32(d_frag[0, 0] * scale_term * Float32(0.25))
+    for mma_kv in cutlass.range_constexpr(_MLA_NUM_MMA_KV):
+        p0 = (
+            Float32(0.0)
+            if m_new == -Float32.inf
+            else _exp2_approx_ftz_f32(score_frag[0, mma_kv, 0] - m_new)
+        )
+        p1 = (
+            Float32(0.0)
+            if m_new == -Float32.inf
+            else _exp2_approx_ftz_f32(score_frag[0, mma_kv, 1] - m_new)
+        )
+        p2 = (
+            Float32(0.0)
+            if m_new == -Float32.inf
+            else _exp2_approx_ftz_f32(score_frag[0, mma_kv, 4] - m_new)
+        )
+        p3 = (
+            Float32(0.0)
+            if m_new == -Float32.inf
+            else _exp2_approx_ftz_f32(score_frag[0, mma_kv, 5] - m_new)
+        )
+        d_acc = Float32(d_acc + p0 + p1 + p2 + p3)
+    d_acc = Float32(d_acc + cute.arch.shuffle_sync_bfly(d_acc, offset=2))
+    d_acc = Float32(d_acc + cute.arch.shuffle_sync_bfly(d_acc, offset=1))
+    m_frag[0, 0] = Float32(m_new)
+    d_frag[0, 0] = Float32(d_acc)
+
+
+@cute.jit
 def _fill_normalized_p_frag_from_scores(
     p_frag: cute.Tensor,
     score_frag: cute.Tensor,
@@ -1044,6 +1112,42 @@ def _fill_normalized_p_frag_from_scores(
             )
             p_frag[0, mma_kv, row_slot + 0] = pack_f32x2_to_bfloat2(p0, p1)
             p_frag[0, mma_kv, row_slot + 2] = pack_f32x2_to_bfloat2(p2, p3)
+
+
+@cute.jit
+def _fill_normalized_p_frag_from_scores_b1(
+    p_frag: cute.Tensor,
+    score_frag: cute.Tensor,
+    m_frag: cute.Tensor,
+    d_frag: cute.Tensor,
+):
+    del d_frag
+    for mma_kv in cutlass.range_constexpr(_MLA_NUM_MMA_KV):
+        m_scaled = Float32(m_frag[0, 0])
+        p0 = (
+            Float32(0.0)
+            if m_scaled == -Float32.inf
+            else Float32(_exp2_approx_ftz_f32(score_frag[0, mma_kv, 0] - m_scaled))
+        )
+        p1 = (
+            Float32(0.0)
+            if m_scaled == -Float32.inf
+            else Float32(_exp2_approx_ftz_f32(score_frag[0, mma_kv, 1] - m_scaled))
+        )
+        p2 = (
+            Float32(0.0)
+            if m_scaled == -Float32.inf
+            else Float32(_exp2_approx_ftz_f32(score_frag[0, mma_kv, 4] - m_scaled))
+        )
+        p3 = (
+            Float32(0.0)
+            if m_scaled == -Float32.inf
+            else Float32(_exp2_approx_ftz_f32(score_frag[0, mma_kv, 5] - m_scaled))
+        )
+        p_frag[0, mma_kv, 0] = pack_f32x2_to_bfloat2(p0, p1)
+        p_frag[0, mma_kv, 1] = Uint32(0)
+        p_frag[0, mma_kv, 2] = pack_f32x2_to_bfloat2(p2, p3)
+        p_frag[0, mma_kv, 3] = Uint32(0)
 
 
 @cute.jit
@@ -1946,10 +2050,18 @@ def _run_one_pass_sparse_mla_tile(
     o_frag1 = cute.make_rmem_tensor(o_layout, Float32)
     o_frag2 = cute.make_rmem_tensor(o_layout, Float32)
     o_frag3 = cute.make_rmem_tensor(o_layout, Float32)
-    _zero_output_frag(o_frag0)
-    _zero_output_frag(o_frag1)
-    _zero_output_frag(o_frag2)
-    _zero_output_frag(o_frag3)
+    num_heads = Int32(q_u32.shape[1])
+    has_second_head_slot = head_tile_start + Int32(8) < num_heads
+    if has_second_head_slot:
+        _zero_output_frag(o_frag0)
+        _zero_output_frag(o_frag1)
+        _zero_output_frag(o_frag2)
+        _zero_output_frag(o_frag3)
+    else:
+        _zero_output_frag_b1(o_frag0)
+        _zero_output_frag_b1(o_frag1)
+        _zero_output_frag_b1(o_frag2)
+        _zero_output_frag_b1(o_frag3)
     if token_end - token_start <= Int32(_MLA_TOKEN_TILE):
         # Single-tile path: already single-pass, unchanged
         score_frag = cute.make_rmem_tensor(frag_layout, Float32)
@@ -1989,9 +2101,15 @@ def _run_one_pass_sparse_mla_tile(
                 sm_scale_log2,
                 lane,
             )
-        _update_softmax_stats_b2(score_frag, m_frag, d_frag, o_rescale_frag)
+        if has_second_head_slot:
+            _update_softmax_stats_b2(score_frag, m_frag, d_frag, o_rescale_frag)
+        else:
+            _update_softmax_stats_b1(score_frag, m_frag, d_frag, o_rescale_frag)
         p_frag = cute.make_rmem_tensor(p_layout, Uint32)
-        _fill_normalized_p_frag_from_scores(p_frag, score_frag, m_frag, d_frag)
+        if has_second_head_slot:
+            _fill_normalized_p_frag_from_scores(p_frag, score_frag, m_frag, d_frag)
+        else:
+            _fill_normalized_p_frag_from_scores_b1(p_frag, score_frag, m_frag, d_frag)
         if cutlass.const_expr(os.environ.get("B12X_MLA_DEBUG_QK_BF16", "0") == "1"):
             _accumulate_pv_groups_from_p_frag(
                 o_frag0,
@@ -2022,7 +2140,6 @@ def _run_one_pass_sparse_mla_tile(
             )
     else:
         # Multi-tile: per-group Q+KV co-streaming (~9KB smem, ~11 CTAs/SM)
-        num_heads = Int32(q_u32.shape[1])
         num_kv = Int32(kv_rows_u32.shape[0])
         lane_group = lane // Int32(4)
         lane_pair_base = Int32(2) * (lane % Int32(4))
@@ -2225,31 +2342,54 @@ def _run_one_pass_sparse_mla_tile(
             cute.arch.sync_threads()
 
             # Softmax + O rescale + P norm
-            _update_softmax_stats_b2(score_frag, m_frag, d_frag, o_rescale_frag)
+            if has_second_head_slot:
+                _update_softmax_stats_b2(score_frag, m_frag, d_frag, o_rescale_frag)
+            else:
+                _update_softmax_stats_b1(score_frag, m_frag, d_frag, o_rescale_frag)
 
-            for row_slot in cutlass.range_constexpr(2):
-                rs = Float32(o_rescale_frag[0, row_slot])
+            rs = Float32(o_rescale_frag[0, 0])
+            for mma_d in cutlass.range_constexpr(_MLA_VO_NUM_MMA_D):
+                o_frag0[0, mma_d, 0] = Float32(o_frag0[0, mma_d, 0] * rs)
+                o_frag0[0, mma_d, 1] = Float32(o_frag0[0, mma_d, 1] * rs)
+                o_frag0[0, mma_d, 4] = Float32(o_frag0[0, mma_d, 4] * rs)
+                o_frag0[0, mma_d, 5] = Float32(o_frag0[0, mma_d, 5] * rs)
+                o_frag1[0, mma_d, 0] = Float32(o_frag1[0, mma_d, 0] * rs)
+                o_frag1[0, mma_d, 1] = Float32(o_frag1[0, mma_d, 1] * rs)
+                o_frag1[0, mma_d, 4] = Float32(o_frag1[0, mma_d, 4] * rs)
+                o_frag1[0, mma_d, 5] = Float32(o_frag1[0, mma_d, 5] * rs)
+                o_frag2[0, mma_d, 0] = Float32(o_frag2[0, mma_d, 0] * rs)
+                o_frag2[0, mma_d, 1] = Float32(o_frag2[0, mma_d, 1] * rs)
+                o_frag2[0, mma_d, 4] = Float32(o_frag2[0, mma_d, 4] * rs)
+                o_frag2[0, mma_d, 5] = Float32(o_frag2[0, mma_d, 5] * rs)
+                o_frag3[0, mma_d, 0] = Float32(o_frag3[0, mma_d, 0] * rs)
+                o_frag3[0, mma_d, 1] = Float32(o_frag3[0, mma_d, 1] * rs)
+                o_frag3[0, mma_d, 4] = Float32(o_frag3[0, mma_d, 4] * rs)
+                o_frag3[0, mma_d, 5] = Float32(o_frag3[0, mma_d, 5] * rs)
+            if has_second_head_slot:
+                rs1 = Float32(o_rescale_frag[0, 1])
                 for mma_d in cutlass.range_constexpr(_MLA_VO_NUM_MMA_D):
-                    reg_base = row_slot * 2
-                    o_frag0[0, mma_d, reg_base + 0] = Float32(o_frag0[0, mma_d, reg_base + 0] * rs)
-                    o_frag0[0, mma_d, reg_base + 1] = Float32(o_frag0[0, mma_d, reg_base + 1] * rs)
-                    o_frag0[0, mma_d, reg_base + 4] = Float32(o_frag0[0, mma_d, reg_base + 4] * rs)
-                    o_frag0[0, mma_d, reg_base + 5] = Float32(o_frag0[0, mma_d, reg_base + 5] * rs)
-                    o_frag1[0, mma_d, reg_base + 0] = Float32(o_frag1[0, mma_d, reg_base + 0] * rs)
-                    o_frag1[0, mma_d, reg_base + 1] = Float32(o_frag1[0, mma_d, reg_base + 1] * rs)
-                    o_frag1[0, mma_d, reg_base + 4] = Float32(o_frag1[0, mma_d, reg_base + 4] * rs)
-                    o_frag1[0, mma_d, reg_base + 5] = Float32(o_frag1[0, mma_d, reg_base + 5] * rs)
-                    o_frag2[0, mma_d, reg_base + 0] = Float32(o_frag2[0, mma_d, reg_base + 0] * rs)
-                    o_frag2[0, mma_d, reg_base + 1] = Float32(o_frag2[0, mma_d, reg_base + 1] * rs)
-                    o_frag2[0, mma_d, reg_base + 4] = Float32(o_frag2[0, mma_d, reg_base + 4] * rs)
-                    o_frag2[0, mma_d, reg_base + 5] = Float32(o_frag2[0, mma_d, reg_base + 5] * rs)
-                    o_frag3[0, mma_d, reg_base + 0] = Float32(o_frag3[0, mma_d, reg_base + 0] * rs)
-                    o_frag3[0, mma_d, reg_base + 1] = Float32(o_frag3[0, mma_d, reg_base + 1] * rs)
-                    o_frag3[0, mma_d, reg_base + 4] = Float32(o_frag3[0, mma_d, reg_base + 4] * rs)
-                    o_frag3[0, mma_d, reg_base + 5] = Float32(o_frag3[0, mma_d, reg_base + 5] * rs)
+                    o_frag0[0, mma_d, 2] = Float32(o_frag0[0, mma_d, 2] * rs1)
+                    o_frag0[0, mma_d, 3] = Float32(o_frag0[0, mma_d, 3] * rs1)
+                    o_frag0[0, mma_d, 6] = Float32(o_frag0[0, mma_d, 6] * rs1)
+                    o_frag0[0, mma_d, 7] = Float32(o_frag0[0, mma_d, 7] * rs1)
+                    o_frag1[0, mma_d, 2] = Float32(o_frag1[0, mma_d, 2] * rs1)
+                    o_frag1[0, mma_d, 3] = Float32(o_frag1[0, mma_d, 3] * rs1)
+                    o_frag1[0, mma_d, 6] = Float32(o_frag1[0, mma_d, 6] * rs1)
+                    o_frag1[0, mma_d, 7] = Float32(o_frag1[0, mma_d, 7] * rs1)
+                    o_frag2[0, mma_d, 2] = Float32(o_frag2[0, mma_d, 2] * rs1)
+                    o_frag2[0, mma_d, 3] = Float32(o_frag2[0, mma_d, 3] * rs1)
+                    o_frag2[0, mma_d, 6] = Float32(o_frag2[0, mma_d, 6] * rs1)
+                    o_frag2[0, mma_d, 7] = Float32(o_frag2[0, mma_d, 7] * rs1)
+                    o_frag3[0, mma_d, 2] = Float32(o_frag3[0, mma_d, 2] * rs1)
+                    o_frag3[0, mma_d, 3] = Float32(o_frag3[0, mma_d, 3] * rs1)
+                    o_frag3[0, mma_d, 6] = Float32(o_frag3[0, mma_d, 6] * rs1)
+                    o_frag3[0, mma_d, 7] = Float32(o_frag3[0, mma_d, 7] * rs1)
 
             p_frag = cute.make_rmem_tensor(p_layout, Uint32)
-            _fill_normalized_p_frag_from_scores(p_frag, score_frag, m_frag, d_frag)
+            if has_second_head_slot:
+                _fill_normalized_p_frag_from_scores(p_frag, score_frag, m_frag, d_frag)
+            else:
+                _fill_normalized_p_frag_from_scores_b1(p_frag, score_frag, m_frag, d_frag)
 
             # Per-group PV: double-buffered — overlap next group KV load with current group compute
             # Initial: load group 0 into stage_a

@@ -490,6 +490,56 @@ def sparse_nsa_index_extend_logits(
     )
 
 
+def _reference_topk_indices_from_logits(
+    logits: torch.Tensor,
+    *,
+    topk: int,
+    output_values: torch.Tensor | None = None,
+    output_indices: torch.Tensor | None = None,
+) -> torch.Tensor:
+    topk = int(topk)
+    if topk < 0:
+        raise ValueError(f"topk must be non-negative, got {topk}")
+    num_rows = int(logits.shape[0])
+    result = torch.full((num_rows, topk), -1, dtype=torch.int32, device=logits.device)
+    values = torch.full((num_rows, topk), float("-inf"), dtype=torch.float32, device=logits.device)
+    gather_k = min(topk, int(logits.shape[1]))
+    if gather_k:
+        topk_pos = torch.argsort(logits, dim=1, descending=True, stable=True)[:, :gather_k]
+        topk_values = torch.gather(logits, 1, topk_pos)
+        result[:, :gather_k] = torch.where(
+            torch.isfinite(topk_values),
+            topk_pos.to(torch.int32),
+            torch.full_like(topk_pos, -1, dtype=torch.int32),
+        )
+        values[:, :gather_k] = topk_values
+
+    if output_indices is not None:
+        if output_indices.dtype != torch.int32:
+            raise ValueError(f"output_indices must have dtype torch.int32, got {output_indices.dtype}")
+        if output_indices.device != logits.device:
+            raise ValueError("output_indices device must match logits")
+        if output_indices.ndim != 2 or output_indices.shape[0] < num_rows or output_indices.shape[1] < topk:
+            raise ValueError(
+                f"output_indices must have shape at least ({num_rows}, {topk}), got {tuple(output_indices.shape)}"
+            )
+        output_indices[:num_rows, :topk].copy_(result)
+        result = output_indices[:num_rows, :topk]
+
+    if output_values is not None:
+        if output_values.dtype != torch.float32:
+            raise ValueError(f"output_values must have dtype torch.float32, got {output_values.dtype}")
+        if output_values.device != logits.device:
+            raise ValueError("output_values device must match logits")
+        if output_values.ndim != 2 or output_values.shape[0] < num_rows or output_values.shape[1] < topk:
+            raise ValueError(
+                f"output_values must have shape at least ({num_rows}, {topk}), got {tuple(output_values.shape)}"
+            )
+        output_values[:num_rows, :topk].copy_(values)
+
+    return result
+
+
 def sparse_nsa_index_extend_tiled_topk(
     *,
     q_fp8: torch.Tensor,
@@ -525,7 +575,29 @@ def sparse_nsa_index_extend_tiled_topk(
         k_start=k_start,
         k_end=k_end,
     ):
-        raise ValueError("tiled topk requires the CUDA sparse NSA extend logits kernel")
+        if lengths is not None:
+            if lengths.ndim != 1 or lengths.shape[0] < int(k_start.shape[0]):
+                raise ValueError(
+                    f"lengths must have shape at least ({int(k_start.shape[0])},), got {tuple(lengths.shape)}"
+                )
+            if lengths.dtype != torch.int32:
+                raise ValueError(f"lengths must have dtype torch.int32, got {lengths.dtype}")
+            if lengths.device != q_fp8.device:
+                raise ValueError(f"lengths device {lengths.device} does not match q_fp8 device {q_fp8.device}")
+            torch.sub(k_end, k_start, out=lengths[: int(k_start.shape[0])])
+        logits = sparse_nsa_extend_logits_reference(
+            q_fp8=q_fp8,
+            weights=weights_f,
+            kv_fp8=kv_fp8,
+            k_start=k_start,
+            k_end=k_end,
+        )
+        return _reference_topk_indices_from_logits(
+            logits[: int(k_start.shape[0])],
+            topk=topk,
+            output_values=output_values,
+            output_indices=output_indices,
+        )
     prefill_block_k = resolve_sparse_nsa_extend_prefill_block_k(
         valid_q_rows=int(k_start.shape[0]),
         k_rows=int(k_quant.shape[0]),

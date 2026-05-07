@@ -27,6 +27,9 @@ from b12x.cute.fp4 import (
     ldmatrix_m8n8x4_right_half_b16,
     mxfp8_mma_m16n8k32_f32_e4m3,
     shared_ptr_to_u32,
+    st_global_f32,
+    st_global_v2_f32,
+    st_global_v4_f32,
     st_shared_v4_u32,
 )
 from b12x.runtime_control import raise_if_kernel_resolution_frozen
@@ -72,6 +75,8 @@ _PREFILL512_THREADS_PER_CTA = _PREFILL512_WARPS_PER_CTA * _WARP_THREADS
 _PREFILL512_NUM_MMA_Q = 1
 _PREFILL512_NUM_MMA_KV = 8
 _PREFILL512_Q_HEADS_BATCH = 6  # Exp15: 11 batches vs 16, 5 fewer sync barriers
+_PREFILL512_H32_Q_HEADS_BATCH = 7
+_PREFILL512_H32_WEIGHT_COLS = 32
 
 _NSA_EXTEND_PREFILL_THRESHOLD_ENV = "B12X_NSA_EXTEND_PREFILL_THRESHOLD"
 _NSA_EXTEND_PREFILL_BLOCK_K_ENV = "B12X_NSA_EXTEND_PREFILL_BLOCK_K"
@@ -916,6 +921,55 @@ def st_shared_v4_f32(smem_addr: Int32, v0: Float32, v1: Float32, v2: Float32, v3
     )
 
 
+def get_sparse_nsa_prefill512_shared_storage_cls(q_heads_batch: int, weight_cols: int):
+    q_heads_batch = int(q_heads_batch)
+    weight_cols = int(weight_cols)
+
+    class SharedStorage:
+        pass
+
+    SharedStorage.__annotations__ = {
+        "mbar_ptr_k": cute.struct.MemRange[cutlass.Int64, 1],
+        "tile_live": cute.struct.Align[
+            cute.struct.MemRange[cutlass.Int32, 1],
+            16,
+        ],
+        "tile_full": cute.struct.Align[
+            cute.struct.MemRange[cutlass.Int32, 1],
+            16,
+        ],
+        "k_start": cute.struct.Align[
+            cute.struct.MemRange[cutlass.Int32, _PREFILL512_BLOCK_Q],
+            16,
+        ],
+        "k_end": cute.struct.Align[
+            cute.struct.MemRange[cutlass.Int32, _PREFILL512_BLOCK_Q],
+            16,
+        ],
+        "scales": cute.struct.Align[
+            cute.struct.MemRange[cutlass.Float32, _PREFILL512_BLOCK_K],
+            16,
+        ],
+        "k_perm": cute.struct.Align[
+            cute.struct.MemRange[cutlass.Uint8, _PREFILL512_BLOCK_K * _INDEX_HEAD_DIM],
+            1024,
+        ],
+        "q_bytes_smem": cute.struct.Align[
+            cute.struct.MemRange[
+                cutlass.Uint8,
+                _PREFILL_Q_STAGE_ROWS * _PREFILL_Q_STAGE_COLS * q_heads_batch,
+            ],
+            1024,
+        ],
+        "w_smem": cute.struct.Align[
+            cute.struct.MemRange[cutlass.Float32, _PREFILL512_BLOCK_Q * weight_cols],
+            1024,
+        ],
+    }
+
+    return cute.struct(SharedStorage)
+
+
 @cute.jit
 def _pack_q_mxfp8_reg_smem_ptr(
     q_smem_base: Int32,
@@ -928,20 +982,14 @@ def _pack_q_mxfp8_reg_smem_ptr(
     [row_local, col_pair_base+8], [row_local, col_pair_base+9].
     Uses _permuted_offset_128b to match the swizzled write layout.
     """
-    u32_idx_lo = col_pair_base // Int32(4)
-    u32_idx_hi = u32_idx_lo + Int32(2)
+    vec_idx = col_pair_base // Int32(16)
+    word_pair = (col_pair_base // Int32(4)) % Int32(4)
     byte_shift = (col_pair_base % Int32(4)) * Int32(8)
-    byte_off_lo = u32_idx_lo * Int32(4)
-    byte_off_hi = u32_idx_hi * Int32(4)
-    vec_lo = byte_off_lo // Int32(16)
-    vec_hi = byte_off_hi // Int32(16)
-    within_lo = byte_off_lo % Int32(16)
-    within_hi = byte_off_hi % Int32(16)
     q_rs = Int32(_PREFILL_Q_STAGE_COLS // 16)
-    addr_lo = q_smem_base + _permuted_offset_128b(row_local, vec_lo, q_rs) * Int32(16) + within_lo
-    addr_hi = q_smem_base + _permuted_offset_128b(row_local, vec_hi, q_rs) * Int32(16) + within_hi
-    lo = ld_shared_u32(addr_lo)
-    hi = ld_shared_u32(addr_hi)
+    addr = q_smem_base + _permuted_offset_128b(row_local, vec_idx, q_rs) * Int32(16)
+    v0, v1, v2, v3 = ld_shared_v4_u32(addr)
+    lo = v0 if word_pair == Int32(0) else v1
+    hi = v2 if word_pair == Int32(0) else v3
     lo_half = (lo >> byte_shift) & Uint32(0xFFFF)
     hi_half = ((hi >> byte_shift) & Uint32(0xFFFF)) << Int32(16)
     return lo_half | hi_half
@@ -1415,11 +1463,20 @@ class SparseNSAExtendLogitsPrefill512Kernel:
     """Experimental prefill scorer with _PREFILL512_BLOCK_K=512.
 
     This halves the K-CTA count versus the BK=256 prefill scorer. To keep
-    shared-memory use under the launch limit, it stages four Q heads at a time.
+    shared-memory use under the launch limit, it batches a small group of Q
+    heads in shared memory.
     """
 
-    def __init__(self, *, tiled_output: bool = False):
+    def __init__(
+        self,
+        *,
+        tiled_output: bool = False,
+        q_heads_batch: int = _PREFILL512_Q_HEADS_BATCH,
+        weight_cols: int = _MAX_Q_HEADS,
+    ):
         self._tiled_output = tiled_output
+        self._q_heads_batch = int(q_heads_batch)
+        self._weight_cols = int(weight_cols)
 
     @cute.jit
     def __call__(
@@ -1496,45 +1553,15 @@ class SparseNSAExtendLogitsPrefill512Kernel:
         valid_q_rows = Int32(valid_q_rows)
         k_total_rows = Int32(valid_k_rows)
         TILED_OUTPUT = cutlass.const_expr(self._tiled_output)
+        Q_HEADS_BATCH = cutlass.const_expr(self._q_heads_batch)
         num_heads = Int32(q_u32.shape[1])
 
         smem = cutlass.utils.SmemAllocator()
 
-        @cute.struct
-        class SharedStorage:
-            mbar_ptr_k: cute.struct.MemRange[cutlass.Int64, 1]
-            tile_live: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Int32, 1],
-                16,
-            ]
-            k_start: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Int32, _PREFILL512_BLOCK_Q],
-                16,
-            ]
-            k_end: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Int32, _PREFILL512_BLOCK_Q],
-                16,
-            ]
-            scales: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, _PREFILL512_BLOCK_K],
-                16,
-            ]
-            k_perm: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Uint8, _PREFILL512_BLOCK_K * _INDEX_HEAD_DIM],
-                1024,
-            ]
-            q_bytes_smem: cute.struct.Align[
-                cute.struct.MemRange[
-                    cutlass.Uint8,
-                    _PREFILL_Q_STAGE_ROWS * _PREFILL_Q_STAGE_COLS * _PREFILL512_Q_HEADS_BATCH,
-                ],
-                1024,
-            ]
-            w_smem: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, _PREFILL512_BLOCK_Q * _MAX_Q_HEADS],
-                1024,
-            ]
-
+        SharedStorage = get_sparse_nsa_prefill512_shared_storage_cls(
+            self._q_heads_batch,
+            self._weight_cols,
+        )
         storage = smem.allocate(SharedStorage)
         mbar_ptr_k = storage.mbar_ptr_k.data_ptr()
         k_perm_base_addr = shared_ptr_to_u32(storage.k_perm.data_ptr())
@@ -1545,6 +1572,7 @@ class SparseNSAExtendLogitsPrefill512Kernel:
         s_k_start = storage.k_start.get_tensor(cute.make_layout((_PREFILL512_BLOCK_Q,), stride=(1,)))
         s_k_end = storage.k_end.get_tensor(cute.make_layout((_PREFILL512_BLOCK_Q,), stride=(1,)))
         s_tile_live = storage.tile_live.get_tensor(cute.make_layout((1,), stride=(1,)))
+        s_tile_full = storage.tile_full.get_tensor(cute.make_layout((1,), stride=(1,)))
 
         if tx == 0:
             cute.arch.mbarrier_init(mbar_ptr_k, Int32(1))
@@ -1562,15 +1590,24 @@ class SparseNSAExtendLogitsPrefill512Kernel:
                 tile_k_end = k_total_rows
             row_start = Int32(s_k_start[tx])
             row_end = Int32(s_k_end[tx])
+            physical_tile_full = tile_k_end == k_tile_base + Int32(_PREFILL512_BLOCK_K)
             row_live = (row_end > k_tile_base) & (row_start < tile_k_end) & (k_tile_base < tile_k_end)
+            row_full = (
+                (q_tile_base + tx < valid_q_rows)
+                & physical_tile_full
+                & (row_start <= k_tile_base)
+                & (row_end >= tile_k_end)
+            )
             ballot = cute.arch.vote_ballot_sync(Boolean(row_live))
+            full_ballot = cute.arch.vote_ballot_sync(Boolean(row_full))
             if tx == Int32(0):
                 s_tile_live[Int32(0)] = ballot
+                s_tile_full[Int32(0)] = Int32(1) if full_ballot == Int32(-1) else Int32(0)
         cute.arch.sync_threads()
 
         if s_tile_live[Int32(0)] != Int32(0):
             q_smem_base = k_perm_base_addr + Int32(_PREFILL512_BLOCK_K * _INDEX_HEAD_DIM)
-            w_smem_base = q_smem_base + Int32(_PREFILL_Q_STAGE_BYTES * _PREFILL512_Q_HEADS_BATCH)
+            w_smem_base = q_smem_base + Int32(_PREFILL_Q_STAGE_BYTES * Q_HEADS_BATCH)
             producer_state = pipeline.PipelineStateSimple(1, Int32(0))
             consumer_state = pipeline.PipelineStateSimple(1, Int32(0))
             if warp_idx == Int32(0):
@@ -1594,14 +1631,9 @@ class SparseNSAExtendLogitsPrefill512Kernel:
                         k_tile_base + Int32(_PREFILL_BLOCK_K),
                         shared_ptr_to_u32(full_mbar_ptr),
                     )
-            cute.arch.mbarrier_wait(
-                mbar_ptr_k + consumer_state.index,
-                phase=consumer_state.phase,
-            )
-
-            # Overlap: issue weight loads before TMA sync (no K dependency)
+            # Stage weights and scales while the K TMA copy is in flight.
             w_linear = tx * Int32(4)
-            while w_linear < Int32(_PREFILL512_BLOCK_Q * _MAX_Q_HEADS):
+            while w_linear < Int32(_PREFILL512_BLOCK_Q) * num_heads:
                 w_q_local = w_linear // num_heads
                 w_head = w_linear % num_heads
                 w_q_row = q_tile_base + w_q_local
@@ -1614,14 +1646,11 @@ class SparseNSAExtendLogitsPrefill512Kernel:
                     w0, w1, w2, w3,
                 )
                 w_linear += Int32(_PREFILL512_THREADS_PER_CTA * 4)
-            cute.arch.sync_threads()
 
-            # Load scales after TMA arrival
             scale_linear = tx
             while scale_linear < Int32(_PREFILL512_BLOCK_K):
                 s_scales[scale_linear] = Float32(k_scales[k_tile_base + scale_linear])
                 scale_linear += Int32(_PREFILL512_THREADS_PER_CTA)
-            cute.arch.sync_threads()
 
             acc_layout = cute.make_layout(
                 (1, _PREFILL512_NUM_MMA_KV, 8), stride=(16, 8, 1)
@@ -1630,6 +1659,11 @@ class SparseNSAExtendLogitsPrefill512Kernel:
             for mma_kv in cutlass.range_constexpr(_PREFILL512_NUM_MMA_KV):
                 for reg_id in cutlass.range_constexpr(8):
                     acc_frag[Int32(0), mma_kv, reg_id] = Float32(0.0)
+            cute.arch.mbarrier_wait(
+                mbar_ptr_k + consumer_state.index,
+                phase=consumer_state.phase,
+            )
+            cute.arch.sync_threads()
 
             lane_group_pre = lane // Int32(4)
             q_local_rs0 = warp_q_idx * Int32(16) + lane_group_pre
@@ -1650,7 +1684,7 @@ class SparseNSAExtendLogitsPrefill512Kernel:
 
             batch_base_head = Int32(0)
             while batch_base_head < num_heads:
-                for block_offset in cutlass.range_constexpr(_PREFILL512_Q_HEADS_BATCH):
+                for block_offset in cutlass.range_constexpr(Q_HEADS_BATCH):
                     head_in_batch = Int32(block_offset)
                     global_head = batch_base_head + head_in_batch
                     if global_head < num_heads:
@@ -1666,7 +1700,7 @@ class SparseNSAExtendLogitsPrefill512Kernel:
                 cute.arch.cp_async_wait_group(0)
                 cute.arch.sync_threads()
 
-                for block_offset in cutlass.range_constexpr(_PREFILL512_Q_HEADS_BATCH):
+                for block_offset in cutlass.range_constexpr(Q_HEADS_BATCH):
                     head_idx = batch_base_head + Int32(block_offset)
                     if head_idx < num_heads:
                         curr_mma_base = q_smem_base + Int32(block_offset) * q_smem_stride
@@ -1704,7 +1738,7 @@ class SparseNSAExtendLogitsPrefill512Kernel:
                                     * w_val
                                 )
                 cute.arch.sync_threads()
-                batch_base_head += Int32(_PREFILL512_Q_HEADS_BATCH)
+                batch_base_head += Int32(Q_HEADS_BATCH)
 
             lane_group = lane // Int32(4)
             lane_pair_base = Int32(2) * (lane % Int32(4))
@@ -1732,40 +1766,43 @@ class SparseNSAExtendLogitsPrefill512Kernel:
                                 acc_frag[Int32(0), mma_kv, reg_id] * s_scales[k_local]
                             )
             else:
-                for mma_kv in cutlass.range_constexpr(_PREFILL512_NUM_MMA_KV):
-                    for reg_id in cutlass.range_constexpr(8):
-                        row_slot = (reg_id % 4) // 2
-                        q_local = warp_q_idx * Int32(16) + lane_group + Int32(8 * row_slot)
-                        k_local = (
+                if s_tile_full[Int32(0)] != Int32(0):
+                    q_full_row0 = q_tile_base + warp_q_idx * Int32(16) + lane_group
+                    q_full_row1 = q_full_row0 + Int32(8)
+                    out_base0 = q_full_row0 * k_total_rows + k_tile_base
+                    out_base1 = q_full_row1 * k_total_rows + k_tile_base
+                    for mma_kv in cutlass.range_constexpr(_PREFILL512_NUM_MMA_KV):
+                        k_pair0 = (
                             warp_k_idx * Int32(_PREFILL512_NUM_MMA_KV * 16)
                             + mma_kv * Int32(16)
                             + lane_pair_base
-                            + Int32(8 * (reg_id // 4))
-                            + Int32(reg_id % 2)
                         )
-                        q_row = q_tile_base + q_local
-                        k_row = k_tile_base + k_local
-                        if (
-                            q_local < Int32(_PREFILL512_BLOCK_Q)
-                            and k_local < Int32(_PREFILL512_BLOCK_K)
-                            and q_row < valid_q_rows
-                            and k_row < k_total_rows
-                        ):
-                            row_start = Int32(s_k_start[q_local])
-                            row_end = Int32(s_k_end[q_local])
-                            if k_row >= row_start and k_row < row_end:
-                                logits_out[q_row, k_row] = Float32(
-                                    acc_frag[Int32(0), mma_kv, reg_id] * s_scales[k_local]
-                                )
-                            elif write_invalid_logits != Int32(0):
-                                logits_out[q_row, k_row] = Float32(-Float32.inf)
-        else:
-            if TILED_OUTPUT:
-                pass  # dead tile; topk kernel uses k_start/k_end to filter
-            else:
-                if write_invalid_logits != Int32(0):
-                    lane_group = lane // Int32(4)
-                    lane_pair_base = Int32(2) * (lane % Int32(4))
+                        k_pair1 = k_pair0 + Int32(8)
+                        scale0 = s_scales[k_pair0]
+                        scale1 = s_scales[k_pair0 + Int32(1)]
+                        scale8 = s_scales[k_pair1]
+                        scale9 = s_scales[k_pair1 + Int32(1)]
+                        st_global_v2_f32(
+                            get_ptr_as_int64(logits_out, out_base0 + k_pair0),
+                            Float32(acc_frag[Int32(0), mma_kv, 0] * scale0),
+                            Float32(acc_frag[Int32(0), mma_kv, 1] * scale1),
+                        )
+                        st_global_v2_f32(
+                            get_ptr_as_int64(logits_out, out_base1 + k_pair0),
+                            Float32(acc_frag[Int32(0), mma_kv, 2] * scale0),
+                            Float32(acc_frag[Int32(0), mma_kv, 3] * scale1),
+                        )
+                        st_global_v2_f32(
+                            get_ptr_as_int64(logits_out, out_base0 + k_pair1),
+                            Float32(acc_frag[Int32(0), mma_kv, 4] * scale8),
+                            Float32(acc_frag[Int32(0), mma_kv, 5] * scale9),
+                        )
+                        st_global_v2_f32(
+                            get_ptr_as_int64(logits_out, out_base1 + k_pair1),
+                            Float32(acc_frag[Int32(0), mma_kv, 6] * scale8),
+                            Float32(acc_frag[Int32(0), mma_kv, 7] * scale9),
+                        )
+                else:
                     for mma_kv in cutlass.range_constexpr(_PREFILL512_NUM_MMA_KV):
                         for reg_id in cutlass.range_constexpr(8):
                             row_slot = (reg_id % 4) // 2
@@ -1785,7 +1822,62 @@ class SparseNSAExtendLogitsPrefill512Kernel:
                                 and q_row < valid_q_rows
                                 and k_row < k_total_rows
                             ):
-                                logits_out[q_row, k_row] = Float32(-Float32.inf)
+                                row_start = Int32(s_k_start[q_local])
+                                row_end = Int32(s_k_end[q_local])
+                                if k_row >= row_start and k_row < row_end:
+                                    logits_out[q_row, k_row] = Float32(
+                                        acc_frag[Int32(0), mma_kv, reg_id] * s_scales[k_local]
+                                    )
+                                elif write_invalid_logits != Int32(0):
+                                    logits_out[q_row, k_row] = Float32(-Float32.inf)
+        else:
+            if TILED_OUTPUT:
+                pass  # dead tile; topk kernel uses k_start/k_end to filter
+            else:
+                if write_invalid_logits != Int32(0):
+                    lane_group = lane // Int32(4)
+                    lane_pair_base = Int32(2) * (lane % Int32(4))
+                    if (
+                        q_tile_base + Int32(_PREFILL512_BLOCK_Q) <= valid_q_rows
+                        and k_tile_base + Int32(_PREFILL512_BLOCK_K) <= k_total_rows
+                    ):
+                        neg_inf = Float32(-Float32.inf)
+                        for fill_iter in cutlass.range_constexpr(
+                            (_PREFILL512_BLOCK_Q * _PREFILL512_BLOCK_K)
+                            // (_PREFILL512_THREADS_PER_CTA * 4)
+                        ):
+                            fill_linear = tx * Int32(4) + Int32(fill_iter * _PREFILL512_THREADS_PER_CTA * 4)
+                            q_local = fill_linear // Int32(_PREFILL512_BLOCK_K)
+                            k_local = fill_linear - q_local * Int32(_PREFILL512_BLOCK_K)
+                            out_base = (q_tile_base + q_local) * k_total_rows + k_tile_base + k_local
+                            st_global_v4_f32(
+                                get_ptr_as_int64(logits_out, out_base),
+                                neg_inf,
+                                neg_inf,
+                                neg_inf,
+                                neg_inf,
+                            )
+                    else:
+                        for mma_kv in cutlass.range_constexpr(_PREFILL512_NUM_MMA_KV):
+                            for reg_id in cutlass.range_constexpr(8):
+                                row_slot = (reg_id % 4) // 2
+                                q_local = warp_q_idx * Int32(16) + lane_group + Int32(8 * row_slot)
+                                k_local = (
+                                    warp_k_idx * Int32(_PREFILL512_NUM_MMA_KV * 16)
+                                    + mma_kv * Int32(16)
+                                    + lane_pair_base
+                                    + Int32(8 * (reg_id // 4))
+                                    + Int32(reg_id % 2)
+                                )
+                                q_row = q_tile_base + q_local
+                                k_row = k_tile_base + k_local
+                                if (
+                                    q_local < Int32(_PREFILL512_BLOCK_Q)
+                                    and k_local < Int32(_PREFILL512_BLOCK_K)
+                                    and q_row < valid_q_rows
+                                    and k_row < k_total_rows
+                                ):
+                                    logits_out[q_row, k_row] = Float32(-Float32.inf)
 
 
 @lru_cache(maxsize=16)
@@ -1793,7 +1885,17 @@ def _build_sparse_nsa_extend_prefill_kernel(*, tiled_output: bool = False) -> Sp
     return SparseNSAExtendLogitsPrefillKernel(tiled_output=tiled_output)
 
 @lru_cache(maxsize=16)
-def _build_sparse_nsa_extend_prefill512_kernel(*, tiled_output: bool = False) -> SparseNSAExtendLogitsPrefill512Kernel:
+def _build_sparse_nsa_extend_prefill512_kernel(
+    *,
+    tiled_output: bool = False,
+    num_heads: int = 0,
+) -> SparseNSAExtendLogitsPrefill512Kernel:
+    if int(num_heads) == _PREFILL512_H32_WEIGHT_COLS:
+        return SparseNSAExtendLogitsPrefill512Kernel(
+            tiled_output=tiled_output,
+            q_heads_batch=_PREFILL512_H32_Q_HEADS_BATCH,
+            weight_cols=_PREFILL512_H32_WEIGHT_COLS,
+        )
     return SparseNSAExtendLogitsPrefill512Kernel(tiled_output=tiled_output)
 
 @lru_cache(maxsize=16)
@@ -2082,7 +2184,10 @@ def run_sparse_nsa_extend_logits_kernel(
         _, k_tma_desc_ptrs = _get_cached_extend_k_tma_descriptor(k_quant_bytes)
 
     if _prefill_block_k == _PREFILL512_BLOCK_K:
-        kernel = _build_sparse_nsa_extend_prefill512_kernel(tiled_output=_tiled_output)
+        kernel = _build_sparse_nsa_extend_prefill512_kernel(
+            tiled_output=_tiled_output,
+            num_heads=int(q_fp8.shape[1]),
+        )
     elif _use_prefill:
         kernel = _build_sparse_nsa_extend_prefill_kernel(tiled_output=_tiled_output)
     else:
@@ -2133,6 +2238,11 @@ def run_sparse_nsa_extend_logits_kernel(
         )
     _cp = contract_phantoms or {}
     if _use_prefill:
+        _prefill_cache_variant = (
+            "prefill512_h32"
+            if _prefill_block_k == _PREFILL512_BLOCK_K and int(q_fp8.shape[1]) == _PREFILL512_H32_WEIGHT_COLS
+            else ("prefill512" if _prefill_block_k == _PREFILL512_BLOCK_K else "prefill")
+        )
         cache_key = (
             _tensor_meta_key(_cp.get("extend_q_u32", q_u32)),
             _tensor_meta_key(_cp.get("extend_q_bytes", q_bytes_kernel)),
@@ -2145,7 +2255,7 @@ def run_sparse_nsa_extend_logits_kernel(
             _tensor_meta_key(_cp.get("extend_logits", out_kernel)),
             _tensor_meta_key(_cp.get("extend_tile_logits", tile_logits_kernel)),
             (
-                "prefill512" if _prefill_block_k == _PREFILL512_BLOCK_K else "prefill",
+                _prefill_cache_variant,
                 _tiled_output,
             ),
         )

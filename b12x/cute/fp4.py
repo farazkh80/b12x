@@ -419,6 +419,53 @@ def st_global_f32(base_ptr: Int64, value: Float32, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def st_global_v2_f32(base_ptr: Int64, v0: Float32, v1: Float32, *, loc=None, ip=None):
+    """Store 64 bits (2 x float32) to global memory."""
+    llvm.inline_asm(
+        None,
+        [
+            Int64(base_ptr).ir_value(loc=loc, ip=ip),
+            Float32(v0).ir_value(loc=loc, ip=ip),
+            Float32(v1).ir_value(loc=loc, ip=ip),
+        ],
+        "st.global.v2.f32 [$0], {$1, $2};",
+        "l,f,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def st_global_v4_f32(
+    base_ptr: Int64,
+    v0: Float32,
+    v1: Float32,
+    v2: Float32,
+    v3: Float32,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Store 128 bits (4 x float32) to global memory."""
+    llvm.inline_asm(
+        None,
+        [
+            Int64(base_ptr).ir_value(loc=loc, ip=ip),
+            Float32(v0).ir_value(loc=loc, ip=ip),
+            Float32(v1).ir_value(loc=loc, ip=ip),
+            Float32(v2).ir_value(loc=loc, ip=ip),
+            Float32(v3).ir_value(loc=loc, ip=ip),
+        ],
+        "st.global.v4.f32 [$0], {$1, $2, $3, $4};",
+        "l,f,f,f,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
 def smem_ptr_to_addr(ptr: cute.Pointer, *, loc=None, ip=None) -> Int32:
     """Convert a generic/smem pointer to a shared-memory u32 address for PTX."""
     generic_addr = llvm.ptrtoint(T.i64(), ptr.llvm_ptr, loc=loc, ip=ip)
