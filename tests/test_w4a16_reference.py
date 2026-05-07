@@ -146,6 +146,26 @@ def test_w4a16_dynamic_geometry_uses_bf16_tile_contract() -> None:
 
 
 def test_w4a16_direct_micro_supports_static_decode_batches() -> None:
+    for k_segments in range(1, 13):
+        assert MoEMicroKernelBackend.is_supported(
+            m=1,
+            k=k_segments * 32 * 16,
+            n=256,
+            num_topk=8,
+            weight_E=256,
+            input_scales_are_reciprocal=False,
+        )
+
+    for batch_size in (1, 2, 4, 8):
+        assert MoEMicroKernelBackend.is_supported(
+            m=batch_size,
+            k=3072,
+            n=768,
+            num_topk=8,
+            weight_E=256,
+            input_scales_are_reciprocal=False,
+        )
+
     for batch_size in (10, 12, 16, 24, 32):
         assert MoEMicroKernelBackend.is_supported(
             m=batch_size,

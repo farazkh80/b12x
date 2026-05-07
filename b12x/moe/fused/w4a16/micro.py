@@ -11,7 +11,11 @@ from __future__ import annotations
 
 from typing import Tuple
 
-from b12x.moe.fused.micro import MoEMicroKernelBackend as _DirectMoEMicroKernelBackend
+from b12x.moe.fused.micro import (
+    _MAX_DIRECT_K_SEGMENTS,
+    _direct_k_segments_supported,
+    MoEMicroKernelBackend as _DirectMoEMicroKernelBackend,
+)
 
 
 class MoEMicroKernelBackend(_DirectMoEMicroKernelBackend):
@@ -31,7 +35,7 @@ class MoEMicroKernelBackend(_DirectMoEMicroKernelBackend):
             return False
         if k <= 0 or k % (32 * 16) != 0 or k % 128 != 0:
             return False
-        if k // 16 > 512:
+        if k // 16 > 32 * _MAX_DIRECT_K_SEGMENTS:
             return False
         if n <= 0 or n % 16 != 0:
             return False
@@ -45,7 +49,7 @@ class MoEMicroKernelBackend(_DirectMoEMicroKernelBackend):
         k_segments = k // (32 * 16)
         return (
             not input_scales_are_reciprocal
-            and k_segments in (2, 8, 12)
+            and _direct_k_segments_supported(k_segments)
             and 0 < num_topk <= 32
             and weight_E > 0
         )
