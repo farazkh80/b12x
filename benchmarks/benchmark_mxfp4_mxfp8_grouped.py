@@ -89,13 +89,19 @@ def torch_dequant_matmul(a_e4m3: torch.Tensor, a_sf: torch.Tensor,
 
 def flashinfer_grouped(a, b_grp, a_sf, b_sf_grp, m_indptr, *,
                        tile_m=128, tile_n=128, tile_k=128) -> Optional[torch.Tensor]:
-    """Try flashinfer's grouped GEMM. Returns None if SM120 path unavailable."""
+    """Try flashinfer's grouped GEMM. Returns None if SM120 path unavailable.
+
+    Working in flashinfer ≥ 0.6.7 — the public entry is
+    `group_gemm_mxfp4_nt_groupwise` (despite the name, it accepts
+    A=fp8 + B=fp4 ⇒ mxfp8 act × mxfp4 weight). 0.6.6 hard-codes the SM100
+    module and crashes on SM120; upgrade to 0.6.10+ to use this.
+    """
     try:
-        from flashinfer.gemm import group_gemm_mxfp8_mxfp4_nt_groupwise
+        from flashinfer.gemm import group_gemm_mxfp4_nt_groupwise as _grp_gemm
     except ImportError:
         return None
     try:
-        return group_gemm_mxfp8_mxfp4_nt_groupwise(
+        return _grp_gemm(
             a, b_grp, a_sf, b_sf_grp, m_indptr,
             mma_sm=1, tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, swap_ab=True,
         )

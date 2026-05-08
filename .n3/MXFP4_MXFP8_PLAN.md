@@ -233,7 +233,7 @@ Tune sweep (only after baseline beats or ties flashinfer):
 ## Status
 
 - [x] Container + b12x build verified, mxfp8 MMA smoke passes.
-- [x] flashinfer kernel confirmed to support mxfp8×mxfp4 — but **prebuilt wheel does not expose SM120 mxfp4 binding** (`get_gemm_sm100_module()` is hard-coded for the mxfp4 entry, and `gen_gemm_sm120_module` only generates fp8 instantiations). Perf baseline against flashinfer requires source rebuild as a follow-up.
+- [x] flashinfer kernel confirmed to support mxfp8×mxfp4 — but **flashinfer 0.6.6's prebuilt wheel does not expose SM120 mxfp4 binding** (`get_gemm_sm100_module()` is hard-coded for the mxfp4 entry, and `gen_gemm_sm120_module` only generates fp8 instantiations). **flashinfer 0.6.10 fixes this** — it ships a proper SM120 dispatch: `group_gemm_mxfp4_nt_groupwise` routes to `get_gemm_sm120_module().group_gemm_mxfp4_nt_groupwise` via `is_sm120a_supported` capability check. JIT-compiles cleanly on the local SM120 (~71s first call); subsequent calls cached. Baseline measurement: **16.4 μs at (M=128, N=128, K=256)** as a single grouped GEMM. To use, install via `pip install --no-deps --upgrade flashinfer-python` (the `--no-deps` keeps the cutlass-dsl 4.4.1 pin that b12x requires).
 - [x] **Phase 1** — torch MXFP4×MXFP8 reference + benchmark scaffold. `b12x/moe/fused/mxfp4_mxfp8/reference.py` covers UE8M0 ⇄ fp32, MXFP4/MXFP8 quant+dequant, and full routed-MoE forward. 6/6 unit tests pass (`tests/test_mxfp4_mxfp8_reference.py`).
 - [x] **Phase 2** — MMA helpers added in `b12x/cute/fp4.py`:
   - `mxfp4_mxfp8_mma_m16n8k32_f32_e4m3_e2m1` (native `kind::mxf8f6f4 .e4m3.e2m1`) — present, but probe shows D = 1/4 of expected. Root cause appears to be in B-side register layout for `.e2m1` operand; needs CUTLASS source consultation. Deferred.
@@ -275,7 +275,26 @@ Tune sweep (only after baseline beats or ties flashinfer):
   - [ ] Multi-warp + double-buffered cp.async combined (current MW is single-buffered).
   - [ ] Kernel-internal expert routing/scatter/gather (currently in Python).
 - [ ] Phase 5 — Python integration entrypoint mirroring `b12x_moe_fp4` (mostly glue once Phase 4-prod lands)
-- [ ] Phase 6 — benchmarks vs flashinfer (requires flashinfer source rebuild for SM120 mxfp4)
+- [x] **Phase 6 — gpt-oss-shaped wall-clock benchmark vs flashinfer**. flashinfer 0.6.10 unblocks the SM120 mxfp4 path. b12x's fused single-launch chain vs flashinfer's two-GEMM + host-activation + host-quant chain, on a (M, K_in, I, K_out) sweep with K_in / I / K_out multiples of 128 (flashinfer's kernel constraint).
+
+  **Key results (median μs at this SM120 host):**
+
+  | shape (M, K_in, I, K_out) | b12x_global | b12x_cpasync | flashinfer_chain | flashinfer / b12x |
+  |---|---|---|---|---|
+  | (64, 128, 128, 128)        | 89.1  | 85.3  | 152.6 | **1.79× faster (b12x)** |
+  | (128, 128, 128, 128)       | 86.3  | 83.8  | 151.2 | **1.80×** |
+  | (256, 128, 128, 128)       | 88.1  | 86.4  | 152.1 | **1.76×** |
+  | (128, 256, 128, 128)       | 103.3 | 95.1  | 151.7 | 1.60× |
+  | (128, 128, 256, 128)       | 157.5 | 123.4 | 154.4 | 1.25× |
+  | (128, 128, 128, 256)       | 91.9  | 88.0  | 152.9 | 1.74× |
+  | (128, 256, 256, 256)       | 251.3 | 178.8 | 155.1 | 0.87× (flashinfer) |
+  | (256, 256, 256, 256)       | 250.6 | 184.2 | 155.4 | 0.84× (flashinfer) |
+
+  - **At small-to-medium shapes, b12x beats flashinfer by 1.6-1.8×** because: (a) one launch instead of two, (b) on-device fused SwiGLU+quant instead of host-side, (c) flashinfer's per-launch dispatch is ~75 μs floor regardless of shape.
+  - **At larger shapes (256³+), b12x falls behind** because of register pressure on the single-warp kernel (FC1 accumulator scales with FC1_N_tiles × K_in_blocks; spills to local memory above ~16 N-tiles). flashinfer scales flat ~155 μs and wins from there.
+  - **Production gpt-oss-20b shape (K=I=K_out=2880) runs in NEITHER**: flashinfer requires K multiple of 128 (2880/128 = 22.5), b12x's single-warp kernel can't fit FC1_N_tiles=720 in registers. Both need K-padding (next multiple of 128 = 3072) AND b12x needs in-kernel N-tile partitioning.
+
+  **What this proves:** the b12x fused-MoE design is meaningfully faster at moderate shapes, and the fusion-vs-two-launch advantage holds. Scaling to gpt-oss-20b requires shape-coverage work on both sides (flashinfer's K-multiple-of-128 + b12x's N-tile partitioning loop). Headline harness: `benchmarks/bench_gpt_oss_moe.py` (run with `--shapes constrained` for the sweep above; `--shapes gpt-oss` to see the K=2880 blocker).
 
 ## Validated artifacts as of session end
 
