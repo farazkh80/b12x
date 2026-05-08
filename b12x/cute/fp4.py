@@ -676,6 +676,25 @@ def st_shared_v4_u32(
 
 
 @dsl_user_op
+def ld_shared_u8(smem_addr: Int32, *, loc=None, ip=None) -> Uint32:
+    """Load 1 byte from shared memory at an arbitrary (non-4-byte-aligned) byte
+    address. Returns Uint32 with the byte in the low 8 bits and zeros above."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int32(smem_addr).ir_value(loc=loc, ip=ip)],
+            "ld.shared.u8 $0, [$1];",
+            "=r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def st_shared_u8(smem_addr: Int32, value: Uint8, *, loc=None, ip=None):
     """Store 8 bits to shared memory. smem_addr is a u32 shared-memory address."""
     llvm.inline_asm(

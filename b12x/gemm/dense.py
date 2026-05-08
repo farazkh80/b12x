@@ -42,7 +42,14 @@ import cutlass.utils.hopper_helpers as sm90_utils
 import functools
 import torch
 from cutlass.cute.nvgpu import cpasync
-from cutlass.cute.nvgpu.warp.mma import Field as WarpField
+try:
+    from cutlass.cute.nvgpu.warp.mma import Field as WarpField
+except ImportError:
+    # cutlass-dsl 4.3.4 doesn't expose `Field` here. Kernels that reference
+    # WarpField.{SFA,SFB} will raise at call time; importing this module
+    # remains supported so unrelated package consumers (e.g. moe.fused.mxfp4_mxfp8)
+    # are not blocked by the older cutlass install.
+    WarpField = None
 from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
 
 from b12x.cute.utils import (

@@ -33,6 +33,7 @@ from b12x.cute.fp4 import (
     cvt_f32_to_e4m3,
     get_ptr_as_int64,
     ld_shared_i32,
+    ld_shared_u8,
     mxfp8_mma_m16n8k32_f32_e4m3,
     shared_ptr_to_u32,
     st_shared_u8,
@@ -1537,6 +1538,419 @@ def run_fused_silu_full(
         A_frag, A_sf_frag, W13_frag, W13_sf_frag, W2_frag, W2_sf_frag,
     )                                              # (M_tiles, 16, K_out)
     out_flat = out.reshape(M_total, K_out)
+    if pad:
+        out_flat = out_flat[:M_actual].clone()
+    return out_flat
+
+
+# =============================================================================
+# Chunked single-warp kernel — unblocks arbitrary FC1_N and K_out
+# =============================================================================
+
+
+def _make_kernel_chunked(
+    K_in_blocks: int,
+    I_k_blocks: int,
+    K_out_n_tiles: int,
+    fc2_chunk_n_tiles: int = 4,
+):
+    """Single-warp single-CTA fused kernel that chunks FC1 and FC2 N-tiles.
+
+    Unlike `_make_kernel_cpasync` (which holds ALL FC1 D fragments in registers
+    simultaneously — limits FC1_N_tiles ≤ ~16 before spilling), this variant
+    processes FC1 N-tiles in chunks of 4 (one intermediate K-block worth),
+    and FC2 N-tiles in chunks of `fc2_chunk_n_tiles`. Each chunk's accumulator
+    is its own register state, freed before the next chunk begins.
+
+    FC1 chunk geometry (chunk = 1 intermediate K-block of 32 cols):
+      - 4 gate N-tiles + 4 up N-tiles per chunk
+      - per-thread fc1 accumulator: 8 N-tiles × 4 fp32 = 32 fp32
+
+    FC2 chunk geometry (chunk = `fc2_chunk_n_tiles` × 8 cols of K_out):
+      - per-thread fc2 accumulator: fc2_chunk_n_tiles × 4 fp32
+
+    Constraints (validated up front):
+      - K_out_n_tiles % fc2_chunk_n_tiles == 0
+      - I_k_blocks ≥ 1 (each = 1 FC1 chunk)
+      - W13 K-block size for chunk: 8 N-tiles × 8 rows/tile × 16 bytes = 1024 bytes
+        (= 32 cp.async/16B per chunk per K-iter; 32 threads × 1 cp.async/thread)
+      - W2 K-block size for chunk: fc2_chunk_n_tiles × 8 × 16 bytes
+    """
+    if K_out_n_tiles % fc2_chunk_n_tiles != 0:
+        raise ValueError(
+            f"K_out_n_tiles ({K_out_n_tiles}) must be divisible by "
+            f"fc2_chunk_n_tiles ({fc2_chunk_n_tiles})"
+        )
+    fc2_n_chunks = K_out_n_tiles // fc2_chunk_n_tiles
+    I_n_tiles = I_k_blocks * N_TILES_PER_K_BLOCK  # = 4 * I_k_blocks
+
+    # FC1 chunk: 4 gate + 4 up tiles = 8 tiles, 8 rows/tile = 64 W13 rows per chunk per K-iter.
+    # Each row is 16 bytes (1 K-block packed FP4) → 1024 bytes per chunk per K-iter.
+    # 64 cp.async-16B issues = 32 threads × 2 each.
+    FC1_W13_ROWS_PER_CHUNK = 8 * 8           # 64 rows
+    FC1_W13_CHUNK_BYTES = FC1_W13_ROWS_PER_CHUNK * 16   # 1024 bytes
+    FC1_W13_LOADS_PER_THREAD = FC1_W13_ROWS_PER_CHUNK // 32   # 2
+
+    FC2_W2_ROWS_PER_CHUNK = fc2_chunk_n_tiles * 8
+    FC2_W2_CHUNK_BYTES = FC2_W2_ROWS_PER_CHUNK * 16
+    if FC2_W2_ROWS_PER_CHUNK % 32 != 0:
+        raise ValueError(
+            f"fc2_chunk_n_tiles ({fc2_chunk_n_tiles}) × 8 = {FC2_W2_ROWS_PER_CHUNK} "
+            "must be divisible by 32 for clean cp.async distribution"
+        )
+    FC2_W2_LOADS_PER_THREAD = FC2_W2_ROWS_PER_CHUNK // 32
+
+    @cute.kernel
+    def kernel(mA, mA_sf, mW13, mW13_sf, mW2, mW2_sf, mY):
+        cta = cute.arch.block_idx()[0]
+        tidx = cute.arch.thread_idx()[0]
+        g = Int32(tidx) // Int32(4)
+        lane = Int32(tidx) % Int32(4)
+
+        row_top = cta * Int32(16) + g
+        row_bot = cta * Int32(16) + g + Int32(8)
+
+        mA_u32 = cute.recast_tensor(mA, cutlass.Uint32)
+
+        smem = utils.SmemAllocator()
+        I_cols = I_k_blocks * 32
+        # Re-bind factory closures as kernel-local names so @cute.struct sees them.
+        W13_CHUNK_BYTES_LOCAL = FC1_W13_CHUNK_BYTES
+        W2_CHUNK_BYTES_LOCAL  = FC2_W2_CHUNK_BYTES
+
+        @cute.struct
+        class Storage:
+            sInt: cute.struct.MemRange[Uint8, M * I_cols]
+            sInt_sf: cute.struct.MemRange[Uint8, M * I_k_blocks]
+            sW13_kb: cute.struct.MemRange[Uint8, W13_CHUNK_BYTES_LOCAL]
+            sW2_kb:  cute.struct.MemRange[Uint8, W2_CHUNK_BYTES_LOCAL]
+
+        storage = smem.allocate(Storage)
+        sInt_addr = shared_ptr_to_u32(storage.sInt.data_ptr())
+        sInt_sf_addr = shared_ptr_to_u32(storage.sInt_sf.data_ptr())
+        sW13_addr = shared_ptr_to_u32(storage.sW13_kb.data_ptr())
+        sW2_addr  = shared_ptr_to_u32(storage.sW2_kb.data_ptr())
+
+        K_half = K_in_blocks * 16
+        I_half = I_k_blocks * 16
+
+        # ------------------------------------------------------------------
+        # Outer FC1 chunk loop: each chunk = 1 intermediate K-block (32 cols).
+        # Runtime loop (cutlass.range, unroll=1) keeps generated IR small at
+        # large I_k_blocks (e.g. gpt-oss-20b's 90). Each iteration resets the
+        # `fc1` accumulator from zeros, so no inter-iteration carry is needed.
+        # The inner K loop stays constexpr-unrolled because its body mutates a
+        # Python list of Float32 SSA values, a pattern that only works under
+        # full unroll.
+        # ------------------------------------------------------------------
+        for chunk in cutlass.range(I_k_blocks, unroll=1):
+            # Per-chunk fc1 accumulator: 4 gate + 4 up tiles, 4 fp32 each.
+            fc1 = [Float32(0.0) for _ in range(8 * 4)]
+
+            chunk_x32 = chunk * Int32(32)
+
+            for k in cutlass.range_constexpr(K_in_blocks):
+                # Load this chunk's W13 K-block portion (4 gate + 4 up rows × 8
+                # rows/tile = 64 total rows × 16 bytes = 1024 bytes).
+                # Layout in SMEM: rows 0..31 = gate (4 tiles × 8 rows),
+                #                 rows 32..63 = up   (4 tiles × 8 rows).
+                for i in cutlass.range_constexpr(FC1_W13_LOADS_PER_THREAD):
+                    # i=0 → gate side; i=1 → up side. `chunk` is a runtime IV,
+                    # so build the row base via Int32 arithmetic (not an Int32
+                    # cast of a runtime expression). Use a ternary so the DSL
+                    # AST preprocessor recognizes this as constexpr branching.
+                    gmem_row_load = (
+                        chunk_x32 + Int32(tidx)
+                    ) if i == 0 else (
+                        chunk_x32 + Int32(I_n_tiles * 8) + Int32(tidx)
+                    )
+                    smem_row = Int32(i * 32) + Int32(tidx)
+                    src_addr = get_ptr_as_int64(
+                        mW13, gmem_row_load * Int32(K_half) + Int32(k * 16),
+                    )
+                    dst_addr = sW13_addr + smem_row * Int32(16)
+                    _cp_async_16B(dst_addr, src_addr)
+                cute.arch.cp_async_commit_group()
+                cute.arch.cp_async_wait_group(0)
+                cute.arch.sync_warp()
+
+                # A fragment from row-major global.
+                col_a_u32 = Int32(k * 8) + lane * Int32(2)
+                a0 = Uint32(mA_u32[row_top, col_a_u32 + Int32(0)])
+                a1 = Uint32(mA_u32[row_bot, col_a_u32 + Int32(0)])
+                a2 = Uint32(mA_u32[row_top, col_a_u32 + Int32(1)])
+                a3 = Uint32(mA_u32[row_bot, col_a_u32 + Int32(1)])
+
+                sfa = Uint32(0x7F)
+                if lane == Int32(0):
+                    sfa = Uint32(mA_sf[row_top, k])
+                elif lane == Int32(1):
+                    sfa = Uint32(mA_sf[row_bot, k])
+
+                # Inner: 4 gate tiles, then 4 up tiles. Each MMA reads its
+                # bp from SMEM at the staged location.
+                for n in cutlass.range_constexpr(8):  # 0..3 = gate, 4..7 = up
+                    smem_wrow = Int32(n * 8) + g     # row inside chunk SMEM (0..63)
+                    bp_addr = sW13_addr + smem_wrow * Int32(16) + lane * Int32(4)
+                    bp = Uint32(ld_shared_i32(bp_addr))
+                    b0, b1 = cvt_e2m1x8_to_e4m3x8(bp)
+
+                    # SFB row index for this N-tile within the W13 matrix:
+                    #   n<4 (gate): chunk*32 + n*8 + g
+                    #   n>=4 (up):  I_n_tiles*8 + chunk*32 + (n-4)*8 + g
+                    # Ternary form so the DSL preprocessor recognizes this as
+                    # constexpr branching (constexpr `n` is checked at trace time).
+                    gmem_wrow_sfb = (
+                        chunk_x32 + Int32(n * 8) + g
+                    ) if n < 4 else (
+                        chunk_x32 + Int32(I_n_tiles * 8 + (n - 4) * 8) + g
+                    )
+                    sfb = Uint32(0x7F)
+                    if lane == Int32(0):
+                        sfb = Uint32(mW13_sf[gmem_wrow_sfb, k])
+
+                    d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e4m3(
+                        fc1[n * 4 + 0], fc1[n * 4 + 1], fc1[n * 4 + 2], fc1[n * 4 + 3],
+                        a0, a1, a2, a3, b0, b1, sfa, sfb,
+                    )
+                    fc1[n * 4 + 0] = d0
+                    fc1[n * 4 + 1] = d1
+                    fc1[n * 4 + 2] = d2
+                    fc1[n * 4 + 3] = d3
+
+            # SwiGLU + per-row amax + quant for this chunk's 32 cols.
+            intermediate = [Float32(0.0) for _ in range(4 * 4)]   # 4 tiles × 4 fp32
+            for n in cutlass.range_constexpr(4):
+                for i in cutlass.range_constexpr(4):
+                    gate = fc1[n * 4 + i]
+                    up   = fc1[(n + 4) * 4 + i]
+                    sigmoid_up = Float32(1.0) / (Float32(1.0) + cute.math.exp(-up, fastmath=True))
+                    intermediate[n * 4 + i] = gate * up * sigmoid_up
+
+            local_max_top = Float32(0.0)
+            local_max_bot = Float32(0.0)
+            for n in cutlass.range_constexpr(4):
+                for i in cutlass.range_constexpr(2):
+                    v_top = intermediate[n * 4 + i]
+                    local_max_top = cute.arch.fmax(local_max_top, cute.arch.fmax(v_top, -v_top))
+                    v_bot = intermediate[n * 4 + 2 + i]
+                    local_max_bot = cute.arch.fmax(local_max_bot, cute.arch.fmax(v_bot, -v_bot))
+            row_top_amax = warp_reduce(local_max_top, lambda a, b: cute.arch.fmax(a, b), width=4)
+            row_bot_amax = warp_reduce(local_max_bot, lambda a, b: cute.arch.fmax(a, b), width=4)
+
+            inv_max = Float32(1.0) / Float32(448.0)
+            tiny = Float32(1.401298464e-45)
+            safe_top = cute.arch.fmax(row_top_amax * inv_max, tiny)
+            safe_bot = cute.arch.fmax(row_bot_amax * inv_max, tiny)
+            log_top = cute.math.log2(safe_top, fastmath=True)
+            log_bot = cute.math.log2(safe_bot, fastmath=True)
+            ceil_top = -floor_f32_to_s32(-log_top)
+            ceil_bot = -floor_f32_to_s32(-log_bot)
+            sf_top = imin_s32(Int32(254), imax_s32(Int32(0), ceil_top + Int32(127)))
+            sf_bot = imin_s32(Int32(254), imax_s32(Int32(0), ceil_bot + Int32(127)))
+            inv_scale_top = Float32(1.0) / cute.math.exp2(Float32(sf_top - Int32(127)), fastmath=True)
+            inv_scale_bot = Float32(1.0) / cute.math.exp2(Float32(sf_bot - Int32(127)), fastmath=True)
+
+            # Quantize and write E4M3 bytes to sInt at chunk's 32 cols.
+            for n in cutlass.range_constexpr(4):
+                for i in cutlass.range_constexpr(2):
+                    e4m3_top = cvt_f32_to_e4m3(intermediate[n * 4 + i] * inv_scale_top)
+                    e4m3_bot = cvt_f32_to_e4m3(intermediate[n * 4 + 2 + i] * inv_scale_bot)
+                    col = chunk_x32 + lane * Int32(2) + Int32(n * 8) + Int32(i)
+                    top_smem_addr = sInt_addr + g * Int32(I_cols) + col
+                    bot_smem_addr = sInt_addr + (g + Int32(8)) * Int32(I_cols) + col
+                    st_shared_u8(top_smem_addr, Uint8(e4m3_top))
+                    st_shared_u8(bot_smem_addr, Uint8(e4m3_bot))
+
+            # Per-row sf for this chunk's K-block: lane 0 writes top row's,
+            # lane 1 writes bottom row's. `chunk` is a runtime IV — use it
+            # directly in the address calculation.
+            if lane == Int32(0):
+                addr = sInt_sf_addr + g * Int32(I_k_blocks) + chunk
+                st_shared_u8(addr, Uint8(sf_top))
+            elif lane == Int32(1):
+                addr = sInt_sf_addr + (g + Int32(8)) * Int32(I_k_blocks) + chunk
+                st_shared_u8(addr, Uint8(sf_bot))
+
+        cute.arch.sync_warp()
+
+        # ------------------------------------------------------------------
+        # Outer FC2 chunk loop. Runtime loop (cutlass.range, unroll=1) — see
+        # the FC1 chunk-loop comment for why this avoids IR explosion at large
+        # K_out / fc2_chunk counts. `fc2` accumulator resets every iteration.
+        # ------------------------------------------------------------------
+        for fc2_chunk in cutlass.range(fc2_n_chunks, unroll=1):
+            # Per-chunk fc2 accumulator.
+            fc2 = [Float32(0.0) for _ in range(fc2_chunk_n_tiles * 4)]
+
+            fc2_chunk_row_off = fc2_chunk * Int32(fc2_chunk_n_tiles * 8)
+
+            for kb_fc2 in cutlass.range_constexpr(I_k_blocks):
+                # Load this FC2 chunk's W2 K-block portion into sW2_kb.
+                for i in cutlass.range_constexpr(FC2_W2_LOADS_PER_THREAD):
+                    smem_row = Int32(i * 32) + Int32(tidx)
+                    gmem_row = fc2_chunk_row_off + smem_row
+                    src_addr = get_ptr_as_int64(
+                        mW2, gmem_row * Int32(I_half) + Int32(kb_fc2 * 16),
+                    )
+                    dst_addr = sW2_addr + smem_row * Int32(16)
+                    _cp_async_16B(dst_addr, src_addr)
+                cute.arch.cp_async_commit_group()
+                cute.arch.cp_async_wait_group(0)
+                cute.arch.sync_warp()
+
+                # FC2 A fragment: read from sInt at this kb_fc2's cols.
+                col_off = Int32(kb_fc2 * 32)
+                fc2_a0 = Uint32(0); fc2_a1 = Uint32(0)
+                fc2_a2 = Uint32(0); fc2_a3 = Uint32(0)
+                base_lo_top = sInt_addr + g * Int32(I_cols) + col_off + lane * Int32(8)
+                base_lo_bot = sInt_addr + (g + Int32(8)) * Int32(I_cols) + col_off + lane * Int32(8)
+                fc2_a0 = Uint32(ld_shared_i32(base_lo_top + Int32(0)))
+                fc2_a1 = Uint32(ld_shared_i32(base_lo_bot + Int32(0)))
+                fc2_a2 = Uint32(ld_shared_i32(base_lo_top + Int32(4)))
+                fc2_a3 = Uint32(ld_shared_i32(base_lo_bot + Int32(4)))
+
+                # FC2 SFA: read from sInt_sf at (g, kb_fc2) for lane 0 / (g+8, kb_fc2) for lane 1.
+                # Use byte-aligned load since sInt_sf is per-row × per-K-block bytes
+                # (offset isn't necessarily 4-byte aligned for I_k_blocks==1).
+                sfa_fc2 = Uint32(0x7F)
+                if lane == Int32(0):
+                    addr = sInt_sf_addr + g * Int32(I_k_blocks) + Int32(kb_fc2)
+                    sfa_fc2 = ld_shared_u8(addr)
+                elif lane == Int32(1):
+                    addr = sInt_sf_addr + (g + Int32(8)) * Int32(I_k_blocks) + Int32(kb_fc2)
+                    sfa_fc2 = ld_shared_u8(addr)
+
+                for n in cutlass.range_constexpr(fc2_chunk_n_tiles):
+                    smem_wrow = Int32(n * 8) + g
+                    bp_addr_2 = sW2_addr + smem_wrow * Int32(16) + lane * Int32(4)
+                    bp = Uint32(ld_shared_i32(bp_addr_2))
+                    b0, b1 = cvt_e2m1x8_to_e4m3x8(bp)
+
+                    sfb_fc2 = Uint32(0x7F)
+                    if lane == Int32(0):
+                        gmem_wrow = fc2_chunk_row_off + Int32(n * 8) + g
+                        sfb_fc2 = Uint32(mW2_sf[gmem_wrow, kb_fc2])
+
+                    d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e4m3(
+                        fc2[n * 4 + 0], fc2[n * 4 + 1], fc2[n * 4 + 2], fc2[n * 4 + 3],
+                        fc2_a0, fc2_a1, fc2_a2, fc2_a3, b0, b1, sfa_fc2, sfb_fc2,
+                    )
+                    fc2[n * 4 + 0] = d0
+                    fc2[n * 4 + 1] = d1
+                    fc2[n * 4 + 2] = d2
+                    fc2[n * 4 + 3] = d3
+
+            # Write D fragments to mY at this FC2 chunk's K_out cols.
+            for n in cutlass.range_constexpr(fc2_chunk_n_tiles):
+                col0 = fc2_chunk_row_off + Int32(n * 8) + lane * Int32(2)
+                mY[cta, g,            col0]            = BFloat16(fc2[n * 4 + 0])
+                mY[cta, g,            col0 + Int32(1)] = BFloat16(fc2[n * 4 + 1])
+                mY[cta, g + Int32(8), col0]            = BFloat16(fc2[n * 4 + 2])
+                mY[cta, g + Int32(8), col0 + Int32(1)] = BFloat16(fc2[n * 4 + 3])
+
+    @cute.jit
+    def driver(mA, mA_sf, mW13, mW13_sf, mW2, mW2_sf, mY, stream):
+        M_tiles = mY.shape[0]
+        kernel(mA, mA_sf, mW13, mW13_sf, mW2, mW2_sf, mY).launch(
+            grid=(M_tiles, 1, 1), block=[32, 1, 1], stream=stream,
+        )
+
+    return driver
+
+
+_compile_cache_chunked = {}
+
+
+def _compiled_chunked(M_tiles, K_in_blocks, I_k_blocks, K_out_n_tiles, fc2_chunk):
+    key = (M_tiles, K_in_blocks, I_k_blocks, K_out_n_tiles, fc2_chunk)
+    if key in _compile_cache_chunked:
+        return _compile_cache_chunked[key]
+    device = torch.device("cuda")
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    M_total = M_tiles * 16
+    K_in = K_in_blocks * 32
+    K_out = K_out_n_tiles * 8
+    I = I_k_blocks * 32
+    FC1_N = 2 * I
+    A = torch.zeros(M_total, K_in, dtype=torch.uint8, device=device)
+    A_sf = torch.zeros(M_total, K_in_blocks, dtype=torch.uint8, device=device)
+    W13 = torch.zeros(FC1_N, K_in // 2, dtype=torch.uint8, device=device)
+    W13_sf = torch.zeros(FC1_N, K_in_blocks, dtype=torch.uint8, device=device)
+    W2 = torch.zeros(K_out, I // 2, dtype=torch.uint8, device=device)
+    W2_sf = torch.zeros(K_out, I_k_blocks, dtype=torch.uint8, device=device)
+    Y = torch.zeros(M_tiles, 16, K_out, dtype=torch.bfloat16, device=device)
+    driver = _make_kernel_chunked(K_in_blocks, I_k_blocks, K_out_n_tiles, fc2_chunk)
+    compiled = cute.compile(
+        driver,
+        _to_cute(A, cutlass.Uint8),
+        _to_cute(A_sf, cutlass.Uint8),
+        _to_cute(W13, cutlass.Uint8),
+        _to_cute(W13_sf, cutlass.Uint8),
+        _to_cute(W2, cutlass.Uint8),
+        _to_cute(W2_sf, cutlass.Uint8),
+        _to_cute(Y, cutlass.BFloat16),
+        stream,
+    )
+    _compile_cache_chunked[key] = compiled
+    return compiled
+
+
+def run_fused_silu_chunked(
+    x_e4m3: torch.Tensor,
+    x_sf: torch.Tensor,
+    w13_packed: torch.Tensor,
+    w13_sf: torch.Tensor,
+    w2_packed: torch.Tensor,
+    w2_sf: torch.Tensor,
+    *,
+    fc2_chunk_n_tiles: int = 4,
+) -> torch.Tensor:
+    """Chunked variant. Same calling shape as run_fused_silu_global / cpasync.
+
+    Handles arbitrary FC1_N = 2*I (chunked over I_k_blocks) and arbitrary
+    K_out (chunked over K_out_n_tiles / fc2_chunk_n_tiles). Constraint:
+    K_out_n_tiles must be divisible by fc2_chunk_n_tiles.
+    """
+    M_actual, K_in = x_e4m3.shape
+    FC1_N, K_half = w13_packed.shape
+    K_out, I_half = w2_packed.shape
+    assert K_half * 2 == K_in
+    I = I_half * 2
+    assert FC1_N == 2 * I
+    K_in_blocks = K_in // 32
+    I_k_blocks = I // 32
+    K_out_n_tiles = K_out // 8
+
+    pad = (16 - M_actual % 16) % 16
+    if pad:
+        x_e4m3 = torch.cat(
+            [x_e4m3, torch.zeros(pad, K_in, dtype=x_e4m3.dtype, device=x_e4m3.device)], dim=0,
+        )
+        x_sf = torch.cat(
+            [x_sf, torch.zeros(pad, K_in_blocks, dtype=x_sf.dtype, device=x_sf.device)], dim=0,
+        )
+    M_total = x_e4m3.shape[0]
+    M_tiles = M_total // 16
+
+    device = x_e4m3.device
+    Y = torch.zeros(M_tiles, 16, K_out, dtype=torch.bfloat16, device=device)
+    compiled = _compiled_chunked(
+        M_tiles, K_in_blocks, I_k_blocks, K_out_n_tiles, fc2_chunk_n_tiles,
+    )
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    compiled(
+        _to_cute(x_e4m3, cutlass.Uint8),
+        _to_cute(x_sf, cutlass.Uint8),
+        _to_cute(w13_packed, cutlass.Uint8),
+        _to_cute(w13_sf, cutlass.Uint8),
+        _to_cute(w2_packed, cutlass.Uint8),
+        _to_cute(w2_sf, cutlass.Uint8),
+        _to_cute(Y, cutlass.BFloat16),
+        stream,
+    )
+    torch.cuda.synchronize()
+    out_flat = Y.reshape(M_total, K_out)
     if pad:
         out_flat = out_flat[:M_actual].clone()
     return out_flat
