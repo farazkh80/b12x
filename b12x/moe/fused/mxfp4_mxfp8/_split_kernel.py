@@ -552,9 +552,25 @@ class SplitRunner:
         self.w2_buf.copy_(w2_packed)
         self.w2sf_buf.copy_(w2_sf)
 
-    def __call__(self, x_e4m3: torch.Tensor, x_sf: torch.Tensor) -> torch.Tensor:
+    def __call__(
+        self,
+        x_e4m3: torch.Tensor,
+        x_sf: torch.Tensor,
+        *,
+        sync: bool = True,
+    ) -> torch.Tensor:
         """Run FC1+SwiGLU+Quant then FC2. Activations are copied into the
-        runner's static buffers before launch."""
+        runner's static buffers before launch.
+
+        Args:
+            sync: if True (default), block until the FC2 kernel completes
+                before returning. Pass `sync=False` in throughput loops where
+                the caller will sync once at the end — this lets the GPU
+                pipeline successive calls and saves ~30 µs of host-side wait
+                per call at gpt-oss-20b. The returned tensor still aliases
+                the runner's static `Y_buf`, so the caller must consume or
+                copy it before the next call.
+        """
         if x_e4m3.shape[0] != self.M:
             raise ValueError(
                 f"runner was built for M={self.M}; got x with M={x_e4m3.shape[0]}"
@@ -576,8 +592,9 @@ class SplitRunner:
             self._cint, self._cintsf, self._cw2, self._cw2sf,
             self._cY, stream,
         )
-        torch.cuda.synchronize()
+        if sync:
+            torch.cuda.synchronize()
         out_flat = self.Y_buf.reshape(self.M_total, self.K_out)
         if self.pad:
-            out_flat = out_flat[:self.M].clone()
+            out_flat = out_flat[:self.M].clone() if sync else out_flat[:self.M]
         return out_flat
