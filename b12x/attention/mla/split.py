@@ -67,10 +67,6 @@ def get_sparse_mla_split_shared_storage_cls():
             cute.struct.MemRange[cutlass.Uint8, int(_MLA_KV_STAGE_BYTES)],
             128,
         ],
-        "kv_stage_b": cute.struct.Align[
-            cute.struct.MemRange[cutlass.Uint8, int(_MLA_KV_STAGE_BYTES)],
-            128,
-        ],
         "token_idx": cute.struct.Align[
             cute.struct.MemRange[cutlass.Int32, _MLA_TOKEN_TILE],
             16,
@@ -309,7 +305,6 @@ class SparseMLASplitDecodeForwardKernel:
 
             q_base_addr = shared_ptr_to_u32(storage.q_group_stage.data_ptr())
             kv_base_addr = shared_ptr_to_u32(storage.kv_stage_a.data_ptr())
-            kv_stage_b_addr = shared_ptr_to_u32(storage.kv_stage_b.data_ptr())
 
             _run_one_pass_sparse_mla_tile(
                 q_u32,
@@ -320,7 +315,6 @@ class SparseMLASplitDecodeForwardKernel:
                 sScale,
                 q_base_addr,
                 kv_base_addr,
-                kv_stage_b_addr,
                 q_idx,
                 head_tile_start,
                 token_start,

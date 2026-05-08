@@ -885,6 +885,25 @@ def ld_shared_f32(addr: Int32, *, loc=None, ip=None) -> Float32:
     )
 
 
+
+@dsl_user_op
+def ld_shared_bf16_to_f32(addr: Int32, *, loc=None, ip=None) -> Float32:
+    """Load a BF16 from shared memory at a 32-bit byte address and convert to FP32."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Int32(addr).ir_value(loc=loc, ip=ip)],
+            "{.reg .b16 tmp; ld.shared.b16 tmp, [$1]; cvt.f32.bf16 $0, tmp;}",
+            "=f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
 @dsl_user_op
 def st_shared_f32(addr: Int32, val: Float32, *, loc=None, ip=None):
     """Store float32 to shared memory at a 32-bit byte address."""

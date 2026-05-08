@@ -21,13 +21,13 @@ from b12x.attention import utils as attention_utils
 from b12x.cute.fp4 import (
     frag_layout_swizzle_16b_to_8b,
     get_ptr_as_int64,
+    ld_shared_bf16_to_f32,
     ld_shared_v4_u32,
-    ldmatrix_m8n8x4_b16,
+    pack_f32x2_to_bfloat2,
     ldmatrix_m8n8x4_left_half_b16,
     ldmatrix_m8n8x4_right_half_b16,
     mxfp8_mma_m16n8k32_f32_e4m3,
     shared_ptr_to_u32,
-    st_global_f32,
     st_global_v2_f32,
     st_global_v4_f32,
     st_shared_v4_u32,
@@ -74,14 +74,14 @@ _PREFILL512_WARPS_PER_CTA = _PREFILL512_WARPS_Q * _PREFILL512_WARPS_K
 _PREFILL512_THREADS_PER_CTA = _PREFILL512_WARPS_PER_CTA * _WARP_THREADS
 _PREFILL512_NUM_MMA_Q = 1
 _PREFILL512_NUM_MMA_KV = 8
-_PREFILL512_Q_HEADS_BATCH = 6  # Exp15: 11 batches vs 16, 5 fewer sync barriers
+_PREFILL512_Q_HEADS_BATCH = 7  # Exp29: BF16 weights free 4KB smem, 10 batches vs 11
 _PREFILL512_H32_Q_HEADS_BATCH = 7
 _PREFILL512_H32_WEIGHT_COLS = 32
 
 _NSA_EXTEND_PREFILL_THRESHOLD_ENV = "B12X_NSA_EXTEND_PREFILL_THRESHOLD"
 _NSA_EXTEND_PREFILL_BLOCK_K_ENV = "B12X_NSA_EXTEND_PREFILL_BLOCK_K"
 _PREFILL512_MIN_Q_ROWS = 1024
-_PREFILL512_MIN_K_ROWS = 32768
+_PREFILL512_MIN_K_ROWS = 4096
 _PREFILL512_SUPPORTED_NUM_HEADS = (32, 64)
 
 
@@ -921,9 +921,8 @@ def st_shared_v4_f32(smem_addr: Int32, v0: Float32, v1: Float32, v2: Float32, v3
     )
 
 
-def get_sparse_nsa_prefill512_shared_storage_cls(q_heads_batch: int, weight_cols: int):
+def get_sparse_nsa_prefill512_shared_storage_cls(q_heads_batch: int):
     q_heads_batch = int(q_heads_batch)
-    weight_cols = int(weight_cols)
 
     class SharedStorage:
         pass
@@ -959,10 +958,6 @@ def get_sparse_nsa_prefill512_shared_storage_cls(q_heads_batch: int, weight_cols
                 cutlass.Uint8,
                 _PREFILL_Q_STAGE_ROWS * _PREFILL_Q_STAGE_COLS * q_heads_batch,
             ],
-            1024,
-        ],
-        "w_smem": cute.struct.Align[
-            cute.struct.MemRange[cutlass.Float32, _PREFILL512_BLOCK_Q * weight_cols],
             1024,
         ],
     }
@@ -1472,11 +1467,9 @@ class SparseNSAExtendLogitsPrefill512Kernel:
         *,
         tiled_output: bool = False,
         q_heads_batch: int = _PREFILL512_Q_HEADS_BATCH,
-        weight_cols: int = _MAX_Q_HEADS,
     ):
         self._tiled_output = tiled_output
         self._q_heads_batch = int(q_heads_batch)
-        self._weight_cols = int(weight_cols)
 
     @cute.jit
     def __call__(
@@ -1560,7 +1553,6 @@ class SparseNSAExtendLogitsPrefill512Kernel:
 
         SharedStorage = get_sparse_nsa_prefill512_shared_storage_cls(
             self._q_heads_batch,
-            self._weight_cols,
         )
         storage = smem.allocate(SharedStorage)
         mbar_ptr_k = storage.mbar_ptr_k.data_ptr()
@@ -1607,7 +1599,6 @@ class SparseNSAExtendLogitsPrefill512Kernel:
 
         if s_tile_live[Int32(0)] != Int32(0):
             q_smem_base = k_perm_base_addr + Int32(_PREFILL512_BLOCK_K * _INDEX_HEAD_DIM)
-            w_smem_base = q_smem_base + Int32(_PREFILL_Q_STAGE_BYTES * Q_HEADS_BATCH)
             producer_state = pipeline.PipelineStateSimple(1, Int32(0))
             consumer_state = pipeline.PipelineStateSimple(1, Int32(0))
             if warp_idx == Int32(0):
@@ -1631,22 +1622,8 @@ class SparseNSAExtendLogitsPrefill512Kernel:
                         k_tile_base + Int32(_PREFILL_BLOCK_K),
                         shared_ptr_to_u32(full_mbar_ptr),
                     )
-            # Stage weights and scales while the K TMA copy is in flight.
-            w_linear = tx * Int32(4)
-            while w_linear < Int32(_PREFILL512_BLOCK_Q) * num_heads:
-                w_q_local = w_linear // num_heads
-                w_head = w_linear % num_heads
-                w_q_row = q_tile_base + w_q_local
-                w0 = Float32(weights[w_q_row, w_head]) if (w_q_row < valid_q_rows and w_head < num_heads) else Float32(0.0)
-                w1 = Float32(weights[w_q_row, w_head + Int32(1)]) if (w_q_row < valid_q_rows and w_head + Int32(1) < num_heads) else Float32(0.0)
-                w2 = Float32(weights[w_q_row, w_head + Int32(2)]) if (w_q_row < valid_q_rows and w_head + Int32(2) < num_heads) else Float32(0.0)
-                w3 = Float32(weights[w_q_row, w_head + Int32(3)]) if (w_q_row < valid_q_rows and w_head + Int32(3) < num_heads) else Float32(0.0)
-                st_shared_v4_f32(
-                    w_smem_base + w_linear * Int32(4),
-                    w0, w1, w2, w3,
-                )
-                w_linear += Int32(_PREFILL512_THREADS_PER_CTA * 4)
-
+            # Exp40: weight staging removed — weights read from gmem directly (hidden by QK MMA latency).
+            # Only stage scales while the K TMA copy is in flight.
             scale_linear = tx
             while scale_linear < Int32(_PREFILL512_BLOCK_K):
                 s_scales[scale_linear] = Float32(k_scales[k_tile_base + scale_linear])
@@ -1659,18 +1636,10 @@ class SparseNSAExtendLogitsPrefill512Kernel:
             for mma_kv in cutlass.range_constexpr(_PREFILL512_NUM_MMA_KV):
                 for reg_id in cutlass.range_constexpr(8):
                     acc_frag[Int32(0), mma_kv, reg_id] = Float32(0.0)
-            cute.arch.mbarrier_wait(
-                mbar_ptr_k + consumer_state.index,
-                phase=consumer_state.phase,
-            )
-            cute.arch.sync_threads()
 
-            lane_group_pre = lane // Int32(4)
-            q_local_rs0 = warp_q_idx * Int32(16) + lane_group_pre
-            q_local_rs1 = q_local_rs0 + Int32(8)
-            w_off_rs0 = q_local_rs0 * num_heads * Int32(4)
-            w_off_rs1 = q_local_rs1 * num_heads * Int32(4)
-
+            # Exp38: compute Q staging variables and issue first Q-head batch
+            # cp_async BEFORE mbarrier_wait — Q loads from gmem, independent of K TMA.
+            # This overlaps first-batch Q staging latency with K TMA tail + weight/scale loads.
             threads_per_row = Int32(8)
             row_local = tx // threads_per_row
             col_group = tx % threads_per_row
@@ -1683,20 +1652,33 @@ class SparseNSAExtendLogitsPrefill512Kernel:
             q_row_for_async = q_row if row_local < Int32(_PREFILL_Q_STAGE_ROWS) else Int32(0)
 
             batch_base_head = Int32(0)
+            for block_offset in cutlass.range_constexpr(Q_HEADS_BATCH):
+                head_in_batch = Int32(block_offset)
+                global_head = batch_base_head + head_in_batch
+                if global_head < num_heads:
+                    gmem_u32_offset = (
+                        q_row_for_async * num_heads + global_head
+                    ) * Int32(_INDEX_HEAD_DIM // 4) + u32_col_base
+                    cp_async_128b_pred(
+                        q_smem_base + head_in_batch * q_smem_stride + thread_offset,
+                        get_ptr_as_int64(q_u32, gmem_u32_offset),
+                        in_bounds_pred,
+                    )
+            cute.arch.cp_async_commit_group()
+
+            cute.arch.mbarrier_wait(
+                mbar_ptr_k + consumer_state.index,
+                phase=consumer_state.phase,
+            )
+            cute.arch.sync_threads()
+
+            lane_group_pre = lane // Int32(4)
+            q_local_rs0 = warp_q_idx * Int32(16) + lane_group_pre
+            q_local_rs1 = q_local_rs0 + Int32(8)
+            # Pipelined Q-head batch loop: overlap staging of batch N+1 with compute of batch N
+            # Prologue: first Q-head batch already staged above before mbarrier_wait
+
             while batch_base_head < num_heads:
-                for block_offset in cutlass.range_constexpr(Q_HEADS_BATCH):
-                    head_in_batch = Int32(block_offset)
-                    global_head = batch_base_head + head_in_batch
-                    if global_head < num_heads:
-                        gmem_u32_offset = (
-                            q_row_for_async * num_heads + global_head
-                        ) * Int32(_INDEX_HEAD_DIM // 4) + u32_col_base
-                        cp_async_128b_pred(
-                            q_smem_base + head_in_batch * q_smem_stride + thread_offset,
-                            get_ptr_as_int64(q_u32, gmem_u32_offset),
-                            in_bounds_pred,
-                        )
-                cute.arch.cp_async_commit_group()
                 cute.arch.cp_async_wait_group(0)
                 cute.arch.sync_threads()
 
@@ -1723,8 +1705,10 @@ class SparseNSAExtendLogitsPrefill512Kernel:
                             Int32(_FP8_ROW_VECS),
                         )
                         lane_group = lane // Int32(4)
-                        w_rs0 = ld_shared_f32(w_smem_base + w_off_rs0 + head_idx * Int32(4))
-                        w_rs1 = ld_shared_f32(w_smem_base + w_off_rs1 + head_idx * Int32(4))
+                        q_row_rs0 = q_tile_base + q_local_rs0
+                        q_row_rs1 = q_tile_base + q_local_rs1
+                        w_rs0 = Float32(weights[q_row_rs0, head_idx]) if q_row_rs0 < valid_q_rows else Float32(0.0)
+                        w_rs1 = Float32(weights[q_row_rs1, head_idx]) if q_row_rs1 < valid_q_rows else Float32(0.0)
                         for mma_kv in cutlass.range_constexpr(_PREFILL512_NUM_MMA_KV):
                             for reg_id in cutlass.range_constexpr(8):
                                 row_slot = (reg_id % 4) // 2
@@ -1739,6 +1723,22 @@ class SparseNSAExtendLogitsPrefill512Kernel:
                                 )
                 cute.arch.sync_threads()
                 batch_base_head += Int32(Q_HEADS_BATCH)
+
+                # Issue Q staging for next batch (overlapped with current sync overhead)
+                if batch_base_head < num_heads:
+                    for block_offset in cutlass.range_constexpr(Q_HEADS_BATCH):
+                        head_in_batch = Int32(block_offset)
+                        global_head = batch_base_head + head_in_batch
+                        if global_head < num_heads:
+                            gmem_u32_offset = (
+                                q_row_for_async * num_heads + global_head
+                            ) * Int32(_INDEX_HEAD_DIM // 4) + u32_col_base
+                            cp_async_128b_pred(
+                                q_smem_base + head_in_batch * q_smem_stride + thread_offset,
+                                get_ptr_as_int64(q_u32, gmem_u32_offset),
+                                in_bounds_pred,
+                            )
+                    cute.arch.cp_async_commit_group()
 
             lane_group = lane // Int32(4)
             lane_pair_base = Int32(2) * (lane % Int32(4))
@@ -1894,7 +1894,6 @@ def _build_sparse_nsa_extend_prefill512_kernel(
         return SparseNSAExtendLogitsPrefill512Kernel(
             tiled_output=tiled_output,
             q_heads_batch=_PREFILL512_H32_Q_HEADS_BATCH,
-            weight_cols=_PREFILL512_H32_WEIGHT_COLS,
         )
     return SparseNSAExtendLogitsPrefill512Kernel(tiled_output=tiled_output)
 
