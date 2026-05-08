@@ -1687,6 +1687,151 @@ def mxfp8_mma_m16n8k32_f32_e4m3(
 
 
 @dsl_user_op
+def mxfp4_mxfp8_mma_m16n8k32_f32_e4m3_e2m1(
+    d0: Float32,
+    d1: Float32,
+    d2: Float32,
+    d3: Float32,
+    a0: Uint32,
+    a1: Uint32,
+    a2: Uint32,
+    a3: Uint32,
+    b0: Uint32,
+    b1: Uint32,
+    sfa: Uint32,
+    sfb: Uint32,
+    bid_a: int = 0,
+    tid_a: int = 0,
+    bid_b: int = 0,
+    tid_b: int = 0,
+    *,
+    loc=None,
+    ip=None,
+) -> Tuple[Float32, Float32, Float32, Float32]:
+    """Warp MMA helper for SM120 mixed MXFP4/MXFP8 `m16n8k32`, A=E4M3, B=E2M1.
+
+    STATUS: probe shows D = 1/4 of expected (factor-4 mismatch) with byte-padded
+    FP4 in low nibble. Root cause likely in B-side register layout for `.e2m1`
+    operand under `kind::mxf8f6f4` — needs PTX/CUTLASS source consultation
+    before relying on this directly.
+
+    Workable alternative: use `cvt_e2m1x4_to_e4m3x4` to dequant FP4→E4M3 in
+    registers and call `mxfp8_mma_m16n8k32_f32_e4m3` instead. Lossless since
+    every FP4 representable value fits in E4M3.
+    """
+    i16_ty = cutlass._mlir.ir.IntegerType.get_signless(16)
+    bid_a_i16 = cutlass._mlir.ir.Operation.create(
+        "llvm.mlir.constant",
+        results=[i16_ty],
+        attributes={"value": cutlass._mlir.ir.IntegerAttr.get(i16_ty, int(bid_a))},
+    ).result
+    tid_a_i16 = cutlass._mlir.ir.Operation.create(
+        "llvm.mlir.constant",
+        results=[i16_ty],
+        attributes={"value": cutlass._mlir.ir.IntegerAttr.get(i16_ty, int(tid_a))},
+    ).result
+    bid_b_i16 = cutlass._mlir.ir.Operation.create(
+        "llvm.mlir.constant",
+        results=[i16_ty],
+        attributes={"value": cutlass._mlir.ir.IntegerAttr.get(i16_ty, int(bid_b))},
+    ).result
+    tid_b_i16 = cutlass._mlir.ir.Operation.create(
+        "llvm.mlir.constant",
+        results=[i16_ty],
+        attributes={"value": cutlass._mlir.ir.IntegerAttr.get(i16_ty, int(tid_b))},
+    ).result
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32(), T.f32(), T.f32()]),
+        [
+            Uint32(a0).ir_value(loc=loc, ip=ip),
+            Uint32(a1).ir_value(loc=loc, ip=ip),
+            Uint32(a2).ir_value(loc=loc, ip=ip),
+            Uint32(a3).ir_value(loc=loc, ip=ip),
+            Uint32(b0).ir_value(loc=loc, ip=ip),
+            Uint32(b1).ir_value(loc=loc, ip=ip),
+            Uint32(sfa).ir_value(loc=loc, ip=ip),
+            bid_a_i16,
+            tid_a_i16,
+            Uint32(sfb).ir_value(loc=loc, ip=ip),
+            bid_b_i16,
+            tid_b_i16,
+            Float32(d0).ir_value(loc=loc, ip=ip),
+            Float32(d1).ir_value(loc=loc, ip=ip),
+            Float32(d2).ir_value(loc=loc, ip=ip),
+            Float32(d3).ir_value(loc=loc, ip=ip),
+        ],
+        """
+        mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e2m1.f32.ue8m0
+        {$0, $1, $2, $3},
+        {$4, $5, $6, $7},
+        {$8, $9},
+        {$0, $1, $2, $3},
+        {$10},
+        {$11, $12},
+        {$13},
+        {$14, $15};
+        """,
+        "=f,=f,=f,=f,r,r,r,r,r,r,r,h,h,r,h,h,0,1,2,3",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    r0 = llvm.extractvalue(T.f32(), result, [0], loc=loc, ip=ip)
+    r1 = llvm.extractvalue(T.f32(), result, [1], loc=loc, ip=ip)
+    r2 = llvm.extractvalue(T.f32(), result, [2], loc=loc, ip=ip)
+    r3 = llvm.extractvalue(T.f32(), result, [3], loc=loc, ip=ip)
+    return Float32(r0), Float32(r1), Float32(r2), Float32(r3)
+
+
+@dsl_user_op
+def cvt_e2m1x8_to_e4m3x8(
+    packed: Uint32, *, loc=None, ip=None
+) -> Tuple[Uint32, Uint32]:
+    """Lossless dequant: 8 packed E2M1 nibbles (1 u32) → 8 E4M3 bytes (2 u32).
+
+    Every FP4 representable value {0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, ±6} is
+    exactly representable in E4M3, so this widening is value-exact and lets the
+    proven `mxfp8_mma_m16n8k32_f32_e4m3` MMA consume MXFP4 weights without a
+    dedicated mixed-input MMA atom.
+
+    Path: e2m1 → f16x2 (hw cvt) → e4m3x2 (hw cvt). 4 hw cvts per direction.
+    """
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [Uint32(packed).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .b8 byte0, byte1, byte2, byte3;
+            .reg .b32 h0, h1, h2, h3;
+            .reg .b16 e_lo, e_hi;
+            mov.b32 {byte0, byte1, byte2, byte3}, $2;
+            cvt.rn.f16x2.e2m1x2 h0, byte0;
+            cvt.rn.f16x2.e2m1x2 h1, byte1;
+            cvt.rn.f16x2.e2m1x2 h2, byte2;
+            cvt.rn.f16x2.e2m1x2 h3, byte3;
+            cvt.rn.satfinite.e4m3x2.f16x2 e_lo, h0;
+            cvt.rn.satfinite.e4m3x2.f16x2 e_hi, h1;
+            mov.b32 $0, {e_lo, e_hi};
+            cvt.rn.satfinite.e4m3x2.f16x2 e_lo, h2;
+            cvt.rn.satfinite.e4m3x2.f16x2 e_hi, h3;
+            mov.b32 $1, {e_lo, e_hi};
+        }
+        """,
+        "=r,=r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    out0 = llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)
+    out1 = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
+    return Uint32(out0), Uint32(out1)
+
+
+@dsl_user_op
 def byte_perm(a: Uint32, b: Uint32, selector: Int32, *, loc=None, ip=None) -> Uint32:
     """PTX byte permutation helper."""
     return Uint32(
