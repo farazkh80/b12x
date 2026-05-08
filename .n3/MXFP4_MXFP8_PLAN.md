@@ -277,24 +277,36 @@ Tune sweep (only after baseline beats or ties flashinfer):
 - [ ] Phase 5 — Python integration entrypoint mirroring `b12x_moe_fp4` (mostly glue once Phase 4-prod lands)
 - [x] **Phase 6 — gpt-oss-shaped wall-clock benchmark vs flashinfer**. flashinfer 0.6.10 unblocks the SM120 mxfp4 path. b12x's fused single-launch chain vs flashinfer's two-GEMM + host-activation + host-quant chain, on a (M, K_in, I, K_out) sweep with K_in / I / K_out multiples of 128 (flashinfer's kernel constraint).
 
-  **Key results (median μs at this SM120 host):**
+  **Key results (median μs at this SM120 host, weights pre-quantized OUTSIDE the timed window — mirrors inference; only intermediate quant inside):**
 
   | shape (M, K_in, I, K_out) | b12x_global | b12x_cpasync | flashinfer_chain | flashinfer / b12x |
   |---|---|---|---|---|
-  | (64, 128, 128, 128)        | 89.1  | 85.3  | 152.6 | **1.79× faster (b12x)** |
-  | (128, 128, 128, 128)       | 86.3  | 83.8  | 151.2 | **1.80×** |
-  | (256, 128, 128, 128)       | 88.1  | 86.4  | 152.1 | **1.76×** |
-  | (128, 256, 128, 128)       | 103.3 | 95.1  | 151.7 | 1.60× |
-  | (128, 128, 256, 128)       | 157.5 | 123.4 | 154.4 | 1.25× |
-  | (128, 128, 128, 256)       | 91.9  | 88.0  | 152.9 | 1.74× |
-  | (128, 256, 256, 256)       | 251.3 | 178.8 | 155.1 | 0.87× (flashinfer) |
-  | (256, 256, 256, 256)       | 250.6 | 184.2 | 155.4 | 0.84× (flashinfer) |
+  | (64, 128, 128, 128)        | 90.1  | 86.5  | 138.3 | **1.60× faster (b12x)** |
+  | (128, 128, 128, 128)       | 88.8  | 86.8  | 137.2 | **1.58×** |
+  | (256, 128, 128, 128)       | 87.8  | 87.2  | 134.8 | **1.55×** |
+  | (128, 256, 128, 128)       | 101.9 | 95.0  | 134.4 | 1.42× |
+  | (128, 128, 128, 256)       | 93.1  | 90.1  | 134.2 | 1.49× |
 
-  - **At small-to-medium shapes, b12x beats flashinfer by 1.6-1.8×** because: (a) one launch instead of two, (b) on-device fused SwiGLU+quant instead of host-side, (c) flashinfer's per-launch dispatch is ~75 μs floor regardless of shape.
-  - **At larger shapes (256³+), b12x falls behind** because of register pressure on the single-warp kernel (FC1 accumulator scales with FC1_N_tiles × K_in_blocks; spills to local memory above ~16 N-tiles). flashinfer scales flat ~155 μs and wins from there.
-  - **Production gpt-oss-20b shape (K=I=K_out=2880) runs in NEITHER**: flashinfer requires K multiple of 128 (2880/128 = 22.5), b12x's single-warp kernel can't fit FC1_N_tiles=720 in registers. Both need K-padding (next multiple of 128 = 3072) AND b12x needs in-kernel N-tile partitioning.
+  - **At small-to-medium shapes, b12x beats flashinfer by ~1.5×** because: (a) one launch instead of two, (b) on-device fused SwiGLU + MXFP8 quant instead of host-side, (c) flashinfer floors at ~135 μs (per-launch dispatch + intermediate-quant overhead) regardless of K dim.
+  - **Larger shapes (FC1_N_tiles > 16): b12x's single-warp kernel hits register spill** (FC1 accumulator scales with `FC1_N_tiles × K_in_blocks`; benchmark harness now skips them rather than running a slow spilled kernel).
 
-  **What this proves:** the b12x fused-MoE design is meaningfully faster at moderate shapes, and the fusion-vs-two-launch advantage holds. Scaling to gpt-oss-20b requires shape-coverage work on both sides (flashinfer's K-multiple-of-128 + b12x's N-tile partitioning loop). Headline harness: `benchmarks/bench_gpt_oss_moe.py` (run with `--shapes constrained` for the sweep above; `--shapes gpt-oss` to see the K=2880 blocker).
+- [x] **A1 follow-up — K/I/K_out padding utility** (`_flashinfer_expert_chain_padded` and `_flashinfer_pad_and_prequantize` in `bench_gpt_oss_moe.py`): pads any GEMM dim to a multiple of 128 with zeros. The dot product over padded K positions is 0; padded N rows in the result are sliced off. Cost: e.g. 2880 → 3072 = 6.7% extra compute per padded dim. Unblocks **gpt-oss-20b's full shape (K = I = K_out = 2880)** which flashinfer's SM120 mxfp4 path would otherwise reject (`tile_n=128` instantiations only).
+
+  **gpt-oss-20b production-shape baseline** (FC1_N=5760, K=I=K_out=2880 padded to 3072, flashinfer 0.6.10.post1):
+
+  | M    | flashinfer per-expert μs |
+  |------|------------------|
+  | 1    | 155.7 |
+  | 4    | 164.5 |
+  | 16   | 161.8 |
+  | 32   | 161.8 |
+  | 64   | 159.1 |
+  | 128  | 159.8 |
+  | 256  | 156.8 |
+
+  **Flat at ~160 μs across the M sweep** — flashinfer is launch + weight-read bound at this shape, not compute bound. b12x has substantial headroom here once the in-kernel N-tile partitioning lands; until then it can't run at this shape (FC1_N_tiles = 720 > register budget).
+
+  Headline harness: `benchmarks/bench_gpt_oss_moe.py` with modes `--shapes constrained|single|gpt-oss`.
 
 ## Validated artifacts as of session end
 

@@ -79,7 +79,12 @@ def _flashinfer_expert_chain(
     w2_p:  torch.Tensor,   w2_sf:  torch.Tensor,
     *, tile_m: int = 128, tile_n: int = 128, tile_k: int = 128,
 ) -> torch.Tensor:
-    """flashinfer two-GEMM chain with host-side SwiGLU + MXFP8 quant."""
+    """flashinfer two-GEMM chain with host-side SwiGLU + MXFP8 quant.
+
+    Assumes K_in and I are already multiples of tile_k (=128 default). For the
+    gpt-oss-20b shape (K_in=I=2880) use _flashinfer_expert_chain_padded which
+    pads to the next multiple before quantizing.
+    """
     from flashinfer import mxfp8_quantize as fi_mxfp8_quantize
     from flashinfer.gemm import group_gemm_mxfp4_nt_groupwise
 
@@ -105,6 +110,177 @@ def _flashinfer_expert_chain(
         out_dtype=torch.bfloat16,
     )
     return fc2
+
+
+def _flashinfer_pad_and_prequantize(
+    x_bf16: torch.Tensor,           # (M, K_in)            bf16
+    w13_bf16: torch.Tensor,         # (FC1_N, K_in)        bf16
+    w2_bf16: torch.Tensor,          # (K_out, I)           bf16
+    *, multiple: int = 128,
+):
+    """Returns a setup blob with padded + pre-quantized tensors and shape info.
+
+    Mirrors how a real inference deployment reuses pre-quantized weights —
+    only the activation+intermediate quant happens per-call. The returned
+    blob is consumed by `_flashinfer_chain_run` in a timed loop.
+    """
+    from flashinfer import mxfp4_quantize as fi_mxfp4, mxfp8_quantize as fi_mxfp8
+
+    M, K_in = x_bf16.shape
+    FC1_N, K_in_chk = w13_bf16.shape
+    K_out, I = w2_bf16.shape
+    assert K_in == K_in_chk
+    assert FC1_N == 2 * I
+
+    def pad_to(value, mult):
+        return (mult - value % mult) % mult
+    K_pad = pad_to(K_in, multiple)
+    I_pad = pad_to(I, multiple)
+    Kout_pad = pad_to(K_out, multiple)
+
+    if K_pad:
+        x_bf16   = F.pad(x_bf16,   (0, K_pad))
+        w13_bf16 = F.pad(w13_bf16, (0, K_pad))
+    if I_pad:
+        gate_w = w13_bf16[:I]
+        up_w   = w13_bf16[I:]
+        zeros  = torch.zeros(I_pad, w13_bf16.shape[1],
+                             dtype=w13_bf16.dtype, device=w13_bf16.device)
+        w13_bf16 = torch.cat([gate_w, zeros, up_w, zeros], dim=0)
+        w2_bf16  = F.pad(w2_bf16, (0, I_pad))
+    if Kout_pad:
+        w2_bf16 = F.pad(w2_bf16, (0, 0, 0, Kout_pad))
+
+    # Pre-quantize x and weights once.
+    ax,    ax_sf    = fi_mxfp8(x_bf16)
+    w13_q, w13_q_sf = fi_mxfp4(w13_bf16)
+    w2_q,  w2_q_sf  = fi_mxfp4(w2_bf16)
+    m_indptr = torch.tensor([0, M], dtype=torch.int32, device=x_bf16.device)
+
+    return {
+        "ax": ax, "ax_sf": ax_sf,
+        "w13_q": w13_q, "w13_q_sf": w13_q_sf,
+        "w2_q":  w2_q,  "w2_q_sf":  w2_q_sf,
+        "m_indptr": m_indptr,
+        "M": M, "I": I, "K_out": K_out,
+        "I_padded": I + I_pad,
+    }
+
+
+def _flashinfer_chain_run(
+    blob, *, tile_m: int = 128, tile_n: int = 128, tile_k: int = 128,
+) -> torch.Tensor:
+    """Steady-state per-call: FC1 + SwiGLU + intermediate-quant + FC2.
+
+    Pre-quantized tensors come from `_flashinfer_pad_and_prequantize`.
+    """
+    from flashinfer import mxfp8_quantize as fi_mxfp8
+    from flashinfer.gemm import group_gemm_mxfp4_nt_groupwise
+
+    fc1 = group_gemm_mxfp4_nt_groupwise(
+        blob["ax"], blob["w13_q"].unsqueeze(0),
+        blob["ax_sf"], blob["w13_q_sf"].unsqueeze(0), blob["m_indptr"],
+        mma_sm=1, tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, swap_ab=True,
+        out_dtype=torch.bfloat16,
+    )
+    I_padded = blob["I_padded"]
+    gate = fc1[:, :I_padded]
+    up   = fc1[:, I_padded:]
+    inter = (F.silu(up) * gate).to(torch.float16)        # (M, I_padded)
+    int_e4m3, int_sf = fi_mxfp8(inter)
+
+    fc2 = group_gemm_mxfp4_nt_groupwise(
+        int_e4m3, blob["w2_q"].unsqueeze(0),
+        int_sf,   blob["w2_q_sf"].unsqueeze(0), blob["m_indptr"],
+        mma_sm=1, tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, swap_ab=True,
+        out_dtype=torch.bfloat16,
+    )
+    K_out = blob["K_out"]
+    return fc2[:, :K_out].contiguous() if fc2.shape[1] != K_out else fc2
+
+
+def _flashinfer_expert_chain_padded(
+    x_bf16: torch.Tensor,           # (M, K_in)            bf16
+    w13_bf16: torch.Tensor,         # (FC1_N, K_in)        bf16  (FC1_N = 2*I for SwiGLU)
+    w2_bf16: torch.Tensor,          # (K_out, I)           bf16
+    *, tile_m: int = 128, tile_n: int = 128, tile_k: int = 128,
+    multiple: int = 128,
+) -> torch.Tensor:
+    """flashinfer two-GEMM chain with auto-padding to multiples of `multiple`
+    along K dims (K_in for FC1, I for FC2) AND N dims (FC1_N for FC1,
+    K_out for FC2). flashinfer's SM120 kernel currently only ships tile_n=128
+    instantiations, so EVERY GEMM dim that isn't a multiple of 128 must be
+    padded.
+
+    Padding with zeros is numerically equivalent to the unpadded computation:
+    the dot product over padded K positions contributes 0; padded N rows in
+    the result are dropped via slicing. Cost is the extra compute fraction —
+    e.g. 2880 → 3072 = 6.7% overhead per padded dim.
+
+    All quantization happens AFTER padding so flashinfer's quantizers handle
+    the swizzled SF layout for us.
+
+    Returns the result sliced back to the original (M, K_out).
+    """
+    from flashinfer import mxfp4_quantize as fi_mxfp4, mxfp8_quantize as fi_mxfp8
+    from flashinfer.gemm import group_gemm_mxfp4_nt_groupwise
+
+    M, K_in = x_bf16.shape
+    FC1_N, K_in_chk = w13_bf16.shape
+    K_out, I = w2_bf16.shape
+    assert K_in == K_in_chk, f"x and w13 K mismatch: {K_in} vs {K_in_chk}"
+    assert FC1_N == 2 * I, f"SwiGLU expects FC1_N == 2*I, got {FC1_N} != 2*{I}"
+
+    def pad_to(value, mult):
+        return (mult - value % mult) % mult
+    K_pad = pad_to(K_in,   multiple)
+    I_pad = pad_to(I,      multiple)
+    Kout_pad = pad_to(K_out, multiple)
+
+    # Pad K_in: x along last dim, w13 along last dim.
+    if K_pad:
+        x_bf16   = F.pad(x_bf16,   (0, K_pad))
+        w13_bf16 = F.pad(w13_bf16, (0, K_pad))
+    # Pad I: w13 along FIRST dim (FC1_N grows by 2*I_pad to keep gate ‖ up split),
+    # w2 along last dim.
+    if I_pad:
+        # FC1_N = (gate_dim + up_dim) = 2 * I. We need to extend BOTH halves
+        # by I_pad each so the post-FC1 split lines up.
+        gate_w = w13_bf16[:I]
+        up_w   = w13_bf16[I:]
+        zeros  = torch.zeros(I_pad, w13_bf16.shape[1],
+                             dtype=w13_bf16.dtype, device=w13_bf16.device)
+        w13_bf16 = torch.cat([gate_w, zeros, up_w, zeros], dim=0)  # (2*(I+I_pad), K_padded)
+        w2_bf16  = F.pad(w2_bf16, (0, I_pad))
+    # Pad K_out: w2 along FIRST dim. Padded output rows are 0 and get sliced off.
+    if Kout_pad:
+        w2_bf16 = F.pad(w2_bf16, (0, 0, 0, Kout_pad))
+
+    I_padded = I + I_pad
+    K_out_padded = K_out + Kout_pad
+
+    m_indptr = torch.tensor([0, M], dtype=torch.int32, device=x_bf16.device)
+
+    ax,    ax_sf    = fi_mxfp8(x_bf16)
+    w13_q, w13_q_sf = fi_mxfp4(w13_bf16)
+
+    fc1 = group_gemm_mxfp4_nt_groupwise(
+        ax, w13_q.unsqueeze(0), ax_sf, w13_q_sf.unsqueeze(0), m_indptr,
+        mma_sm=1, tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, swap_ab=True,
+        out_dtype=torch.bfloat16,
+    )                                          # (M, 2 * I_padded) bf16
+    gate = fc1[:, :I_padded]
+    up   = fc1[:, I_padded:]
+    inter = (F.silu(up) * gate).to(torch.float16)        # (M, I_padded)
+    int_e4m3, int_sf = fi_mxfp8(inter)
+
+    w2_q, w2_q_sf = fi_mxfp4(w2_bf16)
+    fc2 = group_gemm_mxfp4_nt_groupwise(
+        int_e4m3, w2_q.unsqueeze(0), int_sf, w2_q_sf.unsqueeze(0), m_indptr,
+        mma_sm=1, tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, swap_ab=True,
+        out_dtype=torch.bfloat16,
+    )                                          # (M, K_out_padded)
+    return fc2[:, :K_out].contiguous() if Kout_pad else fc2
 
 
 def main():
@@ -160,7 +336,15 @@ def main():
         # gpt-oss target — flashinfer-only (b12x kernel can't fit this shape today).
         print("gpt-oss target shape — flashinfer baseline only "
               "(b12x's single-warp kernel overflows registers at FC1_N=5760).")
-        sweep = [(128, 2880, 2880, 2880)]
+        sweep = [
+            (1,   2880, 2880, 2880),  # decode regime
+            (4,   2880, 2880, 2880),
+            (16,  2880, 2880, 2880),
+            (32,  2880, 2880, 2880),
+            (64,  2880, 2880, 2880),
+            (128, 2880, 2880, 2880),
+            (256, 2880, 2880, 2880),
+        ]
 
     flush = _l2_flush(device)
     results = []
@@ -203,19 +387,15 @@ def main():
                 t_cpasync = None
                 print(f"    b12x_cpasync error: {e}")
 
-        # flashinfer expects E4M3 byte (NOT uint8 view); use flashinfer's own quantizer.
-        from flashinfer import mxfp4_quantize as fi_mxfp4, mxfp8_quantize as fi_mxfp8
-        ax_fi, ax_fi_sf = fi_mxfp8(x_bf)
-        w13_fi, w13_fi_sf = fi_mxfp4(w13_bf)
-        w2_fi,  w2_fi_sf  = fi_mxfp4(w2_bf)
+        # flashinfer-side: pre-quantize weights + activations OUTSIDE the timed
+        # window (mirrors inference: weights are cached, only intermediate is
+        # re-quantized per call). The padded chain handles K/N alignment to 128;
+        # SM120 only ships tile_n=128 instantiations.
         try:
-            _ = _flashinfer_expert_chain(
-                ax_fi, ax_fi_sf, w13_fi, w13_fi_sf, w2_fi, w2_fi_sf,
-            )
+            blob = _flashinfer_pad_and_prequantize(x_bf, w13_bf, w2_bf)
+            _ = _flashinfer_chain_run(blob)  # warm-up call
             t_fi = _bench(
-                lambda: _flashinfer_expert_chain(
-                    ax_fi, ax_fi_sf, w13_fi, w13_fi_sf, w2_fi, w2_fi_sf,
-                ),
+                lambda: _flashinfer_chain_run(blob),
                 warmup=args.warmup, iters=args.iters, l2_flush=flush,
             )
         except Exception as e:
