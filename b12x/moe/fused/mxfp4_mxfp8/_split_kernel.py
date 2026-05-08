@@ -469,3 +469,115 @@ def run_fused_silu_split(
     if pad:
         out_flat = out_flat[:M_actual].clone()
     return out_flat
+
+
+class SplitRunner:
+    """Hot-path wrapper for run_fused_silu_split that caches cute-tensor
+    handles, intermediate buffers, and the per-shape compiled kernels.
+
+    The first call to `run_fused_silu_split` spends ~70 µs per invocation in
+    `_to_cute(...)` (DLPack import + element-type set) for each of the 8
+    tensor arguments. SplitRunner does that work ONCE at construction. After
+    that, each `__call__` is just two `compiled(...)` launches + a
+    `torch.cuda.synchronize` + (optional) output slice.
+
+    Use when shapes are static (typical inference). The runner pre-allocates
+    its own static input/output buffers; per-call activation data is
+    `copy_`-ed into them. Weights are bound at construction and reused.
+    """
+
+    def __init__(
+        self,
+        *,
+        M: int,
+        K_in: int,
+        I: int,
+        K_out: int,
+        fc2_chunk_n_tiles: int = 4,
+        device: torch.device | None = None,
+    ):
+        if device is None:
+            device = torch.device("cuda")
+        FC1_N = 2 * I
+        K_in_blocks = K_in // 32
+        I_k_blocks = I // 32
+        K_out_n_tiles = K_out // 8
+        pad = (16 - M % 16) % 16
+        M_total = M + pad
+        M_tiles = M_total // 16
+
+        self.M, self.K_in, self.I, self.K_out = M, K_in, I, K_out
+        self.M_total, self.M_tiles, self.pad = M_total, M_tiles, pad
+        self.K_in_blocks = K_in_blocks
+        self.I_k_blocks = I_k_blocks
+        self.K_out_n_tiles = K_out_n_tiles
+        self.fc2_chunk_n_tiles = fc2_chunk_n_tiles
+
+        # Static input/output buffers.
+        self.x_buf = torch.zeros(M_total, K_in, dtype=torch.uint8, device=device)
+        self.xsf_buf = torch.zeros(M_total, K_in_blocks, dtype=torch.uint8, device=device)
+        self.w13_buf = torch.zeros(FC1_N, K_in // 2, dtype=torch.uint8, device=device)
+        self.w13sf_buf = torch.zeros(FC1_N, K_in_blocks, dtype=torch.uint8, device=device)
+        self.w2_buf = torch.zeros(K_out, I // 2, dtype=torch.uint8, device=device)
+        self.w2sf_buf = torch.zeros(K_out, I_k_blocks, dtype=torch.uint8, device=device)
+        self.int_buf = torch.empty(M_total, I, dtype=torch.uint8, device=device)
+        self.intsf_buf = torch.empty(M_total, I_k_blocks, dtype=torch.uint8, device=device)
+        self.Y_buf = torch.empty(M_tiles, 16, K_out, dtype=torch.bfloat16, device=device)
+
+        # Cute tensor handles (created once).
+        self._cx = _to_cute(self.x_buf, cutlass.Uint8)
+        self._cxsf = _to_cute(self.xsf_buf, cutlass.Uint8)
+        self._cw13 = _to_cute(self.w13_buf, cutlass.Uint8)
+        self._cw13sf = _to_cute(self.w13sf_buf, cutlass.Uint8)
+        self._cw2 = _to_cute(self.w2_buf, cutlass.Uint8)
+        self._cw2sf = _to_cute(self.w2sf_buf, cutlass.Uint8)
+        self._cint = _to_cute(self.int_buf, cutlass.Uint8)
+        self._cintsf = _to_cute(self.intsf_buf, cutlass.Uint8)
+        self._cY = _to_cute(self.Y_buf, cutlass.BFloat16)
+
+        self._compiled_fc1 = _compiled_fc1(M_tiles, K_in_blocks, I_k_blocks)
+        self._compiled_fc2 = _compiled_fc2(M_tiles, I_k_blocks, K_out_n_tiles, fc2_chunk_n_tiles)
+
+    def bind_weights(
+        self,
+        w13_packed: torch.Tensor,
+        w13_sf: torch.Tensor,
+        w2_packed: torch.Tensor,
+        w2_sf: torch.Tensor,
+    ) -> None:
+        """Copy fixed weights into the runner's static buffers. Call once per
+        expert (or any time the weight tensors change)."""
+        self.w13_buf.copy_(w13_packed)
+        self.w13sf_buf.copy_(w13_sf)
+        self.w2_buf.copy_(w2_packed)
+        self.w2sf_buf.copy_(w2_sf)
+
+    def __call__(self, x_e4m3: torch.Tensor, x_sf: torch.Tensor) -> torch.Tensor:
+        """Run FC1+SwiGLU+Quant then FC2. Activations are copied into the
+        runner's static buffers before launch."""
+        if x_e4m3.shape[0] != self.M:
+            raise ValueError(
+                f"runner was built for M={self.M}; got x with M={x_e4m3.shape[0]}"
+            )
+        if self.pad:
+            self.x_buf[:self.M].copy_(x_e4m3)
+            self.x_buf[self.M:].zero_()
+            self.xsf_buf[:self.M].copy_(x_sf)
+            self.xsf_buf[self.M:].zero_()
+        else:
+            self.x_buf.copy_(x_e4m3)
+            self.xsf_buf.copy_(x_sf)
+        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        self._compiled_fc1(
+            self._cx, self._cxsf, self._cw13, self._cw13sf,
+            self._cint, self._cintsf, stream,
+        )
+        self._compiled_fc2(
+            self._cint, self._cintsf, self._cw2, self._cw2sf,
+            self._cY, stream,
+        )
+        torch.cuda.synchronize()
+        out_flat = self.Y_buf.reshape(self.M_total, self.K_out)
+        if self.pad:
+            out_flat = out_flat[:self.M].clone()
+        return out_flat
