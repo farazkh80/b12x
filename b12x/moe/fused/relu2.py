@@ -82,6 +82,7 @@ class MoEDynamicKernelRelu2(MoEDynamicKernelBackend):
         *,
         fast_math: bool = False,
         dynamic_down_scale: bool = False,
+        share_input_across_experts: bool = False,
     ):
         super().__init__(
             sf_vec_size,
@@ -89,6 +90,7 @@ class MoEDynamicKernelRelu2(MoEDynamicKernelBackend):
             fast_math=fast_math,
             activation="relu2",
             dynamic_down_scale=dynamic_down_scale,
+            share_input_across_experts=share_input_across_experts,
         )
 
 

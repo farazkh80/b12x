@@ -2559,8 +2559,10 @@ def _get_dynamic_kernel(
     mac_override: int | None = None,
     activation: str = "silu",
     quant_mode: str = "nvfp4",
+    share_input_across_experts: bool = False,
 ):
     quant_mode = _normalize_quant_mode(quant_mode)
+    share_input_across_experts = bool(share_input_across_experts and quant_mode == "nvfp4")
     activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
     sf_vec_size = 16
     mac = mac_override if mac_override is not None else _get_impl_mac("dynamic")
@@ -2573,7 +2575,7 @@ def _get_dynamic_kernel(
     global _LAST_KERNEL
     cache_key = (
         quant_mode, "dynamic", E, k, n, num_topk, mac, mma_tiler_mn, topk_ids_dtype,
-        fast_math, activation, dynamic_down_scale,
+        fast_math, activation, dynamic_down_scale, share_input_across_experts,
     )
     last_kkey, last_kval = _LAST_KERNEL
     if last_kkey == cache_key:
@@ -2600,6 +2602,8 @@ def _get_dynamic_kernel(
         fast_math=fast_math,
         dynamic_down_scale=dynamic_down_scale,
     )
+    if quant_mode == "nvfp4":
+        kernel_kwargs["share_input_across_experts"] = share_input_across_experts
     kernel = activation_spec.make_dynamic_kernel(**kernel_kwargs)
     launch = _DynamicMoELaunch(kernel, k=k, num_topk=num_topk)
 
@@ -2933,6 +2937,7 @@ def _launch_dynamic(
     stream,
     activation: str = "silu",
     quant_mode: str = "nvfp4",
+    share_input_across_experts: bool = False,
 ) -> None:
     quant_mode = _normalize_quant_mode(quant_mode)
     effective_mac = _get_impl_mac("dynamic", routed_rows=routed_rows)
@@ -2945,6 +2950,7 @@ def _launch_dynamic(
         mac_override=effective_mac,
         activation=activation,
         quant_mode=quant_mode,
+        share_input_across_experts=share_input_across_experts,
     )
     _prepare_workspace_for_launch(workspace)
     _gptr = lambda dtype, t, align=16: make_ptr(dtype, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=align)
@@ -3366,6 +3372,7 @@ def b12x_moe_fp4(
             stream=stream,
             activation=activation,
             quant_mode=quant_mode,
+            share_input_across_experts=(quant_mode == "nvfp4" and a1_gscale.numel() == 1),
         )
     else:
         _launch_compact_static(
