@@ -27,7 +27,9 @@ from .mla import (
     B12XAttentionWorkspaceContract,
     clear_mla_caches,
     sparse_mla_decode_forward,
+    sparse_mla_decode_forward_with_lse,
     sparse_mla_extend_forward,
+    sparse_mla_extend_forward_with_lse,
 )
 from .nsa_indexer import (
     NSAIndexerExtendLogitsMetadata,
@@ -76,7 +78,9 @@ __all__ = [
     "MLASparseExtendMetadata",
     "clear_mla_caches",
     "sparse_mla_decode_forward",
+    "sparse_mla_decode_forward_with_lse",
     "sparse_mla_extend_forward",
+    "sparse_mla_extend_forward_with_lse",
     "NSAIndexerExtendLogitsMetadata",
     "NSAIndexerPagedDecodeMetadata",
     "clear_nsa_indexer_caches",

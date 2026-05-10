@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import ctypes
+from types import SimpleNamespace
 import warnings
 
 import b12x
+import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass.base_dsl.dsl import BaseDSL
+from cutlass.base_dsl.jit_executor import JitExecutor
+from cutlass.cute.nvgpu.warp import mma
 
 import b12x.cute.runtime_patches as runtime_patches
 from b12x.cute.runtime_patches import _build_compile_disk_cache_key, _structural_cache_key
@@ -27,6 +32,28 @@ def test_other_cutlass_warnings_still_emit() -> None:
 
     assert len(captured) == 1
     assert str(captured[0].message) == "some other warning"
+
+
+def test_cutlass_45_provides_sm121a_blockscaled_mma() -> None:
+    archs = {str(arch) for arch in mma.MmaSM120BlockScaledOp.admissible_archs}
+
+    assert "sm_121a" in archs
+    assert not hasattr(mma.MmaSM120BlockScaledOp, "_b12x_sm121a_patch")
+
+
+def test_cutlass_executor_accepts_cuda_stream_handles() -> None:
+    executor = JitExecutor.__new__(JitExecutor)
+    executor._num_extra_args = 0
+    executor._tls = SimpleNamespace()
+    executor._has_cuda_result = False
+    executor._kernel_ptrs = None
+
+    stream = cuda.CUstream(123)
+    packed = executor._get_invoke_packed_args([stream])
+
+    assert packed[0] == stream.getPtr()
+    stream_handle = ctypes.cast(packed[0], ctypes.POINTER(ctypes.c_void_p)).contents
+    assert stream_handle.value == 123
 
 
 def test_b12x_pointer_cache_key_is_structural() -> None:
@@ -89,7 +116,7 @@ def test_compile_disk_cache_key_changes_with_toolchain_key(monkeypatch) -> None:
     monkeypatch.setattr(
         runtime_patches,
         "_runtime_toolchain_key",
-        lambda: (("cutlass_dsl", "4.4.1"),),
+        lambda: (("cutlass_dsl", "4.5.0"),),
     )
     key_a = _build_compile_disk_cache_key(
         compile_callable,
@@ -101,7 +128,7 @@ def test_compile_disk_cache_key_changes_with_toolchain_key(monkeypatch) -> None:
     monkeypatch.setattr(
         runtime_patches,
         "_runtime_toolchain_key",
-        lambda: (("cutlass_dsl", "4.4.2"),),
+        lambda: (("cutlass_dsl", "4.5.1"),),
     )
     key_b = _build_compile_disk_cache_key(
         compile_callable,

@@ -608,10 +608,13 @@ def test_eager_dynamic_chunk_limit_uses_exact_routing_tiles() -> None:
 
 def test_dynamic_task_geometry_caps_active_experts_by_routed_rows() -> None:
     max_phys_tiles, gate_tile_cnt, max_tasks = tp_moe._dynamic_task_geometry(512, 1024, 10)
+    slice_groups = (
+        gate_tile_cnt + tp_moe._DYNAMIC_SLICE_CHUNK - 1
+    ) // tp_moe._DYNAMIC_SLICE_CHUNK
 
     assert max_phys_tiles == 10
     assert gate_tile_cnt == 8
-    assert max_tasks == 40
+    assert max_tasks == max_phys_tiles * slice_groups
 
 
 def test_dynamic_workspace_uses_compact_storage() -> None:

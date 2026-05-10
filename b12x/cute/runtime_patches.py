@@ -5,6 +5,7 @@ import importlib.metadata
 import inspect
 import os
 import sys
+import ctypes
 from functools import lru_cache
 from functools import wraps
 from pathlib import Path
@@ -113,6 +114,15 @@ def _runtime_toolchain_key() -> tuple[object, ...]:
         ("torch", torch_version),
         ("torch_cuda", torch_cuda_version),
         ("cutlass_dsl", cutlass_version),
+        (
+            "cutlass_dsl_libs_base",
+            _distribution_version("nvidia-cutlass-dsl-libs-base"),
+        ),
+        (
+            "cutlass_dsl_libs_cu13",
+            _distribution_version("nvidia-cutlass-dsl-libs-cu13"),
+        ),
+        ("cuda_python", _distribution_version("cuda-python")),
         ("cuda_bindings", _distribution_version("cuda-bindings")),
     )
 
@@ -428,6 +438,24 @@ def _cache_object_path(cache_key: str) -> Path:
     return _cute_compile_cache_dir() / cache_key[:2] / f"{cache_key}.o"
 
 
+def _is_cuda_bindings_stream(arg: Any) -> bool:
+    arg_type = type(arg)
+    return (
+        arg_type.__name__ == "CUstream"
+        and arg_type.__module__.startswith("cuda.bindings")
+    )
+
+
+def _normalize_cutlass_executor_arg(arg: Any, keepalive: list[Any] | None = None) -> Any:
+    if _is_cuda_bindings_stream(arg):
+        stream_ptr = ctypes.c_void_p(int(arg.getPtr()))
+        if keepalive is not None:
+            keepalive.append(arg)
+            keepalive.append(stream_ptr)
+        return stream_ptr
+    return arg
+
+
 def _load_cute_compile_from_disk(cache_key: str):
     from cutlass.base_dsl.export.external_binary_module import ExternalBinaryModule
 
@@ -454,81 +482,6 @@ def _store_cute_compile_to_disk(cache_key: str, compiled: Any) -> None:
     os.replace(tmp_path, object_path)
 
 
-def _patch_cutlass_sm120_blockscaled_arch_check() -> None:
-    try:
-        from cutlass.cute.nvgpu.warp import mma as mma_mod
-    except Exception:
-        return
-
-    blockscaled_op = getattr(mma_mod, "MmaSM120BlockScaledOp", None)
-    if blockscaled_op is None:
-        return
-    if getattr(blockscaled_op, "_b12x_sm121a_patch", False):
-        return
-
-    original_post_init = blockscaled_op.__post_init__
-    Arch = mma_mod.Arch
-    dsl_base = getattr(mma_mod, "CuTeDSL", None)
-    if dsl_base is None:
-        dsl_base = getattr(mma_mod, "BaseDSL", None)
-    if dsl_base is None:
-        return
-    OpError = mma_mod.OpError
-    Float4E2M1FN = mma_mod.Float4E2M1FN
-    Float32 = mma_mod.Float32
-    Float8E4M3FN = mma_mod.Float8E4M3FN
-    Float8E8M0FNU = mma_mod.Float8E8M0FNU
-
-    @wraps(original_post_init)
-    def patched_post_init(self) -> None:
-        arch = dsl_base._get_dsl().get_arch_enum()
-        allowed_archs = {Arch.sm_120a}
-        sm_121a = getattr(Arch, "sm_121a", None)
-        if sm_121a is not None:
-            allowed_archs.add(sm_121a)
-        if arch not in allowed_archs:
-            raise OpError(
-                self,
-                f"expects arch to be one of {self.admissible_archs}, but got {arch}",
-                suggestion="Ensure env CUTE_DSL_ARCH matches your GPU architecture",
-            )
-        if self.ab_dtype != Float4E2M1FN:
-            raise OpError(
-                self,
-                "expects the 'ab_dtype' Op parameter to be Float4E2M1FN",
-            )
-        if self.acc_dtype != Float32:
-            raise OpError(
-                self,
-                "expects the 'acc_dtype' Op parameter to be Float32",
-            )
-        if self.shape_mnk != (16, 8, 64):
-            raise OpError(
-                self,
-                "expects the 'shape_mnk' Op parameter to be (16,8,64)",
-            )
-        if self.sf_vec_size == 16:
-            if self.sf_type != Float8E4M3FN:
-                raise OpError(
-                    self,
-                    "expects the 'sf_type' Op parameter to be Float8E4M3FN",
-                )
-        elif self.sf_vec_size == 32:
-            if self.sf_type != Float8E8M0FNU:
-                raise OpError(
-                    self,
-                    "expects the 'sf_type' Op parameter to be Float8E8M0FNU",
-                )
-        else:
-            raise OpError(
-                self,
-                "expects the 'sf_vec_size' Op parameter to be 16 or 32",
-            )
-
-    blockscaled_op.__post_init__ = patched_post_init
-    blockscaled_op._b12x_sm121a_patch = True
-
-
 def apply_cutlass_runtime_patches() -> None:
     global _PATCHED
     if _PATCHED:
@@ -537,12 +490,14 @@ def apply_cutlass_runtime_patches() -> None:
     try:
         from cutlass.base_dsl.compiler import CompileCallable
         from cutlass.base_dsl.dsl import BaseDSL
+        from cutlass.base_dsl.jit_executor import JitExecutor
     except Exception:
         return
 
     original_print_warning = BaseDSL.print_warning
     original_print_warning_once = BaseDSL.print_warning_once
     original_compile = CompileCallable._compile
+    original_get_invoke_packed_args = JitExecutor._get_invoke_packed_args
 
     @wraps(original_print_warning)
     def patched_print_warning(self, message):
@@ -573,8 +528,17 @@ def apply_cutlass_runtime_patches() -> None:
             pass
         return compiled
 
+    @wraps(original_get_invoke_packed_args)
+    def patched_get_invoke_packed_args(self, exe_args):
+        keepalive = []
+        normalized_args = [
+            _normalize_cutlass_executor_arg(arg, keepalive) for arg in exe_args
+        ]
+        self._tls.b12x_cuda_stream_arg_keepalive = keepalive
+        return original_get_invoke_packed_args(self, normalized_args)
+
     BaseDSL.print_warning = patched_print_warning
     BaseDSL.print_warning_once = patched_print_warning_once
     CompileCallable._compile = patched_compile
-    _patch_cutlass_sm120_blockscaled_arch_check()
+    JitExecutor._get_invoke_packed_args = patched_get_invoke_packed_args
     _PATCHED = True

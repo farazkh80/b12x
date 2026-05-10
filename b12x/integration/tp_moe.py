@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Dict, Tuple
 
+import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
@@ -430,6 +431,7 @@ _MICRO_DIRECT_LAUNCH_CAP_CACHE: Dict[Tuple[int, int], bool] = {}
 _EXACT_RELU2_BS1_NEMOTRON_CACHE: Dict[Tuple, _ExactRelu2Bs1NemotronLauncher] = {}
 _LAST_EXACT_RELU2_BS1_NEMOTRON: Tuple = (None, None)  # (cache_key, launcher)
 _CURRENT_DISPATCH_STAGE: str | None = None
+_DIRECT_MICRO_SHAPE_ATTR = "_b12x_direct_micro_shape"
 
 
 @contextmanager
@@ -2415,6 +2417,14 @@ def _get_micro_kernel(
         current_cuda_stream(),        # stream
         **compile_kwargs,
     )
+    try:
+        setattr(
+            compiled,
+            _DIRECT_MICRO_SHAPE_ATTR,
+            (quant_mode, int(m), int(k), int(n), int(num_topk), int(weight_E)),
+        )
+    except Exception:
+        pass
 
     result = (compiled, kernel.grid_x)
     if reuse_compiled:
@@ -2423,12 +2433,26 @@ def _get_micro_kernel(
     return result
 
 
+def _direct_micro_shape_accepts_block_dim(compiled, block_dim: int) -> bool:
+    shape = getattr(compiled, _DIRECT_MICRO_SHAPE_ATTR, None)
+    if shape is None:
+        return True
+    quant_mode, m, _k, n, _num_topk, _weight_E = shape
+    if quant_mode == "w4a16" and int(m) >= 4 and int(n) >= 4096:
+        return False
+    return True
+
+
 def _compiled_direct_micro_accepts_block_dim(compiled, block_dim: int) -> bool:
     """Return whether the compiled direct micro kernel can launch `block_dim` threads."""
-    cache_key = (id(compiled), int(block_dim))
+    cache_key = (id(compiled), int(block_dim), getattr(compiled, _DIRECT_MICRO_SHAPE_ATTR, None))
     cached = _MICRO_DIRECT_LAUNCH_CAP_CACHE.get(cache_key)
     if cached is not None:
         return cached
+
+    if not _direct_micro_shape_accepts_block_dim(compiled, block_dim):
+        _MICRO_DIRECT_LAUNCH_CAP_CACHE[cache_key] = False
+        return False
 
     accepted = False
     try:
@@ -2945,7 +2969,7 @@ def _launch_exact_relu2_bs1_nemotron(
         resolved.row_counts, resolved.active_expert_count, resolved.weight_expert_ids, resolved.global_to_local_expert,
         launcher.input_gs, launcher.weights.w1_alpha, launcher.weights.w2_alpha, launcher.down_input_scale,
         scatter_output, resolved.token_map, resolved.token_weights,
-        launcher.mac, current_cuda_stream(),
+        current_cuda_stream(),
     )
     return scatter_output
 
@@ -3019,7 +3043,7 @@ def _launch_dynamic(
         workspace.physical_tiles_capacity * _dynamic_tile_m(quant_mode),
         workspace.task_capacity,
         workspace.physical_tiles_capacity,
-        mac, stream,
+        stream,
     )
 
 
@@ -3124,7 +3148,7 @@ def _launch_compact_static(
             workspace.row_counts, workspace.active_expert_count, workspace.weight_expert_ids, workspace.global_to_local_expert,
             input_gs, weights.w1_alpha, weights.w2_alpha, down_input_scale,
             scatter_output, workspace.token_map, workspace.token_weights,
-            mac, stream,
+            stream,
         )
         return
 
@@ -3165,7 +3189,7 @@ def _launch_compact_static(
         workspace.row_counts, workspace.active_expert_count, workspace.weight_expert_ids, workspace.global_to_local_expert,
         input_gs, weights.w1_alpha, weights.w2_alpha, down_input_scale,
         scatter_output, workspace.token_map, workspace.token_weights,
-        mac, stream,
+        stream,
     )
 
 

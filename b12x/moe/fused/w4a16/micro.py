@@ -38,6 +38,11 @@ class MoEMicroKernelBackend(_DirectMoEMicroKernelBackend):
             return False
         if n <= 0 or n % 16 != 0:
             return False
+        if m >= 4 and n >= 4096:
+            # CUTLASS 4.5 can report this family as launchable by thread-count
+            # metadata, but the direct W4A16 kernel is outside its safe
+            # resource envelope for multi-token, very-wide FC1 shapes.
+            return False
         rows_per_warp = max(1, m)
         fc1_chunks = max(1, n // (16 * rows_per_warp))
         if n % fc1_chunks != 0:
