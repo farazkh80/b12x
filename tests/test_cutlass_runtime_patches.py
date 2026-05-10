@@ -1,26 +1,31 @@
 from __future__ import annotations
 
 import ctypes
-from types import SimpleNamespace
+import inspect
 import warnings
 
-import b12x
+import b12x  # noqa: F401 - importing b12x applies the runtime patches under test.
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass.base_dsl.dsl import BaseDSL
-from cutlass.base_dsl.jit_executor import JitExecutor
+from cutlass.base_dsl.jit_executor import ExecutionArgs
 from cutlass.cute.nvgpu.warp import mma
 
 import b12x.cute.runtime_patches as runtime_patches
-from b12x.cute.runtime_patches import _build_compile_disk_cache_key, _structural_cache_key
+from b12x.cute.runtime_patches import (
+    _build_compile_disk_cache_key,
+    _structural_cache_key,
+)
 from b12x.cute.utils import make_ptr
 
 
 def test_compile_only_cache_warning_is_suppressed() -> None:
     with warnings.catch_warnings(record=True) as captured:
         warnings.simplefilter("always")
-        BaseDSL.print_warning(object(), "Cache is disabled as user wants to compile only.")
+        BaseDSL.print_warning(
+            object(), "Cache is disabled as user wants to compile only."
+        )
 
     assert captured == []
 
@@ -41,18 +46,17 @@ def test_cutlass_45_provides_sm121a_blockscaled_mma() -> None:
     assert not hasattr(mma.MmaSM120BlockScaledOp, "_b12x_sm121a_patch")
 
 
-def test_cutlass_executor_accepts_cuda_stream_handles() -> None:
-    executor = JitExecutor.__new__(JitExecutor)
-    executor._num_extra_args = 0
-    executor._tls = SimpleNamespace()
-    executor._has_cuda_result = False
-    executor._kernel_ptrs = None
+def test_cutlass_45_adapts_cuda_stream_handles() -> None:
+    def kernel(stream: cuda.CUstream) -> None:
+        pass
 
     stream = cuda.CUstream(123)
-    packed = executor._get_invoke_packed_args([stream])
+    execution_args = ExecutionArgs(inspect.signature(kernel), kernel.__name__)
+    exe_args, adapted_args = execution_args.generate_execution_args((stream,), {})
 
-    assert packed[0] == stream.getPtr()
-    stream_handle = ctypes.cast(packed[0], ctypes.POINTER(ctypes.c_void_p)).contents
+    assert len(adapted_args) == 1
+    assert exe_args == [stream.getPtr()]
+    stream_handle = ctypes.cast(exe_args[0], ctypes.POINTER(ctypes.c_void_p)).contents
     assert stream_handle.value == 123
 
 
@@ -164,7 +168,12 @@ def test_structural_cache_key_handles_symbolic_fake_compact_tensor_dims() -> Non
     key = _structural_cache_key(fake)
 
     assert key[0] == "fake_compact_tensor"
-    assert key[2][0] == ("symbolic_dim", FakeSymInt.__module__, FakeSymInt.__qualname__, "s0")
+    assert key[2][0] == (
+        "symbolic_dim",
+        FakeSymInt.__module__,
+        FakeSymInt.__qualname__,
+        "s0",
+    )
 
 
 def test_structural_cache_key_distinguishes_unnamed_cutlass_symbolic_dims() -> None:

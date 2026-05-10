@@ -233,6 +233,188 @@ def test_paged_workspace_exposes_primary_backend_metadata() -> None:
     assert plan.page_table_shape == tuple(page_table.shape)
 
 
+def test_decode_cuda_graph_matches_reference_for_minimax_m2_head128_shape() -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_paged_inputs(
+        q_seqlens=[1] * 16,
+        cache_seqlens=[128] * 16,
+        page_size=64,
+        q_heads=24,
+        kv_heads=4,
+        head_dim=128,
+        seed=127,
+        page_table_width=2,
+        num_pages=48,
+    )
+    workspace = _make_workspace(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        cu_seqlens_q=cu_seqlens_q,
+        use_cuda_graph=True,
+    )
+    workspace.prepare_decode_graph_replay_state(
+        batch=16,
+        total_q_capacity=16,
+        max_page_table_width=int(page_table.shape[1]),
+        max_cache_page_count=int(page_table.shape[1]),
+    )
+
+    bound_page_table = page_table.clone()
+    bound_cache_seqlens = cache_seqlens.clone()
+    bound_cu_seqlens_q = cu_seqlens_q.clone()
+    workspace.bind_cuda_graph_runtime_metadata(
+        page_table=bound_page_table,
+        cache_seqlens=bound_cache_seqlens,
+        cu_seqlens_q=bound_cu_seqlens_q,
+    )
+    workspace.prepare(page_table, cache_seqlens, cu_seqlens_q)
+
+    output = torch.empty_like(q)
+    workspace.run(q, k_cache, v_cache, output=output)
+    torch.cuda.synchronize()
+
+    ref_out, ref_lse = paged_attention_reference(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        causal=True,
+    )
+
+    output.zero_()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        workspace.run(
+            q,
+            k_cache,
+            v_cache,
+            output=output,
+            prepare_decode_graph_metadata=True,
+        )
+
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert torch.allclose(
+        output.to(torch.float32),
+        ref_out.to(torch.float32),
+        atol=2e-2,
+        rtol=2e-2,
+    )
+    assert torch.allclose(
+        _lse_base2_to_natural(workspace.current_lse_view()),
+        ref_lse,
+        atol=3e-2,
+        rtol=3e-2,
+    )
+
+
+def test_decode_cuda_graph_matches_reference_for_minimax_m2_head128_shape_fp8_kv() -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_paged_inputs(
+        q_seqlens=[1] * 4,
+        cache_seqlens=[128] * 4,
+        page_size=64,
+        q_heads=24,
+        kv_heads=4,
+        head_dim=128,
+        seed=131,
+        page_table_width=2,
+        num_pages=16,
+    )
+    k_fp8, v_fp8, k_descale, v_descale = _quantize_paged_kv_cache_e4m3(
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+    )
+    workspace = _make_workspace(
+        q=q,
+        k_cache=k_fp8,
+        v_cache=v_fp8,
+        cu_seqlens_q=cu_seqlens_q,
+        use_cuda_graph=True,
+    )
+    workspace.prepare_decode_graph_replay_state(
+        batch=4,
+        total_q_capacity=4,
+        max_page_table_width=int(page_table.shape[1]),
+        max_cache_page_count=int(page_table.shape[1]),
+    )
+
+    bound_page_table = page_table.clone()
+    bound_cache_seqlens = cache_seqlens.clone()
+    bound_cu_seqlens_q = cu_seqlens_q.clone()
+    workspace.bind_cuda_graph_runtime_metadata(
+        page_table=bound_page_table,
+        cache_seqlens=bound_cache_seqlens,
+        cu_seqlens_q=bound_cu_seqlens_q,
+    )
+    workspace.prepare(page_table, cache_seqlens, cu_seqlens_q)
+
+    output = torch.empty_like(q)
+    workspace.run(
+        q,
+        k_fp8,
+        v_fp8,
+        output=output,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+    torch.cuda.synchronize()
+
+    ref_out, ref_lse = paged_attention_reference(
+        q,
+        k_fp8,
+        v_fp8,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        causal=True,
+    )
+
+    output.zero_()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        workspace.run(
+            q,
+            k_fp8,
+            v_fp8,
+            output=output,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            prepare_decode_graph_metadata=True,
+        )
+
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert torch.allclose(
+        output.to(torch.float32),
+        ref_out.to(torch.float32),
+        atol=8e-2,
+        rtol=8e-2,
+    )
+    assert torch.allclose(
+        _lse_base2_to_natural(workspace.current_lse_view()),
+        ref_lse,
+        atol=8e-2,
+        rtol=8e-2,
+    )
+    assert _cosine_similarity(output, ref_out) >= 0.999
+
+
 @pytest.mark.parametrize(
     ("turbo_value", "batch", "cache_len", "expect_native_fp8_qk"),
     [
@@ -1160,6 +1342,76 @@ def test_prepare_for_capacity_primes_extend_graph_bucket() -> None:
     assert int(workspace.cache_seqlens[0].item()) == 4096
 
 
+def test_prepare_for_capacity_uses_host_total_without_tensor_item(monkeypatch) -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    q, k_cache, v_cache, _page_table, _cache_seqlens, _cu_seqlens_q = _make_paged_inputs(
+        q_seqlens=[4, 4, 4, 4],
+        cache_seqlens=[2048, 2048, 2048, 2048],
+        page_size=64,
+        seed=98,
+        page_table_width=64,
+        num_pages=512,
+    )
+    workspace = _make_workspace(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        cu_seqlens_q=torch.tensor([0, 4, 8, 12, 16], dtype=torch.int32, device=q.device),
+        use_cuda_graph=True,
+    )
+
+    def fail_item(self):
+        raise AssertionError("prepare_for_capacity should use the host total-q")
+
+    monkeypatch.setattr(torch.Tensor, "item", fail_item)
+
+    workspace.prepare_for_capacity(
+        batch=4,
+        total_q_capacity=16,
+        max_page_table_width=64,
+        max_cache_seqlen=4096,
+    )
+
+    assert workspace.plan.total_q == 16
+
+
+def test_prepare_uses_host_total_without_tensor_item(monkeypatch) -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_paged_inputs(
+        q_seqlens=[4, 4, 4, 4],
+        cache_seqlens=[2048, 2048, 2048, 2048],
+        page_size=64,
+        seed=99,
+        page_table_width=64,
+        num_pages=512,
+    )
+    workspace = _make_workspace(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        cu_seqlens_q=cu_seqlens_q,
+        use_cuda_graph=False,
+    )
+
+    def fail_item(self):
+        raise AssertionError("prepare should use the host total-q")
+
+    monkeypatch.setattr(torch.Tensor, "item", fail_item)
+
+    workspace.prepare(
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        active_total_q=q.shape[0],
+    )
+
+    assert workspace.plan.total_q == q.shape[0]
+
+
 def test_prepare_decode_graph_replay_state_is_batch_specific() -> None:
     require_sm120()
     clear_attention_caches()
@@ -1240,7 +1492,7 @@ def test_prepare_decode_graph_replay_state_is_batch_specific() -> None:
     assert int(workspace_bs8.kv_chunk_size_ptr[0].item()) == 384
 
 
-def test_prepare_decode_graph_replay_state_falls_back_when_no_tuned_policy_exists() -> None:
+def test_prepare_decode_graph_replay_state_uses_shape_heuristic_without_tuned_policy() -> None:
     require_sm120()
     clear_attention_caches()
 
@@ -1266,7 +1518,9 @@ def test_prepare_decode_graph_replay_state_falls_back_when_no_tuned_policy_exist
         max_cache_page_count=64,
     )
 
-    assert workspace._decode_graph_chunk_pages_lut is None
+    assert workspace._decode_graph_chunk_pages_lut is not None
+    assert workspace._decode_graph_chunk_pages_lut.shape[0] == 65
+    assert int(workspace._decode_graph_chunk_pages_lut[-1].item()) == 2
     assert workspace.plan.mode == "decode"
     assert workspace.plan.enable_cuda_graph is True
 

@@ -38,7 +38,7 @@ def test_decode_replay_cases_reject_zero_contexts() -> None:
         )
 
 
-def test_decode_graph_bucket_policy_defaults_to_registered_qwen35_capture_contract() -> None:
+def test_decode_graph_bucket_policy_defaults_to_heuristic_qwen35_capture_contract() -> None:
     policy = _resolve_decode_graph_bucket_policy(
         batch=1,
         q_dtype=torch.bfloat16,
@@ -50,10 +50,10 @@ def test_decode_graph_bucket_policy_defaults_to_registered_qwen35_capture_contra
         graph_ctas_per_sm_override=0,
     )
 
-    assert policy.source == "tuning"
+    assert policy.source == "heuristic"
     assert policy.capture_context_tokens == 262_143
     assert policy.capture_page_count == 4_096
-    assert policy.capture_fixed_split_pages == 4
+    assert policy.capture_fixed_split_pages == 22
     assert policy.replay_fixed_split_pages is None
     assert policy.graph_ctas_per_sm == 6
 

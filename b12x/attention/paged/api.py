@@ -355,12 +355,16 @@ def _build_extend_forward_kernel(
 def _build_merge_kernel(
     dtype: torch.dtype,
     head_dim: int,
+    total_q: int,
     persistent_ctas: int,
     direct_grid: bool,
     regular_decode_graph: bool,
+    pair_bf16_partial_loads: bool,
 ) -> PagedPersistentMergeKernel:
     cutlass_dtype = _torch_to_cutlass_dtype(dtype)
-    merge_bdy = 4
+    merge_bdy = 3 if dtype == torch.bfloat16 and head_dim == 128 and regular_decode_graph else 4
+    if dtype == torch.bfloat16 and head_dim == 128 and regular_decode_graph and int(total_q) == 4:
+        merge_bdy = 4
     return PagedPersistentMergeKernel(
         cutlass_dtype,
         cutlass_dtype,
@@ -370,6 +374,7 @@ def _build_merge_kernel(
         persistent_ctas=persistent_ctas,
         direct_grid=direct_grid,
         regular_decode_graph=regular_decode_graph,
+        pair_bf16_partial_loads=pair_bf16_partial_loads,
     )
 
 
@@ -715,12 +720,23 @@ def paged_attention_forward(
             and max(plan.qo_tile_indices, default=0) == 0
         )
         merge_direct_grid = merge_regular_decode_graph
+        pair_bf16_merge_partial_loads = (
+            plan.mode == "decode"
+            and 2 <= int(plan.total_q) <= 4
+            and output.dtype == torch.bfloat16
+            and workspace.tmp_output is not None
+            and workspace.tmp_output.dtype == torch.bfloat16
+            and plan.head_dim_vo == 128
+            and plan.gqa_group_size == 6
+        )
         merge_kernel = _build_merge_kernel(
             output.dtype,
             plan.head_dim_vo,
+            plan.total_q,
             persistent_ctas,
             merge_direct_grid,
             merge_regular_decode_graph,
+            pair_bf16_merge_partial_loads,
         )
         tmp_output_arg = _to_kernel_tensor(
             workspace.tmp_output, _torch_to_cutlass_dtype(workspace.tmp_output.dtype)
@@ -765,6 +781,7 @@ def paged_attention_forward(
             persistent_ctas,
             merge_direct_grid,
             merge_regular_decode_graph,
+            pair_bf16_merge_partial_loads,
         )
         _run_cached_host_launcher(
             merge_kernel,
@@ -782,6 +799,7 @@ def paged_attention_forward(
                 "persistent_ctas",
                 "direct_grid",
                 "regular_decode_graph",
+                "pair_bf16_partial_loads",
             ),
         )
 

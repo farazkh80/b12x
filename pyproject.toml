@@ -1,6 +1,6 @@
 [project]
 name = "b12x"
-version = "0.13.5"
+version = "0.13.6"
 description = "Unapologetically SM120-only CuTe DSL kernels for NVFP4 GEMM and MoE."
 readme = "README.md"
 requires-python = ">=3.10,<4.0"
@@ -38,7 +38,6 @@ include = ["b12x*", "serve*"]
 
 [tool.setuptools.package-data]
 "b12x.distributed" = ["*.cu"]
-"b12x.attention.paged.tuning" = ["*.decode.bs*.py"]
 
 [tool.ruff.lint]
 select = ["E", "F", "B", "SIM"]

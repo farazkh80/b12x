@@ -5,7 +5,7 @@ import importlib.metadata
 import inspect
 import os
 import sys
-import ctypes
+from contextlib import suppress
 from functools import lru_cache
 from functools import wraps
 from pathlib import Path
@@ -58,7 +58,9 @@ def _tree_state(root: Path) -> tuple[tuple[str, int, int], ...]:
 
 
 @lru_cache(maxsize=8)
-def _tree_fingerprint_cached(root_str: str, state: tuple[tuple[str, int, int], ...]) -> str:
+def _tree_fingerprint_cached(
+    root_str: str, state: tuple[tuple[str, int, int], ...]
+) -> str:
     root = Path(root_str)
     digest = hashlib.sha256()
     for rel_path, _mtime_ns, _size in state:
@@ -145,7 +147,9 @@ def _compile_environment_key() -> tuple[tuple[str, str], ...]:
 def _function_fingerprint(func: Any) -> tuple[str, str, str]:
     func = inspect.unwrap(func)
     module = getattr(func, "__module__", "")
-    qualname = getattr(func, "__qualname__", getattr(func, "__name__", type(func).__qualname__))
+    qualname = getattr(
+        func, "__qualname__", getattr(func, "__name__", type(func).__qualname__)
+    )
     if module == "b12x" or module.startswith("b12x."):
         return module, qualname, f"b12x:{_b12x_package_fingerprint()}"
     try:
@@ -179,7 +183,7 @@ def _normalize_compile_target(func: Any, visited: set[int]) -> Any:
         )
     if inspect.isfunction(func):
         return ("function", _function_fingerprint(func))
-    if hasattr(func, "__call__") and hasattr(func.__call__, "__func__"):
+    if callable(func) and hasattr(func.__call__, "__func__"):
         state = vars(func) if hasattr(func, "__dict__") else None
         return (
             "callable_instance",
@@ -262,7 +266,11 @@ def _tensor_like_cache_key(value: Any, visited: set[int]) -> Any | None:
     assumed_align = _first_present_attr(value, "_assumed_align")
     use_32bit_stride = _first_present_attr(value, "_use_32bit_stride")
     shape_key = tuple(_structural_dim_key(dim, visited) for dim in shape)
-    stride_key = None if stride is None else tuple(_structural_dim_key(dim, visited) for dim in stride)
+    stride_key = (
+        None
+        if stride is None
+        else tuple(_structural_dim_key(dim, visited) for dim in stride)
+    )
     stride_order_key = (
         None
         if stride_order is None
@@ -303,7 +311,8 @@ def _structural_cache_key(value: Any, visited: set[int] | None = None) -> Any:
             "namespace",
             tuple(
                 sorted(
-                    (k, _structural_cache_key(v, visited)) for k, v in vars(value).items()
+                    (k, _structural_cache_key(v, visited))
+                    for k, v in vars(value).items()
                 )
             ),
         )
@@ -343,8 +352,13 @@ def _structural_cache_key(value: Any, visited: set[int] | None = None) -> Any:
         )
     if type_module == "cutlass.cute.runtime" and type_name == "_FakeCompactTensor":
         dtype = getattr(value, "_dtype", None)
-        shape = tuple(_structural_dim_key(dim, visited) for dim in getattr(value, "_shape", ()))
-        stride_order = tuple(_structural_dim_key(dim, visited) for dim in getattr(value, "_stride_order", ()))
+        shape = tuple(
+            _structural_dim_key(dim, visited) for dim in getattr(value, "_shape", ())
+        )
+        stride_order = tuple(
+            _structural_dim_key(dim, visited)
+            for dim in getattr(value, "_stride_order", ())
+        )
         memspace = getattr(value, "_memspace", None)
         assumed_align = getattr(value, "_assumed_align", None)
         use_32bit_stride = getattr(value, "_use_32bit_stride", None)
@@ -438,24 +452,6 @@ def _cache_object_path(cache_key: str) -> Path:
     return _cute_compile_cache_dir() / cache_key[:2] / f"{cache_key}.o"
 
 
-def _is_cuda_bindings_stream(arg: Any) -> bool:
-    arg_type = type(arg)
-    return (
-        arg_type.__name__ == "CUstream"
-        and arg_type.__module__.startswith("cuda.bindings")
-    )
-
-
-def _normalize_cutlass_executor_arg(arg: Any, keepalive: list[Any] | None = None) -> Any:
-    if _is_cuda_bindings_stream(arg):
-        stream_ptr = ctypes.c_void_p(int(arg.getPtr()))
-        if keepalive is not None:
-            keepalive.append(arg)
-            keepalive.append(stream_ptr)
-        return stream_ptr
-    return arg
-
-
 def _load_cute_compile_from_disk(cache_key: str):
     from cutlass.base_dsl.export.external_binary_module import ExternalBinaryModule
 
@@ -490,14 +486,12 @@ def apply_cutlass_runtime_patches() -> None:
     try:
         from cutlass.base_dsl.compiler import CompileCallable
         from cutlass.base_dsl.dsl import BaseDSL
-        from cutlass.base_dsl.jit_executor import JitExecutor
     except Exception:
         return
 
     original_print_warning = BaseDSL.print_warning
     original_print_warning_once = BaseDSL.print_warning_once
     original_compile = CompileCallable._compile
-    original_get_invoke_packed_args = JitExecutor._get_invoke_packed_args
 
     @wraps(original_print_warning)
     def patched_print_warning(self, message):
@@ -522,23 +516,11 @@ def apply_cutlass_runtime_patches() -> None:
             return compiled
 
         compiled = original_compile(self, func, *args, **kwargs)
-        try:
+        with suppress(Exception):
             _store_cute_compile_to_disk(cache_key, compiled)
-        except Exception:
-            pass
         return compiled
-
-    @wraps(original_get_invoke_packed_args)
-    def patched_get_invoke_packed_args(self, exe_args):
-        keepalive = []
-        normalized_args = [
-            _normalize_cutlass_executor_arg(arg, keepalive) for arg in exe_args
-        ]
-        self._tls.b12x_cuda_stream_arg_keepalive = keepalive
-        return original_get_invoke_packed_args(self, normalized_args)
 
     BaseDSL.print_warning = patched_print_warning
     BaseDSL.print_warning_once = patched_print_warning_once
     CompileCallable._compile = patched_compile
-    JitExecutor._get_invoke_packed_args = patched_get_invoke_packed_args
     _PATCHED = True

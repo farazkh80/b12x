@@ -1757,8 +1757,8 @@ class MoEMicroKernelBackend:
             barrier_count, barrier_epoch, m_val,
         ).launch(
             grid=(grid_x, Int32(1), Int32(1)),
-            block=(Int32(_BLOCK_DIM), Int32(1), Int32(1)),
-            smem=Int32(0),
+            block=(_BLOCK_DIM, 1, 1),
+            smem=0,
             stream=stream,
         )
 
