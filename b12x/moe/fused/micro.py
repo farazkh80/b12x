@@ -60,6 +60,10 @@ def _align_up(value: int, align: int) -> int:
     return ((int(value) + int(align) - 1) // int(align)) * int(align)
 
 
+def _direct_k_segments_for_k(k: int) -> int:
+    return _align_up(k, 32 * _BLOCK_SIZE) // (32 * _BLOCK_SIZE)
+
+
 def _fc1_chunks_for_m(m: int, n: int) -> int:
     rows_per_warp = max(1, int(m))
     rows_per_chunk = max(_BLOCK_SIZE, _NUM_WARPS * rows_per_warp)
@@ -86,7 +90,9 @@ class _ShapeConfig:
     w1_sf_cols: int
     w2_sf_rows: int
     w2_sf_cols: int
+    k_blocks: int
     k_segments: int
+    k_segments_aligned: bool
     fc1_chunks: int
     fc1_chunks_per_block: int
     i_chunk: int
@@ -108,7 +114,9 @@ def _make_shape_config(
     w1_sf_cols = _align_up(k // _BLOCK_SIZE, 4)
     w2_sf_rows = _align_up(k, 128)
     w2_sf_cols = _align_up(n // _BLOCK_SIZE, 4)
-    k_segments = k // (32 * _BLOCK_SIZE)
+    k_blocks = k // _BLOCK_SIZE
+    k_segments = _direct_k_segments_for_k(k)
+    k_segments_aligned = k_blocks == k_segments * 32
     fc1_chunks = _fc1_chunks_for_m(m, n)
     fc1_chunks_per_block = 16  # chunks per 128-wide swizzle block
     i_chunk = n // fc1_chunks
@@ -130,7 +138,9 @@ def _make_shape_config(
         w1_sf_cols=w1_sf_cols,
         w2_sf_rows=w2_sf_rows,
         w2_sf_cols=w2_sf_cols,
+        k_blocks=k_blocks,
         k_segments=k_segments,
+        k_segments_aligned=k_segments_aligned,
         fc1_chunks=fc1_chunks,
         fc1_chunks_per_block=fc1_chunks_per_block,
         i_chunk=i_chunk,
@@ -163,7 +173,9 @@ def _remake_shape_config_fc1(cfg: _ShapeConfig, fc1_chunks: int) -> _ShapeConfig
         w1_sf_cols=cfg.w1_sf_cols,
         w2_sf_rows=cfg.w2_sf_rows,
         w2_sf_cols=cfg.w2_sf_cols,
+        k_blocks=cfg.k_blocks,
         k_segments=cfg.k_segments,
+        k_segments_aligned=cfg.k_segments_aligned,
         fc1_chunks=fc1_chunks,
         fc1_chunks_per_block=cfg.fc1_chunks_per_block,
         i_chunk=i_chunk,
@@ -442,9 +454,9 @@ class MoEMicroKernelBackend:
     ) -> bool:
         if m not in (1, 2, 4, 8):
             return False
-        if k <= 0 or k % (32 * _BLOCK_SIZE) != 0 or k % 128 != 0:
+        if k <= 0 or k % _BLOCK_SIZE != 0 or k % 128 != 0:
             return False
-        if k // _BLOCK_SIZE > 32 * _MAX_DIRECT_K_SEGMENTS:
+        if _direct_k_segments_for_k(k) > _MAX_DIRECT_K_SEGMENTS:
             return False
         if n <= 0 or n % _BLOCK_SIZE != 0:
             return False
@@ -454,7 +466,7 @@ class MoEMicroKernelBackend:
         i_chunk = n // fc1_chunks
         if i_chunk % _BLOCK_SIZE != 0:
             return False
-        k_segments = k // (32 * _BLOCK_SIZE)
+        k_segments = _direct_k_segments_for_k(k)
         return (
             _direct_k_segments_supported(k_segments)
             and 0 < num_topk <= 32
@@ -1165,7 +1177,7 @@ class MoEMicroKernelBackend:
                 gate_byte_addr = w1_base_addr + ebase_w + Int64(row_g) * Int64(cfg.k_half) + thread_byte_off
                 col_blk_off = Int64(lane) * Int64((cfg.k_segments // 4) * 512)
 
-                if cutlass.const_expr(cfg.k_segments == 8):
+                if cutlass.const_expr(cfg.k_segments_aligned and cfg.k_segments == 8):
                     if cutlass.const_expr(self.is_gated):
                         uw_a0, uw_a1, uw_a2, uw_a3 = ld_global_nc_v4_u32(up_byte_addr)
                         uw_b0, uw_b1, uw_b2, uw_b3 = ld_global_nc_v4_u32(up_byte_addr + Int64(16))
@@ -1227,7 +1239,7 @@ class MoEMicroKernelBackend:
                             sf_g6 * dot_g6 +
                             sf_g7 * dot_g7
                         )
-                elif cutlass.const_expr(cfg.k_segments == 6):
+                elif cutlass.const_expr(cfg.k_segments_aligned and cfg.k_segments == 6):
                     xh_off0 = Int32(0)
                     xh_off1 = Int32(8) + ((lane_seg_base + Int32(1)) // Int32(8) - lane_pad_base)
                     xh_off2 = Int32(16) + ((lane_seg_base + Int32(2)) // Int32(8) - lane_pad_base)
@@ -1325,7 +1337,7 @@ class MoEMicroKernelBackend:
                             sf_g4 * dot_g4 +
                             sf_g5 * dot_g5
                         )
-                elif cutlass.const_expr(cfg.k_segments == 12):
+                elif cutlass.const_expr(cfg.k_segments_aligned and cfg.k_segments == 12):
                     xh_off0 = Int32(0)
                     xh_off1 = Int32(8) + ((lane_seg_base + Int32(1)) // Int32(8) - lane_pad_base)
                     xh_off2 = Int32(16) + ((lane_seg_base + Int32(2)) // Int32(8) - lane_pad_base)
@@ -1424,7 +1436,7 @@ class MoEMicroKernelBackend:
                             sf_g10 * dot_g10 +
                             sf_g11 * dot_g11
                         )
-                elif cutlass.const_expr(cfg.k_segments == 2):
+                elif cutlass.const_expr(cfg.k_segments_aligned and cfg.k_segments == 2):
                     if cutlass.const_expr(self.is_gated):
                         uw_a0, uw_a1, uw_a2, uw_a3 = ld_global_nc_v4_u32(up_byte_addr)
                     gw_a0, gw_a1, gw_a2, gw_a3 = ld_global_nc_v4_u32(gate_byte_addr)
@@ -1460,30 +1472,61 @@ class MoEMicroKernelBackend:
                 else:
                     partial_up = Float32(0.0)
                     partial_gate = Float32(0.0)
-                    for seg in cutlass.range_constexpr(cfg.k_segments):
-                        seg_byte_off = Int64(seg * (_BLOCK_SIZE // 2))
-                        scale_col = lane * Int32(cfg.k_segments) + Int32(seg)
-                        sf_group_off = Int64(scale_col // Int32(4)) * Int64(512)
-                        sf_shift = Uint32((scale_col % Int32(4)) * Int32(8))
-                        xh_base = xh_buf_base + scale_col * Int32(_BLOCK_SIZE // 2) + scale_col // Int32(8)
+                    if cutlass.const_expr(cfg.k_segments_aligned):
+                        for seg in cutlass.range_constexpr(cfg.k_segments):
+                            seg_byte_off = Int64(seg * (_BLOCK_SIZE // 2))
+                            scale_col = lane * Int32(cfg.k_segments) + Int32(seg)
+                            sf_group_off = Int64(scale_col // Int32(4)) * Int64(512)
+                            sf_shift = Uint32((scale_col % Int32(4)) * Int32(8))
+                            xh_base = xh_buf_base + scale_col * Int32(_BLOCK_SIZE // 2) + scale_col // Int32(8)
 
-                        gw0 = ld_global_nc_u32(gate_byte_addr + seg_byte_off)
-                        gw1 = ld_global_nc_u32(gate_byte_addr + seg_byte_off + Int64(4))
-                        sf_word_g = ld_global_nc_u32(w1s_base_addr + ebase_sf + bsf_base_g + sf_group_off)
-                        sf_g = cvt_e4m3_to_f32_via_f16((sf_word_g >> sf_shift) & Uint32(0xFF))
+                            gw0 = ld_global_nc_u32(gate_byte_addr + seg_byte_off)
+                            gw1 = ld_global_nc_u32(gate_byte_addr + seg_byte_off + Int64(4))
+                            sf_word_g = ld_global_nc_u32(w1s_base_addr + ebase_sf + bsf_base_g + sf_group_off)
+                            sf_g = cvt_e4m3_to_f32_via_f16((sf_word_g >> sf_shift) & Uint32(0xFF))
 
+                            if cutlass.const_expr(self.is_gated):
+                                uw0 = ld_global_nc_u32(up_byte_addr + seg_byte_off)
+                                uw1 = ld_global_nc_u32(up_byte_addr + seg_byte_off + Int64(4))
+                                sf_word_u = ld_global_nc_u32(w1s_base_addr + ebase_sf + bsf_base_u + sf_group_off)
+                                sf_u = cvt_e4m3_to_f32_via_f16((sf_word_u >> sf_shift) & Uint32(0xFF))
+                                dot_u, dot_g = self._block_dot_hfma2_pair_for_math(uw0, uw1, gw0, gw1, smem_xh, xh_base)
+                                partial_up = partial_up + sf_u * dot_u
+                                partial_gate = partial_gate + sf_g * dot_g
+                            else:
+                                partial_gate = partial_gate + sf_g * self._block_dot_hfma2_for_math(
+                                    gw0, gw1, smem_xh, xh_base,
+                                )
+                    else:
+                        gate_row_addr = w1_base_addr + ebase_w + Int64(row_g) * Int64(cfg.k_half)
                         if cutlass.const_expr(self.is_gated):
-                            uw0 = ld_global_nc_u32(up_byte_addr + seg_byte_off)
-                            uw1 = ld_global_nc_u32(up_byte_addr + seg_byte_off + Int64(4))
-                            sf_word_u = ld_global_nc_u32(w1s_base_addr + ebase_sf + bsf_base_u + sf_group_off)
-                            sf_u = cvt_e4m3_to_f32_via_f16((sf_word_u >> sf_shift) & Uint32(0xFF))
-                            dot_u, dot_g = self._block_dot_hfma2_pair_for_math(uw0, uw1, gw0, gw1, smem_xh, xh_base)
-                            partial_up = partial_up + sf_u * dot_u
-                            partial_gate = partial_gate + sf_g * dot_g
-                        else:
-                            partial_gate = partial_gate + sf_g * self._block_dot_hfma2_for_math(
-                                gw0, gw1, smem_xh, xh_base,
-                            )
+                            up_row_addr = w1_base_addr + ebase_w + Int64(i) * Int64(cfg.k_half)
+                        for seg in cutlass.range_constexpr(cfg.k_segments):
+                            scale_col = lane * Int32(cfg.k_segments) + Int32(seg)
+                            valid_seg = Int32(1) if scale_col < Int32(cfg.k_blocks) else Int32(0)
+                            seg_byte_off = Int64(scale_col) * Int64(_BLOCK_SIZE // 2)
+                            sf_group_off = Int64(scale_col // Int32(4)) * Int64(512)
+                            sf_shift = Uint32((scale_col % Int32(4)) * Int32(8))
+                            xh_base = xh_buf_base + scale_col * Int32(_BLOCK_SIZE // 2) + scale_col // Int32(8)
+                            xh_base = xh_base if valid_seg > Int32(0) else xh_buf_base
+
+                            gw0 = ld_global_nc_u32(gate_row_addr + seg_byte_off) if valid_seg > Int32(0) else Uint32(0)
+                            gw1 = ld_global_nc_u32(gate_row_addr + seg_byte_off + Int64(4)) if valid_seg > Int32(0) else Uint32(0)
+                            sf_word_g = ld_global_nc_u32(w1s_base_addr + ebase_sf + bsf_base_g + sf_group_off) if valid_seg > Int32(0) else Uint32(0)
+                            sf_g = cvt_e4m3_to_f32_via_f16((sf_word_g >> sf_shift) & Uint32(0xFF)) if valid_seg > Int32(0) else Float32(0.0)
+
+                            if cutlass.const_expr(self.is_gated):
+                                uw0 = ld_global_nc_u32(up_row_addr + seg_byte_off) if valid_seg > Int32(0) else Uint32(0)
+                                uw1 = ld_global_nc_u32(up_row_addr + seg_byte_off + Int64(4)) if valid_seg > Int32(0) else Uint32(0)
+                                sf_word_u = ld_global_nc_u32(w1s_base_addr + ebase_sf + bsf_base_u + sf_group_off) if valid_seg > Int32(0) else Uint32(0)
+                                sf_u = cvt_e4m3_to_f32_via_f16((sf_word_u >> sf_shift) & Uint32(0xFF)) if valid_seg > Int32(0) else Float32(0.0)
+                                dot_u, dot_g = self._block_dot_hfma2_pair_for_math(uw0, uw1, gw0, gw1, smem_xh, xh_base)
+                                partial_up = partial_up + sf_u * dot_u
+                                partial_gate = partial_gate + sf_g * dot_g
+                            else:
+                                partial_gate = partial_gate + sf_g * self._block_dot_hfma2_for_math(
+                                    gw0, gw1, smem_xh, xh_base,
+                                )
                 # ---- Activation + intermediate quant ----
                 gate_red = cute.arch.warp_reduction_sum(partial_gate) * alpha_fc1
                 if cutlass.const_expr(self.is_gated):

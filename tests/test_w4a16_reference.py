@@ -4,6 +4,7 @@ import torch
 
 import b12x.integration.tp_moe as tp_moe
 from b12x.cute.fp4 import pack_grouped_fp4_values, swizzle_block_scale
+from b12x.moe.fused.micro import MoEMicroKernelBackend as NVFP4MoEMicroKernelBackend
 from b12x.moe.fused.w4a16.micro import MoEMicroKernelBackend
 from b12x.moe.fused.w4a16.reference import moe_reference_w4a16
 
@@ -176,6 +177,15 @@ def test_w4a16_direct_micro_supports_static_decode_batches() -> None:
             weight_E=256,
         )
 
+    for batch_size in (1, 2, 4, 8, 10, 12, 16):
+        assert MoEMicroKernelBackend.is_supported(
+            m=batch_size,
+            k=2688,
+            n=1856,
+            num_topk=6,
+            weight_E=128,
+        )
+
     for batch_size in (1, 2, 4, 8):
         assert MoEMicroKernelBackend.is_supported(
             m=batch_size,
@@ -210,3 +220,38 @@ def test_w4a16_direct_micro_supports_static_decode_batches() -> None:
         num_topk=10,
         weight_E=512,
     )
+
+
+def test_nvfp4_direct_micro_supports_partial_512_k_groups() -> None:
+    for batch_size in (1, 2, 4, 8):
+        assert NVFP4MoEMicroKernelBackend.is_supported(
+            m=batch_size,
+            k=2688,
+            n=1856,
+            num_topk=6,
+            weight_E=128,
+        )
+
+    assert not NVFP4MoEMicroKernelBackend.is_supported(
+        m=1,
+        k=2720,
+        n=1856,
+        num_topk=6,
+        weight_E=128,
+    )
+
+    plan = tp_moe._plan_core_workspace(
+        "static",
+        "nvfp4",
+        state_E=128,
+        weight_E=128,
+        k=2688,
+        n=1856,
+        num_topk=6,
+        device=torch.device("cuda"),
+        dtype=torch.bfloat16,
+        routed_rows=6,
+        max_rows=6,
+    )
+    barrier_spec = next(spec for spec in plan.tensor_specs if spec.name == "barrier_count")
+    assert barrier_spec.shape == (22,)

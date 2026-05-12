@@ -13,7 +13,9 @@ from typing import Tuple
 
 from b12x.moe.fused.micro import (
     _MAX_DIRECT_K_SEGMENTS,
+    _direct_k_segments_for_k,
     _direct_k_segments_supported,
+    _fc1_chunks_for_m,
     MoEMicroKernelBackend as _DirectMoEMicroKernelBackend,
 )
 
@@ -32,9 +34,9 @@ class MoEMicroKernelBackend(_DirectMoEMicroKernelBackend):
     ) -> bool:
         if m not in (1, 2, 4, 8, 10, 12, 16, 24, 32):
             return False
-        if k <= 0 or k % (32 * 16) != 0 or k % 128 != 0:
+        if k <= 0 or k % 16 != 0 or k % 128 != 0:
             return False
-        if k // 16 > 32 * _MAX_DIRECT_K_SEGMENTS:
+        if _direct_k_segments_for_k(k) > _MAX_DIRECT_K_SEGMENTS:
             return False
         if n <= 0 or n % 16 != 0:
             return False
@@ -43,14 +45,15 @@ class MoEMicroKernelBackend(_DirectMoEMicroKernelBackend):
             # metadata, but the direct W4A16 kernel is outside its safe
             # resource envelope for multi-token, very-wide FC1 shapes.
             return False
-        rows_per_warp = max(1, m)
-        fc1_chunks = max(1, n // (16 * rows_per_warp))
+        fc1_chunks = _fc1_chunks_for_m(m, n)
+        if m > 1:
+            fc1_chunks = max(fc1_chunks, n // 16)
         if n % fc1_chunks != 0:
             return False
         i_chunk = n // fc1_chunks
         if i_chunk % 16 != 0:
             return False
-        k_segments = k // (32 * 16)
+        k_segments = _direct_k_segments_for_k(k)
         return (
             _direct_k_segments_supported(k_segments)
             and 0 < num_topk <= 32

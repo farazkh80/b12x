@@ -239,6 +239,14 @@ class ModelSpec:
 
 
 @dataclass(frozen=True)
+class ShapeSpec:
+    hidden_size: int
+    intermediate_size: int
+    num_experts: int
+    top_k: int
+
+
+@dataclass(frozen=True)
 class ModelProfile:
     label: str
     checkpoint_family: str
@@ -246,6 +254,10 @@ class ModelProfile:
     tp_size: int
     hf_repo_id: str | None
     default_model_path: pathlib.Path | None = None
+    default_activation: str = "silu"
+    default_quant_mode: str | None = None
+    default_validate: str = "oracle"
+    shape: ShapeSpec | None = None
 
 
 MODEL_PROFILES = {
@@ -262,6 +274,22 @@ MODEL_PROFILES = {
         default_layer_idx=1,
         tp_size=1,
         hf_repo_id="nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
+    ),
+    "nano35-w4a16": ModelProfile(
+        label="NVIDIA Nano3.5 BF16 NVFP4 W4A16 (shape)",
+        checkpoint_family="nano35_w4a16_shape",
+        default_layer_idx=1,
+        tp_size=1,
+        hf_repo_id=None,
+        default_activation="relu2",
+        default_quant_mode="w4a16",
+        default_validate="none",
+        shape=ShapeSpec(
+            hidden_size=2688,
+            intermediate_size=1856,
+            num_experts=128,
+            top_k=6,
+        ),
     ),
     "glm51": ModelProfile(
         label="GLM-5.1",
@@ -334,6 +362,8 @@ def resolve_model_path(
         from huggingface_hub import snapshot_download
 
         return pathlib.Path(snapshot_download(repo_id=profile.hf_repo_id))
+    if profile.shape is not None:
+        return pathlib.Path("<shape-only>")
 
     raise FileNotFoundError(
         f"no default path found for {profile.label}; pass --model-path explicitly"
@@ -375,6 +405,16 @@ def _load_config(model_path: pathlib.Path) -> dict:
 
 def build_model_spec(model_path: pathlib.Path, profile: ModelProfile, *, tp_size_override: int | None = None, tp_rank: int = 0) -> ModelSpec:
     tp = tp_size_override if tp_size_override is not None else profile.tp_size
+    if profile.shape is not None:
+        return ModelSpec(
+            hidden_size=profile.shape.hidden_size,
+            intermediate_size=profile.shape.intermediate_size,
+            num_experts=profile.shape.num_experts,
+            top_k=profile.shape.top_k,
+            tp_size=tp,
+            tp_rank=tp_rank,
+        )
+
     cfg = _load_config(model_path)
     if profile.checkpoint_family == "qwen":
         return ModelSpec(
@@ -422,6 +462,80 @@ def build_model_spec(model_path: pathlib.Path, profile: ModelProfile, *, tp_size
     raise ValueError(f"unsupported checkpoint family {profile.checkpoint_family!r}")
 
 
+def make_shape_only_expert_weights(
+    spec: ModelSpec,
+    *,
+    layer_idx: int,
+    activation: str,
+) -> ExpertWeights:
+    if activation != "relu2":
+        raise ValueError("Nano3.5 W4A16 shape profile expects relu2 experts")
+    if spec.hidden_size % 16 != 0 or spec.I_tp % 16 != 0:
+        raise ValueError(
+            f"shape-only W4A16 profile requires K and I_tp divisible by 16, got K={spec.hidden_size}, I_tp={spec.I_tp}"
+        )
+
+    device = torch.device("cuda")
+    E = spec.num_experts
+    K = spec.hidden_size
+    I_tp = spec.I_tp
+
+    print(f"  Creating synthetic shape-only experts (E={E}, K={K}, I_tp={I_tp})...", end="", flush=True)
+    w13_weight = torch.empty(E, I_tp, K // 2, dtype=torch.uint8, device=device)
+    w13_weight.fill_(0x11)
+    w2_weight = torch.empty(E, K, I_tp // 2, dtype=torch.uint8, device=device)
+    w2_weight.fill_(0x11)
+
+    w13_sf = torch.ones(E, I_tp, K // 16, dtype=torch.float8_e4m3fn, device=device)
+    down_sf = torch.ones(E, K, I_tp // 16, dtype=torch.float8_e4m3fn, device=device)
+    w13_blockscale_swizzled = swizzle_block_scale(w13_sf)
+    w2_blockscale_swizzled = swizzle_block_scale(down_sf)
+
+    w13_permuted = w13_weight.permute(1, 2, 0)
+    w13_scale = as_grouped_scale_view(w13_blockscale_swizzled.view(torch.uint8), I_tp, K)
+    down_permuted = w2_weight.permute(1, 2, 0)
+    down_scale = as_grouped_scale_view(w2_blockscale_swizzled.view(torch.uint8), K, I_tp)
+
+    w13_input_scale_per_expert = torch.ones(E, dtype=torch.float32, device=device)
+    w2_input_scale_per_expert = torch.ones(E, dtype=torch.float32, device=device)
+    w13_input_scale = w13_input_scale_per_expert.max()
+    w2_input_scale = w2_input_scale_per_expert.max()
+    g1_alphas_per_expert = torch.ones(E, dtype=torch.float32, device=device)
+    g2_alphas_per_expert = torch.ones(E, dtype=torch.float32, device=device)
+    g1_alphas = g1_alphas_per_expert
+    g2_alphas = g2_alphas_per_expert
+    w13_input_scale_quant = (1.0 / w13_input_scale).to(torch.float32)
+    w2_input_scale_quant = (1.0 / w2_input_scale).to(torch.float32)
+    w13_input_scale_quant_per_expert = (1.0 / w13_input_scale_per_expert).to(torch.float32).contiguous()
+    w2_input_scale_quant_per_expert = (1.0 / w2_input_scale_per_expert).to(torch.float32).contiguous()
+    print(" done.")
+
+    return ExpertWeights(
+        layer_idx=layer_idx,
+        spec=spec,
+        w13_permuted=w13_permuted,
+        w13_scale=w13_scale,
+        down_permuted=down_permuted,
+        down_scale=down_scale,
+        w13_weight=w13_weight,
+        w13_blockscale_swizzled=w13_blockscale_swizzled,
+        w2_weight=w2_weight,
+        w2_blockscale_swizzled=w2_blockscale_swizzled,
+        w13_input_scale=w13_input_scale,
+        w2_input_scale=w2_input_scale,
+        w13_input_scale_quant=w13_input_scale_quant,
+        w2_input_scale_quant=w2_input_scale_quant,
+        w13_input_scale_per_expert=w13_input_scale_per_expert,
+        w2_input_scale_per_expert=w2_input_scale_per_expert,
+        w13_input_scale_quant_per_expert=w13_input_scale_quant_per_expert,
+        w2_input_scale_quant_per_expert=w2_input_scale_quant_per_expert,
+        g1_alphas=g1_alphas,
+        g2_alphas=g2_alphas,
+        g1_alphas_per_expert=g1_alphas_per_expert,
+        g2_alphas_per_expert=g2_alphas_per_expert,
+    )
+
+
 def load_expert_weights(
     model_path: pathlib.Path,
     spec: ModelSpec,
@@ -433,12 +547,14 @@ def load_expert_weights(
     if activation not in {"silu", "relu2"}:
         raise ValueError(f"unsupported activation {activation!r}")
 
-    cfg = _load_config(model_path)
-
     device = torch.device("cuda")
     E = spec.num_experts
     K = spec.hidden_size
     I_tp = spec.I_tp
+    if checkpoint_family == "nano35_w4a16_shape":
+        return make_shape_only_expert_weights(spec, layer_idx=layer_idx, activation=activation)
+
+    cfg = _load_config(model_path)
     loader = IndexedSafetensorLoader(model_path)
 
     if checkpoint_family in {"qwen", "glm", "minimax_m2"}:
@@ -1162,9 +1278,12 @@ def bench_multilayer_graph_mode(
     if graph_num_layers < 2:
         raise ValueError("--graph-num-layers must be at least 2 in multi-layer graph mode")
 
-    cfg = _load_config(model_path)
-    total_layers = cfg["num_hidden_layers"]
     layer_start = args.graph_layer_start
+    if profile.shape is None:
+        cfg = _load_config(model_path)
+        total_layers = cfg["num_hidden_layers"]
+    else:
+        total_layers = layer_start + graph_num_layers
     if layer_start < 0 or layer_start + graph_num_layers > total_layers:
         raise ValueError(
             f"requested layers [{layer_start}, {layer_start + graph_num_layers}) exceed model depth {total_layers}"
@@ -1377,14 +1496,15 @@ def bench_e2e() -> None:
     parser.add_argument("--tp-parallel", action="store_true", help="Load all TP rank slices and replay per-rank CUDA graphs in parallel streams")
     parser.add_argument("--model-path", type=pathlib.Path, default=None)
     parser.add_argument("--layer-idx", type=int, default=None)
-    parser.add_argument("--activation", choices=["silu", "relu2"], default="silu")
+    parser.add_argument("--activation", choices=["silu", "relu2"], default=None)
     parser.add_argument(
         "--quant-mode",
         choices=["nvfp4", "w4a16"],
-        default=quant_mode_default,
+        default=None,
         help=(
             "Backend math mode. w4a16 keeps activations BF16 and dequantizes "
-            "FP4 weights inline. B12X_MOE_FORCE_A16=1 changes this default to w4a16."
+            "FP4 weights inline. If omitted, the model profile default is used, "
+            "otherwise B12X_MOE_FORCE_A16=1 changes the default to w4a16."
         ),
     )
     parser.add_argument("--graph-mode", choices=["single-op", "multi-layer"], default="single-op")
@@ -1392,7 +1512,7 @@ def bench_e2e() -> None:
     parser.add_argument("--graph-layer-start", type=int, default=0)
     parser.add_argument("--reference", choices=["flashinfer", "none"], default=None)
     parser.add_argument("--scale-contract", choices=["shared", "per-expert"], default="shared")
-    parser.add_argument("--validate", choices=["none", "oracle"], default="oracle")
+    parser.add_argument("--validate", choices=["none", "oracle"], default=None)
     parser.add_argument("--oracle-mode", choices=["nvfp4", "w4a16", "f32"], default=None)
     parser.add_argument("--include-routing", action="store_true")
     parser.set_defaults(cuda_graph=True)
@@ -1436,6 +1556,13 @@ def bench_e2e() -> None:
         help="Bytes to touch when evicting L2; 0 uses 2x the reported L2 size.",
     )
     args = parser.parse_args()
+    model_profile = MODEL_PROFILES[args.model_profile]
+    if args.activation is None:
+        args.activation = model_profile.default_activation
+    if args.quant_mode is None:
+        args.quant_mode = model_profile.default_quant_mode or quant_mode_default
+    if args.validate is None:
+        args.validate = model_profile.default_validate
     if args.reference is None:
         args.reference = "none" if args.quant_mode == "w4a16" else "flashinfer"
     if args.oracle_mode is None:
@@ -1445,7 +1572,6 @@ def bench_e2e() -> None:
         if args.batch_sizes is not None
         else BATCH_SIZE_PROFILES[args.batch_size_profile]
     )
-    model_profile = MODEL_PROFILES[args.model_profile]
     model_path = resolve_model_path(model_profile, args.model_path)
     layer_idx = model_profile.default_layer_idx if args.layer_idx is None else args.layer_idx
 
@@ -1474,6 +1600,8 @@ def bench_e2e() -> None:
         f"E={spec.num_experts}, top_k={spec.top_k}"
     )
     print(f"Model path: {model_path}")
+    if model_profile.shape is not None:
+        print("Weights: synthetic shape-only")
     print(f"Layer: {layer_idx}")
     print(f"Activation: {args.activation}")
     print(f"Quant mode: {args.quant_mode}")

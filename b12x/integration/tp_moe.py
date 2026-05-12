@@ -31,6 +31,7 @@ from b12x.moe.fused.silu import (
 )
 from b12x.moe.fused.micro import (
     _BLOCK_DIM as _DIRECT_MICRO_BLOCK_DIM,
+    _direct_k_segments_for_k,
     _direct_k_segments_supported,
 )
 from b12x.moe.fused.w4a16.relu2 import (
@@ -949,17 +950,35 @@ def _plan_core_workspace(
 ) -> _TPCoreWorkspacePlan:
     quant_mode = _normalize_quant_mode(quant_mode)
     cols_pad_k = align_up(k // _NVFP4_BLOCK_SIZE, 4)
+    direct_micro_tokens = max(1, routed_rows // max(1, num_topk))
+    if quant_mode == "w4a16":
+        direct_micro_k_supported = (
+            k > 0
+            and k % _NVFP4_BLOCK_SIZE == 0
+            and k % 128 == 0
+            and _direct_k_segments_supported(_direct_k_segments_for_k(k))
+        )
+        direct_micro_token_supported = direct_micro_tokens in (1, 2, 4, 8, 10, 12, 16, 24, 32)
+        direct_micro_resource_supported = not (direct_micro_tokens >= 4 and n >= 4096)
+    else:
+        direct_micro_k_supported = (
+            k > 0
+            and k % _NVFP4_BLOCK_SIZE == 0
+            and k % 128 == 0
+            and _direct_k_segments_supported(_direct_k_segments_for_k(k))
+        )
+        direct_micro_token_supported = direct_micro_tokens in (1, 2, 4, 8)
+        direct_micro_resource_supported = True
     direct_micro_candidate = (
         implementation == "static"
         and n % _NVFP4_BLOCK_SIZE == 0
-        and k % (32 * _NVFP4_BLOCK_SIZE) == 0
-        and k % 128 == 0
-        and _direct_k_segments_supported(k // (32 * _NVFP4_BLOCK_SIZE))
+        and direct_micro_k_supported
         and 0 < num_topk <= 32
         and weight_E > 0
-        and routed_rows <= 8 * num_topk
+        and routed_rows == direct_micro_tokens * num_topk
+        and direct_micro_token_supported
+        and direct_micro_resource_supported
     )
-    direct_micro_tokens = max(1, routed_rows // max(1, num_topk))
     barrier_slots = max(1, routed_rows)
     if direct_micro_candidate:
         barrier_slots = max(barrier_slots, routed_rows + direct_micro_tokens * 16)
