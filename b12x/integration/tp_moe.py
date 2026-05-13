@@ -2368,6 +2368,13 @@ def _get_micro_kernel(
     if (
         mac_override is None
         and quant_mode == "w4a16"
+        and m > 1
+        and _first_env("B12X_MICRO_MAX_ACTIVE_CLUSTERS") is None
+    ):
+        mac = min(mac, 148 if m == 4 else 60)
+    if (
+        mac_override is None
+        and quant_mode == "w4a16"
         and m > 8
         and _first_env("B12X_MICRO_MAX_ACTIVE_CLUSTERS") is None
     ):

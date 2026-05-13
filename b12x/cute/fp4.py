@@ -315,6 +315,22 @@ def ld_global_nc_u32(base_ptr: Int64, *, loc=None, ip=None) -> Uint32:
 
 
 @dsl_user_op
+def prefetch_global_l2(base_ptr: Int64, *, loc=None, ip=None) -> None:
+    """Prefetch a global memory line into L2."""
+    llvm.inline_asm(
+        None,
+        [Int64(base_ptr).ir_value(loc=loc, ip=ip)],
+        "prefetch.global.L2 [$0];",
+        "l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def ld_global_nc_v2_u32(
     base_ptr: Int64, *, loc=None, ip=None
 ) -> Tuple[Uint32, Uint32]:

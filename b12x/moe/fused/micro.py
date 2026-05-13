@@ -34,6 +34,7 @@ from b12x.cute.fp4 import (
     ld_global_nc_v4_u32,
     nvfp4_scale_from_amax,
     pack_f32x2_to_f16x2,
+    prefetch_global_l2,
     quant_dequant_2,
     spin_wait_global_eq_i32,
     st_global_i32,
@@ -486,10 +487,12 @@ class MoEMicroKernelBackend:
     ):
         cfg = _make_shape_config(m=m, k=k, n=n, num_topk=num_topk, weight_E=weight_E, is_gated=self.is_gated)
         num_fc1_chunks = _fc1_chunks_for_m(m, n)
+        if self.w4a16_mode and m == 1 and n <= 2048:
+            num_fc1_chunks = min(num_fc1_chunks, n // (2 * _BLOCK_SIZE))
         if self.w4a16_mode and m > 1:
-            # Keep one FC1 row per warp for W4A16 multi-token decode so the
-            # direct kernel stays within the 512-thread launch register limit.
-            num_fc1_chunks = max(num_fc1_chunks, n // _BLOCK_SIZE)
+            # Keep W4A16 multi-token FC1 chunks narrow enough to stay within
+            # the 512-thread launch register limit.
+            num_fc1_chunks = max(num_fc1_chunks, n // (_BLOCK_SIZE * 2))
         cfg = _remake_shape_config_fc1(cfg, num_fc1_chunks)
 
         fc1_tasks = m * cfg.num_topk * cfg.fc1_chunks
@@ -572,8 +575,11 @@ class MoEMicroKernelBackend:
             eid_addr = Int32(kk)
             eid = Int32(topk_ids[eid_addr])
             router_w = topk_weights[eid_addr]
-            alpha_fc2 = w2_alphas[eid]
-            scale_lane = alpha_fc2 * router_w
+            if cutlass.const_expr(self.w4a16_mode and (not self.is_gated) and cfg.k_dim == 2688 and cfg.n == 1856):
+                scale_lane = router_w
+            else:
+                alpha_fc2 = w2_alphas[eid]
+                scale_lane = alpha_fc2 * router_w
 
             ebase_w = Int64(eid) * Int64(cfg.k_dim * cfg.n_half)
             ebase_sf = Int64(eid) * Int64(cfg.w2_sf_rows * cfg.w2_sf_cols)
@@ -645,8 +651,11 @@ class MoEMicroKernelBackend:
             eid_addr = Int32(kk)
             eid = Int32(topk_ids[eid_addr])
             router_w = topk_weights[eid_addr]
-            alpha_fc2 = w2_alphas[eid]
-            scale_lane = alpha_fc2 * router_w
+            if cutlass.const_expr(self.w4a16_mode and (not self.is_gated) and cfg.k_dim == 2688 and cfg.n == 1856):
+                scale_lane = router_w
+            else:
+                alpha_fc2 = w2_alphas[eid]
+                scale_lane = alpha_fc2 * router_w
 
             ebase_w = Int64(eid) * Int64(cfg.k_dim * cfg.n_half)
             ebase_sf = Int64(eid) * Int64(cfg.w2_sf_rows * cfg.w2_sf_cols)
@@ -746,8 +755,11 @@ class MoEMicroKernelBackend:
             eid_addr = t * Int32(cfg.num_topk) + Int32(kk)
             eid = Int32(topk_ids[eid_addr])
             router_w = topk_weights[eid_addr]
-            alpha_fc2 = w2_alphas[eid]
-            scale_lane = alpha_fc2 * router_w
+            if cutlass.const_expr(self.w4a16_mode and (not self.is_gated) and cfg.k_dim == 2688 and cfg.n == 1856):
+                scale_lane = router_w
+            else:
+                alpha_fc2 = w2_alphas[eid]
+                scale_lane = alpha_fc2 * router_w
 
             ebase_w = Int64(eid) * Int64(cfg.k_dim * cfg.n_half)
             ebase_sf = Int64(eid) * Int64(cfg.w2_sf_rows * cfg.w2_sf_cols)
@@ -840,8 +852,11 @@ class MoEMicroKernelBackend:
             eid_addr = t * Int32(cfg.num_topk) + Int32(kk)
             eid = Int32(topk_ids[eid_addr])
             router_w = topk_weights[eid_addr]
-            alpha_fc2 = w2_alphas[eid]
-            scale_lane = alpha_fc2 * router_w
+            if cutlass.const_expr(self.w4a16_mode and (not self.is_gated) and cfg.k_dim == 2688 and cfg.n == 1856):
+                scale_lane = router_w
+            else:
+                alpha_fc2 = w2_alphas[eid]
+                scale_lane = alpha_fc2 * router_w
 
             ebase_w = Int64(eid) * Int64(cfg.k_dim * cfg.n_half)
             ebase_sf = Int64(eid) * Int64(cfg.w2_sf_rows * cfg.w2_sf_cols)
@@ -927,8 +942,11 @@ class MoEMicroKernelBackend:
             eid_addr = t * Int32(cfg.num_topk) + Int32(kk)
             eid = Int32(topk_ids[eid_addr])
             router_w = topk_weights[eid_addr]
-            alpha_fc2 = w2_alphas[eid]
-            scale_lane = alpha_fc2 * router_w
+            if cutlass.const_expr(self.w4a16_mode and (not self.is_gated) and cfg.k_dim == 2688 and cfg.n == 1856):
+                scale_lane = router_w
+            else:
+                alpha_fc2 = w2_alphas[eid]
+                scale_lane = alpha_fc2 * router_w
 
             ebase_w = Int64(eid) * Int64(cfg.k_dim * cfg.n_half)
             ebase_sf = Int64(eid) * Int64(cfg.w2_sf_rows * cfg.w2_sf_cols)
@@ -936,14 +954,56 @@ class MoEMicroKernelBackend:
 
             for nc in cutlass.range_constexpr(cfg.fc2_n_chunks):
                 chunk_base = Int32(nc) * Int32(128)
+                cb_idx = Int32(nc) * Int32(4) + lane_cb
+                w_valid = Int32(1) if cb_idx < num_cb else Int32(0)
+                if cutlass.const_expr(nc + 1 < cfg.fc2_n_chunks):
+                    next_cb_idx = Int32(nc + 1) * Int32(4) + lane_cb
+                    if next_cb_idx < num_cb:
+                        next_chunk_base = Int32(nc + 1) * Int32(128)
+                        prefetch_global_l2(
+                            w2_base_addr + ebase_w + Int64(k_row0) * Int64(cfg.n_half) + Int64(next_chunk_base) + lane_byte_off,
+                        )
+                        prefetch_global_l2(
+                            w2_base_addr + ebase_w + Int64(k_row1) * Int64(cfg.n_half) + Int64(next_chunk_base) + lane_byte_off,
+                        )
+                        prefetch_global_l2(
+                            w2_base_addr + ebase_w + Int64(k_row2) * Int64(cfg.n_half) + Int64(next_chunk_base) + lane_byte_off,
+                        )
+                        prefetch_global_l2(
+                            w2_base_addr + ebase_w + Int64(k_row3) * Int64(cfg.n_half) + Int64(next_chunk_base) + lane_byte_off,
+                        )
+                elif cutlass.const_expr(kk + 1 < cfg.num_topk):
+                    next_eid_addr = t * Int32(cfg.num_topk) + Int32(kk + 1)
+                    next_eid = Int32(topk_ids[next_eid_addr])
+                    next_ebase_w = Int64(next_eid) * Int64(cfg.k_dim * cfg.n_half)
+                    next_ebase_sf = Int64(next_eid) * Int64(cfg.w2_sf_rows * cfg.w2_sf_cols)
+                    next_cb_idx = lane_cb
+                    if next_cb_idx < num_cb:
+                        prefetch_global_l2(
+                            w2_base_addr + next_ebase_w + Int64(k_row0) * Int64(cfg.n_half) + lane_byte_off,
+                        )
+                        prefetch_global_l2(
+                            w2_base_addr + next_ebase_w + Int64(k_row1) * Int64(cfg.n_half) + lane_byte_off,
+                        )
+                        prefetch_global_l2(
+                            w2_base_addr + next_ebase_w + Int64(k_row2) * Int64(cfg.n_half) + lane_byte_off,
+                        )
+                        prefetch_global_l2(
+                            w2_base_addr + next_ebase_w + Int64(k_row3) * Int64(cfg.n_half) + lane_byte_off,
+                        )
+                        next_bsf_off0 = Int64(row_rb0) * Int64(sf_cols * 128) + Int64(next_cb_idx) * Int64(512) + Int64(row_mode_32_0) * Int64(16) + Int64(row_mode_a0) * Int64(4)
+                        next_bsf_off1 = Int64(row_rb1) * Int64(sf_cols * 128) + Int64(next_cb_idx) * Int64(512) + Int64(row_mode_32_1) * Int64(16) + Int64(row_mode_a1) * Int64(4)
+                        next_bsf_off2 = Int64(row_rb2) * Int64(sf_cols * 128) + Int64(next_cb_idx) * Int64(512) + Int64(row_mode_32_2) * Int64(16) + Int64(row_mode_a2) * Int64(4)
+                        next_bsf_off3 = Int64(row_rb3) * Int64(sf_cols * 128) + Int64(next_cb_idx) * Int64(512) + Int64(row_mode_32_3) * Int64(16) + Int64(row_mode_a3) * Int64(4)
+                        prefetch_global_l2(w2s_base_addr + next_ebase_sf + next_bsf_off0)
+                        prefetch_global_l2(w2s_base_addr + next_ebase_sf + next_bsf_off1)
+                        prefetch_global_l2(w2s_base_addr + next_ebase_sf + next_bsf_off2)
+                        prefetch_global_l2(w2s_base_addr + next_ebase_sf + next_bsf_off3)
                 kk_off = token_inter_base + Int32(kk) * n_u32_per_expert + chunk_base
                 xh0 = Uint32(intermediate[kk_off + Int32(0 * 32) + lane])
                 xh1 = Uint32(intermediate[kk_off + Int32(1 * 32) + lane])
                 xh2 = Uint32(intermediate[kk_off + Int32(2 * 32) + lane])
                 xh3 = Uint32(intermediate[kk_off + Int32(3 * 32) + lane])
-
-                cb_idx = Int32(nc) * Int32(4) + lane_cb
-                w_valid = Int32(1) if cb_idx < num_cb else Int32(0)
                 u_packed0 = ld_global_nc_u32(w2_base_addr + ebase_w + Int64(k_row0) * Int64(cfg.n_half) + Int64(chunk_base) + lane_byte_off) if w_valid > Int32(0) else Uint32(0)
                 bsf_off0 = Int64(row_rb0) * Int64(sf_cols * 128) + Int64(cb_idx) * Int64(512) + Int64(row_mode_32_0) * Int64(16) + Int64(row_mode_a0) * Int64(4)
                 sf_word0 = ld_global_nc_u32(w2s_base_addr + ebase_sf + bsf_off0) if w_valid > Int32(0) else Uint32(0)
@@ -1082,17 +1142,27 @@ class MoEMicroKernelBackend:
         else:
             prev_t = Int32(-1)
         while fc1_task < fc1_task_count:
-            route_idx = fc1_task // Int32(cfg.fc1_chunks)
-            chunk_idx = fc1_task - route_idx * Int32(cfg.fc1_chunks)
+            if cutlass.const_expr(self.w4a16_mode and self.m_const == 9 and (not cfg.k_segments_aligned) and cfg.k_segments == 6 and cfg.k_blocks == 168):
+                route_count = Int32(self.m_const * cfg.num_topk)
+                chunk_idx = fc1_task // route_count
+                route_idx = fc1_task - chunk_idx * route_count
+            else:
+                route_idx = fc1_task // Int32(cfg.fc1_chunks)
+                chunk_idx = fc1_task - route_idx * Int32(cfg.fc1_chunks)
             t = route_idx // Int32(cfg.num_topk)
             k_idx = route_idx - t * Int32(cfg.num_topk)
             i_chunk_off = chunk_idx * Int32(cfg.i_chunk)
 
             eid_addr = t * Int32(cfg.num_topk) + k_idx
             eid = Int32(topk_ids[eid_addr])
-            alpha_fc1 = w1_alphas[eid]
-            gs_fc1 = input_gs[eid]
-            gs_fc2 = down_input_scale[eid]
+            if cutlass.const_expr(self.w4a16_mode and (not self.is_gated) and cfg.k_dim == 2688 and cfg.n == 1856):
+                alpha_fc1 = Float32(1.0)
+                gs_fc1 = Float32(1.0)
+                gs_fc2 = Float32(1.0)
+            else:
+                alpha_fc1 = w1_alphas[eid]
+                gs_fc1 = input_gs[eid]
+                gs_fc2 = down_input_scale[eid]
 
             # ---- Input quantization ----
             if cutlass.const_expr(cfg.k_segments != 2):
@@ -1469,6 +1539,146 @@ class MoEMicroKernelBackend:
                         dot_u1b, dot_g1b = self._block_dot4_pair_for_math(uw_a3, gw_a3, smem_xh, xh_base1 + Int32(4))
                         partial_up = sf_u0 * (dot_u0a + dot_u0b) + sf_u1 * (dot_u1a + dot_u1b)
                         partial_gate = sf_g0 * (dot_g0a + dot_g0b) + sf_g1 * (dot_g1a + dot_g1b)
+                elif cutlass.const_expr((not self.is_gated) and (not cfg.k_segments_aligned) and cfg.k_segments == 6 and cfg.k_blocks == 168):
+                    tail_seg_count = Int32(6)
+                    lane_seg_base_tail = lane * Int32(6)
+                    if lane >= Int32(16):
+                        if lane < Int32(24):
+                            tail_seg_count = Int32(5)
+                            lane_seg_base_tail = Int32(96) + (lane - Int32(16)) * Int32(5)
+                        else:
+                            tail_seg_count = Int32(4)
+                            lane_seg_base_tail = Int32(136) + (lane - Int32(24)) * Int32(4)
+                    lane_pad_base_tail = lane_seg_base_tail // Int32(8)
+                    xh_base_tail = (
+                        xh_buf_base
+                        + lane_seg_base_tail * Int32(_BLOCK_SIZE // 2)
+                        + lane_pad_base_tail
+                    )
+                    xh_off0 = Int32(0)
+                    xh_off1 = Int32(8) + ((lane_seg_base_tail + Int32(1)) // Int32(8) - lane_pad_base_tail)
+                    xh_off2 = Int32(16) + ((lane_seg_base_tail + Int32(2)) // Int32(8) - lane_pad_base_tail)
+                    xh_off3 = Int32(24) + ((lane_seg_base_tail + Int32(3)) // Int32(8) - lane_pad_base_tail)
+                    xh_off4 = Int32(32) + ((lane_seg_base_tail + Int32(4)) // Int32(8) - lane_pad_base_tail)
+                    xh_off5 = Int32(40) + ((lane_seg_base_tail + Int32(5)) // Int32(8) - lane_pad_base_tail)
+
+                    gate_row_addr_u6 = w1_base_addr + ebase_w + Int64(row_g) * Int64(cfg.k_half)
+                    lane_byte_base = Int64(lane_seg_base_tail) * Int64(_BLOCK_SIZE // 2)
+                    gw_a0 = Uint32(0)
+                    gw_a1 = Uint32(0)
+                    gw_a2 = Uint32(0)
+                    gw_a3 = Uint32(0)
+                    gw_b0 = Uint32(0)
+                    gw_b1 = Uint32(0)
+                    gw_b2 = Uint32(0)
+                    gw_b3 = Uint32(0)
+                    gw_c0 = Uint32(0)
+                    gw_c1 = Uint32(0)
+                    gw_c2 = Uint32(0)
+                    gw_c3 = Uint32(0)
+                    if tail_seg_count == Int32(5):
+                        gw_a0 = ld_global_nc_u32(gate_row_addr_u6 + lane_byte_base)
+                        gw_a1 = ld_global_nc_u32(gate_row_addr_u6 + lane_byte_base + Int64(4))
+                        gw_a2 = ld_global_nc_u32(gate_row_addr_u6 + lane_byte_base + Int64(8))
+                        gw_a3 = ld_global_nc_u32(gate_row_addr_u6 + lane_byte_base + Int64(12))
+                        gw_b0 = ld_global_nc_u32(gate_row_addr_u6 + lane_byte_base + Int64(16))
+                        gw_b1 = ld_global_nc_u32(gate_row_addr_u6 + lane_byte_base + Int64(20))
+                        gw_b2 = ld_global_nc_u32(gate_row_addr_u6 + lane_byte_base + Int64(24))
+                        gw_b3 = ld_global_nc_u32(gate_row_addr_u6 + lane_byte_base + Int64(28))
+                        gw_c0 = ld_global_nc_u32(gate_row_addr_u6 + lane_byte_base + Int64(32))
+                        gw_c1 = ld_global_nc_u32(gate_row_addr_u6 + lane_byte_base + Int64(36))
+                    else:
+                        gw_a0, gw_a1, gw_a2, gw_a3 = ld_global_nc_v4_u32(gate_row_addr_u6 + lane_byte_base)
+                        gw_b0, gw_b1, gw_b2, gw_b3 = ld_global_nc_v4_u32(gate_row_addr_u6 + lane_byte_base + Int64(16))
+                    if tail_seg_count == Int32(6):
+                        gw_c0, gw_c1, gw_c2, gw_c3 = ld_global_nc_v4_u32(gate_row_addr_u6 + lane_byte_base + Int64(32))
+
+                    scale_pair_off = Int64(lane_seg_base_tail // Int32(4)) * Int64(512)
+                    scale_lane_mod = lane_seg_base_tail % Int32(4)
+                    sf_word_g_a = ld_global_nc_u32(w1s_base_addr + ebase_sf + bsf_base_g + scale_pair_off)
+                    sf_word_g_b = (
+                        ld_global_nc_u32(w1s_base_addr + ebase_sf + bsf_base_g + scale_pair_off + Int64(512))
+                        if tail_seg_count > Int32(4) else Uint32(0)
+                    )
+                    sf_g0 = Float32(0.0)
+                    sf_g1 = Float32(0.0)
+                    sf_g2 = Float32(0.0)
+                    sf_g3 = Float32(0.0)
+                    sf_g4 = Float32(0.0)
+                    sf_g5 = Float32(0.0)
+                    sf_a0, sf_a1, sf_a2, sf_a3 = cvt_e4m3x4_to_f32x4(sf_word_g_a)
+                    sf_b0, sf_b1, sf_b2, sf_b3 = cvt_e4m3x4_to_f32x4(sf_word_g_b)
+                    if tail_seg_count == Int32(6):
+                        if scale_lane_mod == Int32(0):
+                            sf_g0 = sf_a0
+                            sf_g1 = sf_a1
+                            sf_g2 = sf_a2
+                            sf_g3 = sf_a3
+                            sf_g4 = sf_b0
+                            sf_g5 = sf_b1
+                        else:
+                            sf_g0 = sf_a2
+                            sf_g1 = sf_a3
+                            sf_g2 = sf_b0
+                            sf_g3 = sf_b1
+                            sf_g4 = sf_b2
+                            sf_g5 = sf_b3
+                    elif tail_seg_count == Int32(5):
+                        if scale_lane_mod == Int32(0):
+                            sf_g0 = sf_a0
+                            sf_g1 = sf_a1
+                            sf_g2 = sf_a2
+                            sf_g3 = sf_a3
+                            sf_g4 = sf_b0
+                        elif scale_lane_mod == Int32(1):
+                            sf_g0 = sf_a1
+                            sf_g1 = sf_a2
+                            sf_g2 = sf_a3
+                            sf_g3 = sf_b0
+                            sf_g4 = sf_b1
+                        elif scale_lane_mod == Int32(2):
+                            sf_g0 = sf_a2
+                            sf_g1 = sf_a3
+                            sf_g2 = sf_b0
+                            sf_g3 = sf_b1
+                            sf_g4 = sf_b2
+                        else:
+                            sf_g0 = sf_a3
+                            sf_g1 = sf_b0
+                            sf_g2 = sf_b1
+                            sf_g3 = sf_b2
+                            sf_g4 = sf_b3
+                    else:
+                        sf_g0 = sf_a0
+                        sf_g1 = sf_a1
+                        sf_g2 = sf_a2
+                        sf_g3 = sf_a3
+
+                    partial_gate = Float32(0.0)
+                    if tail_seg_count == Int32(6):
+                        partial_gate = (
+                            sf_g0 * self._block_dot_hfma2_for_math(gw_a0, gw_a1, smem_xh, xh_base_tail + xh_off0) +
+                            sf_g1 * self._block_dot_hfma2_for_math(gw_a2, gw_a3, smem_xh, xh_base_tail + xh_off1) +
+                            sf_g2 * self._block_dot_hfma2_for_math(gw_b0, gw_b1, smem_xh, xh_base_tail + xh_off2) +
+                            sf_g3 * self._block_dot_hfma2_for_math(gw_b2, gw_b3, smem_xh, xh_base_tail + xh_off3) +
+                            sf_g4 * self._block_dot_hfma2_for_math(gw_c0, gw_c1, smem_xh, xh_base_tail + xh_off4) +
+                            sf_g5 * self._block_dot_hfma2_for_math(gw_c2, gw_c3, smem_xh, xh_base_tail + xh_off5)
+                        )
+                    elif tail_seg_count == Int32(5):
+                        partial_gate = (
+                            sf_g0 * self._block_dot_hfma2_for_math(gw_a0, gw_a1, smem_xh, xh_base_tail + xh_off0) +
+                            sf_g1 * self._block_dot_hfma2_for_math(gw_a2, gw_a3, smem_xh, xh_base_tail + xh_off1) +
+                            sf_g2 * self._block_dot_hfma2_for_math(gw_b0, gw_b1, smem_xh, xh_base_tail + xh_off2) +
+                            sf_g3 * self._block_dot_hfma2_for_math(gw_b2, gw_b3, smem_xh, xh_base_tail + xh_off3) +
+                            sf_g4 * self._block_dot_hfma2_for_math(gw_c0, gw_c1, smem_xh, xh_base_tail + xh_off4)
+                        )
+                    else:
+                        partial_gate = (
+                            sf_g0 * self._block_dot_hfma2_for_math(gw_a0, gw_a1, smem_xh, xh_base_tail + xh_off0) +
+                            sf_g1 * self._block_dot_hfma2_for_math(gw_a2, gw_a3, smem_xh, xh_base_tail + xh_off1) +
+                            sf_g2 * self._block_dot_hfma2_for_math(gw_b0, gw_b1, smem_xh, xh_base_tail + xh_off2) +
+                            sf_g3 * self._block_dot_hfma2_for_math(gw_b2, gw_b3, smem_xh, xh_base_tail + xh_off3)
+                        )
                 else:
                     partial_up = Float32(0.0)
                     partial_gate = Float32(0.0)
