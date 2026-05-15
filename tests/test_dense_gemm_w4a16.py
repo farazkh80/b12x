@@ -6,6 +6,8 @@ import pytest
 import torch
 
 from b12x.gemm.w4a16 import (
+    DenseGemmW4A16MicroKernel,
+    dense_gemm_w4a16,
     dense_reference_w4a16,
     quantize_dense_weight_to_fp4,
 )
@@ -51,6 +53,45 @@ def test_dense_reference_dequant_roundtrip(n, k):
     # we only assert high cosine correlation here.  The strict
     # quant-vs-quant accuracy gate lives in the kernel tests.
     assert metrics.cos > 0.99, f"cos={metrics.cos}"
+
+
+def test_dense_gemm_w4a16_signature_callable():
+    """Public entry exists with the expected signature."""
+    import inspect
+    sig = inspect.signature(dense_gemm_w4a16)
+    params = list(sig.parameters)
+    assert params[:4] == ["x", "w_fp4", "w_blockscale", "w_alpha"]
+    assert "out" in sig.parameters
+
+
+def test_dense_gemm_w4a16_is_supported_matrix():
+    """is_supported gate matches the documented decode envelope."""
+    # M ladder
+    for m in (1, 2, 4, 8, 10, 12, 16, 24, 32):
+        assert DenseGemmW4A16MicroKernel.is_supported(m, 2688, 4096)
+    for m in (0, 3, 5, 17, 33, 64):
+        assert not DenseGemmW4A16MicroKernel.is_supported(m, 2688, 4096)
+    # K must be a multiple of 128.  All Nano35 dense K values qualify.
+    for k in (2688, 3712, 4096):
+        assert DenseGemmW4A16MicroKernel.is_supported(1, k, 256)
+    assert not DenseGemmW4A16MicroKernel.is_supported(1, 511, 16)
+    assert not DenseGemmW4A16MicroKernel.is_supported(1, 256 + 64, 16)
+    # N must be a multiple of 16.
+    assert DenseGemmW4A16MicroKernel.is_supported(1, 512, 16)
+    assert not DenseGemmW4A16MicroKernel.is_supported(1, 512, 15)
+
+
+def test_dense_gemm_w4a16_stub_matches_reference_cpu():
+    """Stub kernel call returns the reference output (CPU path)."""
+    device = torch.device("cpu")
+    torch.manual_seed(42)
+    m, k, n = 1, 512, 16
+    x = torch.randn(m, k, dtype=torch.bfloat16, device=device) * 0.5
+    w = torch.randn(n, k, dtype=torch.bfloat16, device=device) * 0.1
+    w_fp4, w_bs, w_alpha = quantize_dense_weight_to_fp4(w)
+    out = dense_gemm_w4a16(x, w_fp4, w_bs, w_alpha)
+    ref = dense_reference_w4a16(x, w_fp4=w_fp4, w_blockscale=w_bs, w_alpha=w_alpha)
+    assert torch.equal(out, ref)
 
 
 def test_dense_quantize_shapes():
