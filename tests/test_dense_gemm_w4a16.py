@@ -142,6 +142,34 @@ def test_dense_gemm_w4a16_nano35_accuracy(name, k, n, m):
     )
 
 
+@pytest.mark.parametrize("name,k,n", NANO35_DENSE_SHAPES, ids=[s[0] for s in NANO35_DENSE_SHAPES])
+def test_dense_gemm_w4a16_cute_m16_accuracy(name, k, n, monkeypatch):
+    """CuTe-DSL backend at M=16 matches reference bit-exact for every Nano35 shape."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    from b12x.gemm.w4a16._cute_kernel import DenseGemmW4A16CuteKernel
+    m = 16
+    if not DenseGemmW4A16CuteKernel.is_supported(m, k, n):
+        pytest.skip(f"cute not supported (m={m}, k={k}, n={n})")
+    monkeypatch.setenv("B12X_GEMM_W4A16_USE_CUTE", "1")
+    device = torch.device("cuda")
+    torch.manual_seed(hash(("cute", name)) & 0xFFFFFFFF)
+    x = (torch.randn(m, k, dtype=torch.bfloat16, device=device) * 0.5).contiguous()
+    w = (torch.randn(n, k, dtype=torch.bfloat16, device=device) * 0.1).contiguous()
+    w_fp4, w_bs, w_alpha = quantize_dense_weight_to_fp4(w)
+    out = dense_gemm_w4a16(x, w_fp4, w_bs, w_alpha)
+    ref = dense_reference_w4a16(
+        x.cpu(), w_fp4=w_fp4.cpu(), w_blockscale=w_bs.cpu(), w_alpha=w_alpha.cpu(),
+    ).to(device)
+    metrics = compare_to_reference(out, ref)
+    assert metrics.cos > 0.9999, f"{name}: cos={metrics.cos}"
+    ref_max_abs = ref.abs().max().item()
+    rel_thresh = max(0.04, 0.01 * ref_max_abs)
+    assert metrics.max_abs <= rel_thresh, (
+        f"{name}: max_abs={metrics.max_abs} cos={metrics.cos}"
+    )
+
+
 def test_dense_quantize_shapes():
     """Packer produces the expected shapes / dtypes."""
     device = torch.device("cpu")

@@ -120,6 +120,11 @@ if _CUTE_AVAILABLE:
             self.sWpacked_layout = cute.make_ordered_layout(
                 (_BLOCK_N, _BLOCK_K // 2), order=(1, 0),
             )
+            # Epilogue smem tile (Step 5): (BLOCK_M, BLOCK_N) bf16,
+            # row-major. Sized to the output tile this CTA produces.
+            self.sC_layout = cute.make_ordered_layout(
+                (_BLOCK_M, _BLOCK_N), order=(1, 0),
+            )
 
             # ---- Step 1: shared-storage struct ----
             buffer_align_bytes = 128
@@ -136,6 +141,10 @@ if _CUTE_AVAILABLE:
                 ]
                 sWpacked: cute.struct.Align[
                     cute.struct.MemRange[Uint8, cute.cosize(self.sWpacked_layout)],
+                    buffer_align_bytes,
+                ]
+                sC: cute.struct.Align[
+                    cute.struct.MemRange[BFloat16, cute.cosize(self.sC_layout)],
                     buffer_align_bytes,
                 ]
 
@@ -184,6 +193,17 @@ if _CUTE_AVAILABLE:
                 atom_copy_u8, self.tW_layout, self.vW_layout,
             )
 
+            # Epilogue smem -> gmem tiled copy (Step 5).
+            # (BLOCK_M=16) x (BLOCK_N=32) = 512 elems / 128 threads ->
+            # 4 elems per thread.
+            self.tC_layout = cute.make_ordered_layout(
+                (_BLOCK_M, _BLOCK_N // 4), order=(1, 0),
+            )  # (16, 8) = 128 threads
+            self.vC_layout = cute.make_layout((1, 4))
+            self.gmem_tiled_copy_C = cute.make_tiled_copy_tv(
+                atom_copy_bf16, self.tC_layout, self.vC_layout,
+            )
+
         @cute.kernel
         def kernel(
             self,
@@ -196,8 +216,10 @@ if _CUTE_AVAILABLE:
             sA_layout: cute.Layout,
             sB_layout: cute.Layout,
             sWpacked_layout: cute.Layout,
+            sC_layout: cute.Layout,
             gmem_tiled_copy_A: cute.TiledCopy,
             gmem_tiled_copy_W: cute.TiledCopy,
+            gmem_tiled_copy_C: cute.TiledCopy,
             tiled_mma: cute.TiledMma,
         ):
             # ---- Step 1: allocate the smem tiles ----
@@ -206,9 +228,11 @@ if _CUTE_AVAILABLE:
             sA = storage.sA.get_tensor(sA_layout)
             sB_bf16 = storage.sB.get_tensor(sB_layout)
             sWpacked = storage.sWpacked.get_tensor(sWpacked_layout)
+            sC = storage.sC.get_tensor(sC_layout)
             cutlass.const_expr(cute.cosize(sA.layout) == _BLOCK_M * _BLOCK_K)
             cutlass.const_expr(cute.cosize(sB_bf16.layout) == _BLOCK_N * _BLOCK_K)
             cutlass.const_expr(cute.cosize(sWpacked.layout) == _BLOCK_N * (_BLOCK_K // 2))
+            cutlass.const_expr(cute.cosize(sC.layout) == _BLOCK_M * _BLOCK_N)
 
             # Identify this CTA's output tile.
             block_m, block_n, _ = cute.arch.block_idx()
@@ -353,21 +377,39 @@ if _CUTE_AVAILABLE:
                     )
                 cute.arch.sync_threads()
 
-            # ---- Step 4 diagnostic dump: write fp32 accumulator (bf16 cast) to gmem ----
-            # Step 5 will replace this with the proper epilogue
-            # (tiled smem store + global write).  For v1 we directly
-            # write each thread's accumulator fragments into the
-            # corresponding output positions, which is correct but
-            # uncoalesced.
-            DUMP_ACC: cutlass.Constexpr = True
-            if cutlass.const_expr(DUMP_ACC):
-                acc_bf16 = cute.make_fragment_like(accumulators, BFloat16)
-                acc_bf16.store(accumulators.load().to(BFloat16))
-                cute.copy(
-                    cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), BFloat16),
-                    acc_bf16,
-                    tCgC,
-                )
+            # ---- Step 5: smem-staged epilogue ----
+            # Stage register accumulators -> sC -> gmem so each warp's
+            # fragmented MMA output is reordered into a layout where
+            # 128 threads cooperatively issue coalesced bf16 writes to
+            # ``out_gmem``.
+            #
+            # Pattern lifted from b12x/gemm/dense.py:1031-1056 but
+            # using CopyUniversalOp instead of StMatrix8x8x16bOp
+            # (v3 swap-in for perf).
+            copy_atom_r2s = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(), BFloat16,
+            )
+            copy_atom_C = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(), BFloat16,
+            )
+            tiled_copy_C_Atom = cute.make_tiled_copy_C_atom(copy_atom_C, tiled_mma)
+            tiled_copy_r2s = cute.make_tiled_copy_S(copy_atom_r2s, tiled_copy_C_Atom)
+            thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
+            tRS_sC = thr_copy_r2s.partition_D(sC)
+            tRS_rAcc = tiled_copy_r2s.retile(accumulators)
+
+            # Cast fp32 acc -> bf16 in registers, then store to sC.
+            acc_bf16 = cute.make_fragment_like(tRS_rAcc, BFloat16)
+            acc_bf16.store(tRS_rAcc.load().to(BFloat16))
+            cute.copy(copy_atom_r2s, acc_bf16, tRS_sC)
+            cute.arch.sync_threads()
+
+            # sC -> gmem via the cooperative tiled copy built in
+            # _setup_attributes (128 threads, 4 bf16 each).
+            thr_gmem_copy_C = gmem_tiled_copy_C.get_slice(tidx)
+            tCsC_for_gmem = thr_gmem_copy_C.partition_S(sC)
+            tCgC_for_gmem = thr_gmem_copy_C.partition_D(gC)
+            cute.copy(gmem_tiled_copy_C, tCsC_for_gmem, tCgC_for_gmem)
 
         @cute.jit
         def __call__(
@@ -418,7 +460,9 @@ if _CUTE_AVAILABLE:
                 x, w, sf, alpha, out,
                 self.SharedStorage,
                 self.sA_layout, self.sB_layout, self.sWpacked_layout,
+                self.sC_layout,
                 self.gmem_tiled_copy_A, self.gmem_tiled_copy_W,
+                self.gmem_tiled_copy_C,
                 self.tiled_mma,
             ).launch(
                 grid=grid,
