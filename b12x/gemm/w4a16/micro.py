@@ -23,6 +23,7 @@ import torch
 
 from b12x.moe.fused.w4a16.reference import unswizzle_block_scale
 
+from ._cute_kernel import DenseGemmW4A16CuteKernel, _cute_backend_enabled
 from ._triton_kernel import w4a16_dense_decode_triton
 from .reference import dense_reference_w4a16
 
@@ -50,9 +51,11 @@ class DenseGemmW4A16MicroKernel:
         return True
 
     def __init__(self) -> None:
-        # Task 7 will populate this with the compiled CuTe DSL kernel
-        # handle.  Until then ``__call__`` shuttles to the reference.
-        self._compiled = None
+        # Lazily-constructed CuTe-DSL backend.  Used only when
+        # ``B12X_GEMM_W4A16_USE_CUTE=1`` and the kernel-body lift in
+        # ``_cute_kernel.py`` has landed; otherwise we always use the
+        # Triton path.
+        self._cute: DenseGemmW4A16CuteKernel | None = None
 
     def __call__(
         self,
@@ -66,6 +69,17 @@ class DenseGemmW4A16MicroKernel:
         n = w_fp4.shape[0]
         if out is None:
             out = torch.empty(m, n, dtype=torch.bfloat16, device=x.device)
+
+        # Optional CuTe-DSL backend (env-gated, currently a scaffold —
+        # see ``_cute_kernel.py``).  Falls through to Triton on
+        # NotImplementedError so a missing body is non-fatal.
+        if x.is_cuda and _cute_backend_enabled():
+            if self._cute is None:
+                self._cute = DenseGemmW4A16CuteKernel()
+            try:
+                return self._cute(x, w_fp4, w_blockscale, w_alpha, out=out)
+            except NotImplementedError:
+                pass
 
         # CPU shuttle is unsupported by the Triton kernel.  Fall back
         # to the reference path if asked to run on CPU.
