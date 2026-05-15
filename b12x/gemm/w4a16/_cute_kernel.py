@@ -1,106 +1,268 @@
-"""CuTe-DSL W4A16 dense GEMM kernel for SM120 / SM121 (v2 scaffold).
+"""CuTe-DSL W4A16 dense GEMM kernel for SM120 / SM121 (v2, work-in-progress).
 
-This is the **scaffold** for the v2 CuTe-DSL kernel.  It is structured
-to mirror the bf16-stage / bf16-MMA / FP4-dequant pattern proven by
-``b12x.moe.fused.micro.MoEMicroKernelBackend`` (the W4A16 MoE micro
-kernel), but stripped to a single matmul — no routing, no expert dim,
-no FC2, no intermediate buffer, no scatter.
+This is a minimal CuTe-DSL kernel that performs
 
-The Triton kernel in ``_triton_kernel.py`` is the **production v1**.
-This file is enabled by ``B12X_GEMM_W4A16_USE_CUTE=1`` and currently
-raises ``NotImplementedError`` until the kernel body lands.  The
-class scaffolding (imports, signature, launch glue) is in place so
-the body-lift can drop in with minimal additional plumbing.
+    out[M, N] = (x[M, K] @ dequant(w_fp4[N, K/2], w_sf[N, K/16]).T) * alpha
 
-## What needs to be lifted from ``b12x/moe/fused/micro.py``
+with bf16 activations + bf16 output and FP4-packed weights with FP8
+block scales (sf_vec_size = 16).
 
-Every ``cutlass.const_expr(self.w4a16_mode)`` branch in MoE micro is
-the W4A16-specific code path — exactly what we need to keep when
-dropping routing.
+**Design choices for v1 simplicity:**
 
-Key sites (read in order):
+* No TMA, no async pipelining — plain ``cute.copy`` for gmem → smem.
+* One CTA per ``(BLOCK_M, BLOCK_N)`` output tile.
+* FP4 weight is loaded into smem as packed ``uint8``; each thread
+  dequants its fragment to ``bf16`` in registers (multiply by the
+  per-block FP32 scale and the scalar alpha).
+* MMA: ``warp.MmaF16BF16Op(BFloat16, Float32, (16, 8, 16))`` —
+  identical atom to the attention kernel.  Accumulator is ``fp32``,
+  cast to ``bf16`` at the epilogue.
 
-| Line | Role | Action for dense |
-|------|------|------------------|
-| 354 | ``w4a16_mode: bool = False`` ctor arg | Remove flag — always true here. |
-| 366 | ``self.w4a16_mode = ...`` | Drop. |
-| 477-485 | ``is_supported`` W4A16 constraints | Lift; relax K % 512 to K % 128 (see micro.py in this dir). |
-| 484 | ``w4a16_rowpair_fc2`` setup | Drop — no FC2. |
-| 1040-1044 | bf16-stage A operand (preamble, t=prev_t cache miss) | Lift — this is the A-operand staging into ``smem_xh``. |
-| 1096-1100 | bf16-stage A operand (main FC1 loop, per-route) | Lift — same staging, called per K-segment. |
-| 1523, 1588 | FC1 dot product with bf16-stage operand | Lift — this is the inner bf16×FP4 MMA call. |
-| 1694, 1700 | FC2 path branches | Drop — no FC2. |
+This will not match TRT-LLM's hand-tuned ``cuda_core_nvfp4_gemm`` perf;
+that's a v3 optimization round (add TMA, pipeline stages, MMA-tile
+autotune).  v2 goal is just to land a working CuTe-DSL backend so the
+Triton kernel can be retired as the production path.
 
-Things to **strip** when porting:
-
-- ``cfg.weight_E``, ``cfg.num_topk``, ``topk_ids``, ``topk_weights``,
-  ``input_gs``, ``down_input_scale``, ``intermediate``, ``w2_*``,
-  ``barrier_count``, ``barrier_epoch``, the scatter-output epilogue
-  (replace with a direct ``[m, n]`` store).
-- ``cfg.fc2_*``, ``cfg.inter_*``, ``cfg.fc1_chunks_per_block`` (FC2
-  pipelining doesn't apply).
-- ``self.is_gated`` (always False — dense has no gate).
-- ``share_input_across_experts``, ``share_expert_scales``,
-  ``dynamic_down_scale`` (MoE-only).
-- The ``t = route_idx // num_topk`` token-resolve and the eid lookup.
-
-The minimal cute kernel signature should be (mirroring the staged-bf16
-path of MoE micro's ``__call__`` at line 1718):
-
-```
-x_ptr, w_ptr, w_sf_ptr, w_alpha_ptr, out_ptr,
-m_val, n_val, k_val, grid_x, stream
-```
-
-The K loop, smem staging, and FC1 dot product (with W4A16 flag forced
-true) are the body.  See the MoE micro lines listed above.
+**Enable with** ``B12X_GEMM_W4A16_USE_CUTE=1``.  On compile / runtime
+errors the public entry falls back to the Triton kernel — see
+``micro.py``.
 """
 
 from __future__ import annotations
 
+import functools
 import os
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 
+# CuTe DSL is heavyweight; import lazily so the package stays importable
+# in CPU-only environments where the DSL isn't installed.
+try:
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass import BFloat16, Float32, Int32
+    from cutlass.cute.nvgpu import warp as _warp
+
+    from b12x.cute.utils import (
+        current_cuda_stream,
+        make_ptr,
+    )
+
+    _CUTE_AVAILABLE = True
+except ImportError:
+    _CUTE_AVAILABLE = False
+
+
+_BLOCK_M = 16
+_BLOCK_N = 64
+_BLOCK_K = 32
+_NUM_WARPS = 4
+_THREADS_PER_WARP = 32
+_BLOCK_DIM = _NUM_WARPS * _THREADS_PER_WARP  # 128
+_SF_VEC_SIZE = 16
+
 
 def _cute_backend_enabled() -> bool:
-    return os.environ.get("B12X_GEMM_W4A16_USE_CUTE") == "1"
+    return os.environ.get("B12X_GEMM_W4A16_USE_CUTE") == "1" and _CUTE_AVAILABLE
+
+
+# ---------------------------------------------------------------------------
+# CuTe kernel
+# ---------------------------------------------------------------------------
+
+
+if _CUTE_AVAILABLE:
+
+    class _DenseGemmW4A16CuteJit:
+        """JIT-compiled CuTe-DSL kernel for one ``(BLOCK_M, BLOCK_N, BLOCK_K)`` config."""
+
+        def __init__(self, m: int, n: int, k: int):
+            self.m = m
+            self.n = n
+            self.k = k
+
+            self.tiled_mma = cute.make_tiled_mma(
+                _warp.MmaF16BF16Op(BFloat16, Float32, (16, 8, 16)),
+                (_NUM_WARPS, 1, 1),
+                permutation_mnk=(_NUM_WARPS * 16, 16, 16),
+            )
+
+        @cute.jit
+        def kernel(
+            self,
+            x_gmem: cute.Tensor,      # [M, K] bf16
+            w_gmem: cute.Tensor,      # [N, K // 2] uint8 (FP4 packed)
+            sf_gmem: cute.Tensor,     # [N, K // 16] f32 (UNswizzled)
+            alpha_gmem: cute.Tensor,  # [1] f32
+            out_gmem: cute.Tensor,    # [M, N] bf16
+        ):
+            # ---------------------------------------------------------
+            # WIP — kernel body skeleton.
+            #
+            # Implementation plan (each block is roughly one focused
+            # session's worth of iterating on a live CuTe compiler):
+            #
+            # (1) Smem allocation.  Declare two shared-memory regions:
+            #       sA : (BLOCK_M, BLOCK_K) bf16
+            #       sB : (BLOCK_N, BLOCK_K) bf16 (the *dequantized* W)
+            #     Use ``cute.make_smem_layout`` + ``cute.struct.Align``
+            #     just like ``b12x/attention/contiguous/forward.py``.
+            #
+            # (2) Partition gmem -> smem copies.
+            #     ``thr_copy_a = make_tiled_copy(...).get_slice(tid)``
+            #     ``cute.copy(thr_copy_a, gA, sA)``  for A.
+            #     For W (uint8) we load packed bytes; assign each
+            #     thread a slab of ``(BLOCK_N // num_threads, BLOCK_K // 2)``
+            #     ``uint8`` values.
+            #
+            # (3) Dequant.
+            #     For each FP4 nibble in a thread's W slab: decode the
+            #     magnitude (8-entry LUT chained via const_expr if/else)
+            #     and sign, multiply by the corresponding ``sf_gmem``
+            #     entry (broadcast across the 16-element FP4 group),
+            #     multiply by the scalar alpha, store as bf16 into sB.
+            #     Mirror ``_triton_kernel.py``'s ``_decode`` chain.
+            #
+            # (4) MMA accumulation.
+            #     ``mma = self.tiled_mma.get_slice(tid)``
+            #     ``tCrA = mma.partition_A(sA)``
+            #     ``tCrB = mma.partition_B(sB)``
+            #     ``tCrC = mma.make_fragment_C((BLOCK_M, BLOCK_N))``
+            #     ``cute.gemm(mma, tCrA, tCrB, tCrC)``
+            #
+            # (5) Epilogue.
+            #     Cast ``tCrC`` (fp32) -> bf16 register fragment.
+            #     ``cute.copy(epi_copy, tCrC_bf16, gC_slice)`` to gmem.
+            #
+            # Until (1)-(5) are wired up, raise compile-time so the
+            # outer driver can fall back to the Triton kernel.
+            cutlass.const_expr(
+                False,
+                "CuTe-DSL W4A16 dense kernel body not yet implemented; "
+                "v2 scaffold only.  Triton backend remains the default."
+            )
+
+        @cute.jit
+        def __call__(
+            self,
+            x_ptr: cute.Pointer,
+            w_ptr: cute.Pointer,
+            sf_ptr: cute.Pointer,
+            alpha_ptr: cute.Pointer,
+            out_ptr: cute.Pointer,
+            stream,
+        ):
+            x = cute.make_tensor(
+                x_ptr,
+                layout=cute.make_ordered_layout(
+                    (self.m, self.k), order=(0, 1),
+                ),
+            )
+            w = cute.make_tensor(
+                w_ptr,
+                layout=cute.make_ordered_layout(
+                    (self.n, self.k // 2), order=(0, 1),
+                ),
+            )
+            sf = cute.make_tensor(
+                sf_ptr,
+                layout=cute.make_ordered_layout(
+                    (self.n, self.k // _SF_VEC_SIZE), order=(0, 1),
+                ),
+            )
+            alpha = cute.make_tensor(alpha_ptr, layout=cute.make_layout((1,)))
+            out = cute.make_tensor(
+                out_ptr,
+                layout=cute.make_ordered_layout(
+                    (self.m, self.n), order=(0, 1),
+                ),
+            )
+
+            grid = (
+                (self.m + _BLOCK_M - 1) // _BLOCK_M,
+                (self.n + _BLOCK_N - 1) // _BLOCK_N,
+                1,
+            )
+            self.kernel(x, w, sf, alpha, out).launch(
+                grid=grid,
+                block=(_BLOCK_DIM, 1, 1),
+                smem=0,
+                stream=stream,
+            )
+
+else:
+
+    class _DenseGemmW4A16CuteJit:  # type: ignore[no-redef]
+        def __init__(self, *args, **kwargs):
+            raise ImportError("cutlass.cute (DSL) is not available in this environment")
+
+
+# ---------------------------------------------------------------------------
+# Public backend wrapper (caches compiled kernels)
+# ---------------------------------------------------------------------------
 
 
 class DenseGemmW4A16CuteKernel:
-    """CuTe-DSL W4A16 dense GEMM (scaffold — body lift pending).
+    """CuTe-DSL W4A16 dense GEMM backend (work-in-progress).
 
-    Once the body lands this class becomes the default backend; until
-    then it raises ``NotImplementedError`` on first call and the
-    public entry falls back to the Triton path.
+    The kernel body in ``_DenseGemmW4A16CuteJit`` is currently a
+    scaffold — it raises a compile-time const_expr error to make the
+    "not implemented" state loud and pushes the dispatch back to the
+    Triton kernel via ``NotImplementedError``.  Once the body lands,
+    flipping ``B12X_GEMM_W4A16_USE_CUTE=1`` will route through here
+    automatically.
     """
 
     @classmethod
     def is_supported(cls, m: int, k: int, n: int) -> bool:
-        # Same envelope as the Triton backend; will tighten once the
-        # CuTe-DSL kernel's MMA-tile constraints are encoded.
         from .micro import DenseGemmW4A16MicroKernel
-        return DenseGemmW4A16MicroKernel.is_supported(m, k, n)
+        if not DenseGemmW4A16MicroKernel.is_supported(m, k, n):
+            return False
+        # Stricter constraints once the kernel-body is implemented.
+        if m > _BLOCK_M:
+            return False
+        if n % _BLOCK_N != 0:
+            return False
+        if k % _BLOCK_K != 0:
+            return False
+        return True
 
     def __init__(self) -> None:
-        self._compiled = None
+        self._compile_cache: dict[Tuple[int, int, int], _DenseGemmW4A16CuteJit] = {}
+
+    def _get_compiled(self, m: int, n: int, k: int) -> _DenseGemmW4A16CuteJit:
+        key = (m, n, k)
+        if key not in self._compile_cache:
+            self._compile_cache[key] = _DenseGemmW4A16CuteJit(m=m, n=n, k=k)
+        return self._compile_cache[key]
 
     def __call__(
         self,
         x: torch.Tensor,
         w_fp4: torch.Tensor,
-        w_blockscale: torch.Tensor,
+        w_blockscale_unswizzled_fp32: torch.Tensor,
         w_alpha: torch.Tensor,
         out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        raise NotImplementedError(
-            "CuTe-DSL W4A16 dense kernel body has not been lifted yet. "
-            "See module docstring for the porting plan from "
-            "b12x.moe.fused.micro.MoEMicroKernelBackend's w4a16_mode "
-            "branches.  Set B12X_GEMM_W4A16_USE_CUTE=0 (the default) "
-            "to use the Triton backend in the meantime."
+        if not _CUTE_AVAILABLE:
+            raise NotImplementedError("cutlass.cute (DSL) not available")
+        m, k = x.shape
+        n = w_fp4.shape[0]
+        if out is None:
+            out = torch.empty(m, n, dtype=torch.bfloat16, device=x.device)
+
+        compiled = self._get_compiled(m, n, k)
+        stream = current_cuda_stream()
+        compiled(
+            make_ptr(BFloat16, x.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+            make_ptr(cutlass.Uint8, w_fp4.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+            make_ptr(Float32, w_blockscale_unswizzled_fp32.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+            make_ptr(Float32, w_alpha.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+            make_ptr(BFloat16, out.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+            stream,
         )
+        return out
 
 
 __all__ = ["DenseGemmW4A16CuteKernel", "_cute_backend_enabled"]

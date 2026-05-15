@@ -70,19 +70,7 @@ class DenseGemmW4A16MicroKernel:
         if out is None:
             out = torch.empty(m, n, dtype=torch.bfloat16, device=x.device)
 
-        # Optional CuTe-DSL backend (env-gated, currently a scaffold —
-        # see ``_cute_kernel.py``).  Falls through to Triton on
-        # NotImplementedError so a missing body is non-fatal.
-        if x.is_cuda and _cute_backend_enabled():
-            if self._cute is None:
-                self._cute = DenseGemmW4A16CuteKernel()
-            try:
-                return self._cute(x, w_fp4, w_blockscale, w_alpha, out=out)
-            except NotImplementedError:
-                pass
-
-        # CPU shuttle is unsupported by the Triton kernel.  Fall back
-        # to the reference path if asked to run on CPU.
+        # CPU shuttle path: reference is the only thing that works.
         if not x.is_cuda:
             out_cpu = dense_reference_w4a16(
                 x, w_fp4=w_fp4, w_blockscale=w_blockscale, w_alpha=w_alpha,
@@ -91,20 +79,28 @@ class DenseGemmW4A16MicroKernel:
             return out
 
         # Unswizzle the FP8 block scales -> [N, K // 16] fp32 once per
-        # call.  This is cheap relative to the matmul and lets the
-        # Triton kernel avoid the swizzle indexing.  v2 will read
-        # swizzled scales directly inside a CuTe-DSL kernel.
+        # call.  Both Triton and CuTe-DSL backends consume the fp32
+        # unswizzled view (v2/v3 CuTe optimization will fold the
+        # swizzle into the kernel itself).
         sf_fp32 = unswizzle_block_scale(
             w_blockscale, rows=n, cols_blocks=k // 16,
         ).contiguous()
+        x_c = x.contiguous()
+        w_c = w_fp4.contiguous()
+        alpha_c = w_alpha.contiguous()
 
-        return w4a16_dense_decode_triton(
-            x.contiguous(),
-            w_fp4.contiguous(),
-            sf_fp32,
-            w_alpha.contiguous(),
-            out=out,
-        )
+        # Optional CuTe-DSL backend (env-gated).  Falls back to Triton
+        # on NotImplementedError / cute compile errors.
+        if _cute_backend_enabled() and DenseGemmW4A16CuteKernel.is_supported(m, k, n):
+            if self._cute is None:
+                self._cute = DenseGemmW4A16CuteKernel()
+            try:
+                return self._cute(x_c, w_c, sf_fp32, alpha_c, out=out)
+            except (NotImplementedError, Exception):
+                # Compile or runtime error — fall through to Triton.
+                pass
+
+        return w4a16_dense_decode_triton(x_c, w_c, sf_fp32, alpha_c, out=out)
 
 
 _KERNEL_CACHE: Optional[DenseGemmW4A16MicroKernel] = None
