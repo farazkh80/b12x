@@ -94,6 +94,54 @@ def test_dense_gemm_w4a16_stub_matches_reference_cpu():
     assert torch.equal(out, ref)
 
 
+NANO35_DENSE_SHAPES = [
+    # (name, K, N)
+    ("q_proj",             2688,   4096),
+    ("k_proj",             2688,    256),
+    ("v_proj",             2688,    256),
+    ("o_proj",             4096,   2688),
+    ("shared_expert.up",   2688,   3712),
+    ("shared_expert.down", 3712,   2688),
+    ("lm_head",            2688, 131072),
+]
+
+
+@pytest.mark.parametrize("name,k,n", NANO35_DENSE_SHAPES, ids=[s[0] for s in NANO35_DENSE_SHAPES])
+@pytest.mark.parametrize("m", [1, 8, 32])
+def test_dense_gemm_w4a16_nano35_accuracy(name, k, n, m):
+    """W4A16 dense matches reference across all Nano35 dense shapes."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    if not DenseGemmW4A16MicroKernel.is_supported(m, k, n):
+        pytest.skip(f"unsupported (m={m}, k={k}, n={n})")
+    device = torch.device("cuda")
+    torch.manual_seed(hash((name, m)) & 0xFFFFFFFF)
+    x = (torch.randn(m, k, dtype=torch.bfloat16, device=device) * 0.5).contiguous()
+    w = (torch.randn(n, k, dtype=torch.bfloat16, device=device) * 0.1).contiguous()
+    w_fp4, w_bs, w_alpha = quantize_dense_weight_to_fp4(w)
+    out = dense_gemm_w4a16(x, w_fp4, w_bs, w_alpha)
+    ref = dense_reference_w4a16(
+        x.cpu(), w_fp4=w_fp4.cpu(), w_blockscale=w_bs.cpu(), w_alpha=w_alpha.cpu(),
+    ).to(device)
+    metrics = compare_to_reference(out, ref)
+    # The reference and kernel both consume the same FP4 weights, so
+    # any non-zero difference is purely MMA tile-order round-off in
+    # bf16 (kernel uses fp32 accumulators but stores bf16).  Output
+    # magnitudes scale as ~sqrt(K) * 0.5 * 0.1 = O(1)..O(10); a 0.04
+    # max-abs is < 1% relative, with cos = 1.0 (down to fp32 precision).
+    assert metrics.cos > 0.9999, f"{name} m={m}: cos={metrics.cos}"
+    # Relative threshold: 1% of the reference's max-abs.  Tile-order
+    # accum differences (kernel uses fp32 accum but stores bf16) plus
+    # bf16 rounding put us comfortably under this on every Nano35
+    # shape we tested.
+    ref_max_abs = ref.abs().max().item()
+    rel_thresh = max(0.04, 0.01 * ref_max_abs)
+    assert metrics.max_abs <= rel_thresh, (
+        f"{name} m={m}: max_abs={metrics.max_abs} cos={metrics.cos} "
+        f"(threshold {rel_thresh:.4f})"
+    )
+
+
 def test_dense_quantize_shapes():
     """Packer produces the expected shapes / dtypes."""
     device = torch.device("cpu")

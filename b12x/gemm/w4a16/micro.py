@@ -1,17 +1,17 @@
 """W4A16 dense GEMM micro kernel for SM120 / SM121.
 
-Decode-only (M ≤ 32).  Designed to consume bf16 activations and
-FP4-packed weights directly, skipping the bf16->FP4 activation quantize
-step that the TRT-LLM ``cuda_core_nvfp4_gemm`` baseline pays per call.
+Decode-only (M ≤ 32).  Consumes bf16 activations and FP4-packed weights
+directly, skipping the bf16->FP4 activation quantize step that the
+TRT-LLM ``cuda_core_nvfp4_gemm`` baseline pays per call.
 
-**v1 status (this file):**
+**v1 implementation:** Triton kernel (``_triton_kernel.py``).  A
+higher-perf CuTe-DSL variant is tracked for v2 — the existing dense
+W4A4 kernel in ``b12x.gemm.dense`` would need bf16-stage A-operand
+plumbing lifted from the W4A16 MoE micro kernel, which is a
+multi-day cute_dsl surgery.
 
-The kernel body has not yet been lifted into ``b12x.gemm.dense`` — that
-is Task 7 of the plan.  Today the public entry stubs through to the
-Python reference (``dense_reference_w4a16``) on the CPU so the API
-contract and shape-discipline are exercised end-to-end.  Set
-``B12X_GEMM_W4A16_FORCE_REFERENCE=1`` to keep the reference path even
-after Task 8 lands (useful for accuracy debugging).
+Set ``B12X_GEMM_W4A16_FORCE_REFERENCE=1`` to fall back to the Python
+reference (useful for accuracy debugging — runs on CPU).
 """
 
 from __future__ import annotations
@@ -21,6 +21,9 @@ from typing import Optional
 
 import torch
 
+from b12x.moe.fused.w4a16.reference import unswizzle_block_scale
+
+from ._triton_kernel import w4a16_dense_decode_triton
 from .reference import dense_reference_w4a16
 
 # Same M ladder as the W4A16 MoE micro kernel.
@@ -64,17 +67,30 @@ class DenseGemmW4A16MicroKernel:
         if out is None:
             out = torch.empty(m, n, dtype=torch.bfloat16, device=x.device)
 
-        # Reference stub.  Move to CPU because the reference uses ops
-        # (e.g. ``torch.float8_e4m3fn`` reshapes) that some CUDA builds
-        # implement only on host.
-        out_cpu = dense_reference_w4a16(
-            x.detach().cpu(),
-            w_fp4=w_fp4.detach().cpu(),
-            w_blockscale=w_blockscale.detach().cpu(),
-            w_alpha=w_alpha.detach().cpu(),
+        # CPU shuttle is unsupported by the Triton kernel.  Fall back
+        # to the reference path if asked to run on CPU.
+        if not x.is_cuda:
+            out_cpu = dense_reference_w4a16(
+                x, w_fp4=w_fp4, w_blockscale=w_blockscale, w_alpha=w_alpha,
+            )
+            out.copy_(out_cpu)
+            return out
+
+        # Unswizzle the FP8 block scales -> [N, K // 16] fp32 once per
+        # call.  This is cheap relative to the matmul and lets the
+        # Triton kernel avoid the swizzle indexing.  v2 will read
+        # swizzled scales directly inside a CuTe-DSL kernel.
+        sf_fp32 = unswizzle_block_scale(
+            w_blockscale, rows=n, cols_blocks=k // 16,
+        ).contiguous()
+
+        return w4a16_dense_decode_triton(
+            x.contiguous(),
+            w_fp4.contiguous(),
+            sf_fp32,
+            w_alpha.contiguous(),
+            out=out,
         )
-        out.copy_(out_cpu.to(out.device))
-        return out
 
 
 _KERNEL_CACHE: Optional[DenseGemmW4A16MicroKernel] = None

@@ -79,19 +79,25 @@ NANO35_LM_HEAD = ("lm_head", 2688, 131072)
 # ---------------------------------------------------------------------------
 
 
-def bench_events(fn: Callable[[], None], *, warmup: int, iters: int) -> list[float]:
-    """Return per-iter latencies in microseconds, median over `iters` calls."""
+def bench_events(fn: Callable[[], None], *, warmup: int, iters: int) -> list[float] | None:
+    """Return per-iter latencies in microseconds, or None if `fn` errors."""
     torch.cuda.synchronize()
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
+    try:
+        for _ in range(warmup):
+            fn()
+        torch.cuda.synchronize()
+    except RuntimeError:
+        return None
     starts = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
     ends = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
-    for i in range(iters):
-        starts[i].record()
-        fn()
-        ends[i].record()
-    torch.cuda.synchronize()
+    try:
+        for i in range(iters):
+            starts[i].record()
+            fn()
+            ends[i].record()
+        torch.cuda.synchronize()
+    except RuntimeError:
+        return None
     return [s.elapsed_time(e) * 1000.0 for s, e in zip(starts, ends)]  # ms -> us
 
 
@@ -217,19 +223,22 @@ def main() -> int:
                 r = make_b12x_runner(x_bf16, w_fp4, w_blockscale, w_alpha)
                 if r is not None:
                     t = bench_events(r, warmup=args.warmup, iters=args.iters)
-                    row["b12x_us"] = round(statistics.median(t), 3)
+                    if t is not None:
+                        row["b12x_us"] = round(statistics.median(t), 3)
 
             if "trtllm" in baselines:
                 r = make_trtllm_runner(x_bf16, w_bf16)
                 if r is not None:
                     t = bench_events(r, warmup=args.warmup, iters=args.iters)
-                    row["trtllm_us"] = round(statistics.median(t), 3)
+                    if t is not None:
+                        row["trtllm_us"] = round(statistics.median(t), 3)
 
             if "flashinfer" in baselines:
                 r = make_flashinfer_runner(x_bf16, w_bf16)
                 if r is not None:
                     t = bench_events(r, warmup=args.warmup, iters=args.iters)
-                    row["fi_us"] = round(statistics.median(t), 3)
+                    if t is not None:
+                        row["fi_us"] = round(statistics.median(t), 3)
 
             # Pretty-print one row
             rows.append(row)
