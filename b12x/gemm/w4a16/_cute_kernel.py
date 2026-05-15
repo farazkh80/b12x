@@ -103,17 +103,17 @@ if _CUTE_AVAILABLE:
             # ``[BLOCK_N, BLOCK_K]``.  No swizzle / no staging — v1 is
             # synchronous; the v3 round will add stages + swizzled
             # layouts once the body is otherwise correct.
+            # Row-major (K stride 1) smem layouts; mirrors the gmem
+            # layout of x and w_fp4 and gives natural K-contiguous
+            # access for the dequant inner loop.
             self.sA_layout = cute.make_ordered_layout(
-                (_BLOCK_M, _BLOCK_K), order=(0, 1),
+                (_BLOCK_M, _BLOCK_K), order=(1, 0),
             )
             self.sB_layout = cute.make_ordered_layout(
-                (_BLOCK_N, _BLOCK_K), order=(0, 1),
+                (_BLOCK_N, _BLOCK_K), order=(1, 0),
             )
-            # Packed FP4 weight smem region — half the K dimension
-            # because FP4 is two-per-byte.  Distinct from sB so the
-            # bf16 dequant target stays untouched until Step 3.
             self.sWpacked_layout = cute.make_ordered_layout(
-                (_BLOCK_N, _BLOCK_K // 2), order=(0, 1),
+                (_BLOCK_N, _BLOCK_K // 2), order=(1, 0),
             )
 
             # ---- Step 1: shared-storage struct ----
@@ -234,16 +234,92 @@ if _CUTE_AVAILABLE:
             cute.copy(gmem_tiled_copy_W, tWgW[None, None, None, 0], tWsW)
             cute.arch.sync_threads()
 
-            # ---------------------------------------------------------
-            # Steps 3-5 (not yet implemented):
+            # ---- Step 3: FP4 nibble dequant -> bf16 in sB ----
             #
-            # (3) Dequant FP4 nibbles -> bf16 in registers, multiply by
-            #     sf+alpha, write into ``sB_bf16``.
+            # Thread layout: tW_layout = (BLOCK_N=64, BLOCK_K/2/8=2),
+            # order=(1, 0).  Thread tidx maps to:
+            #     n_idx = tidx // 2,   k_chunk_idx = tidx % 2
+            # Each thread owns 8 packed bytes = 16 FP4 elements, which
+            # is exactly one FP4 block (sf_vec_size = 16).  That means
+            # each thread reads **one** sf value and applies it to all
+            # 16 decoded values.
+            alpha_val = Float32(alpha_gmem[0])
+
+            n_idx = Int32(tidx // 2)
+            k_chunk_idx = Int32(tidx % 2)
+            global_n = Int32(block_n) * Int32(_BLOCK_N) + n_idx
+
+            sf_val = Float32(sf_gmem[global_n, k_chunk_idx])
+            combined_scale = sf_val * alpha_val
+
+            for byte_idx in cutlass.range_constexpr(8):
+                k_byte = k_chunk_idx * Int32(8) + Int32(byte_idx)
+                k_elem = k_chunk_idx * Int32(16) + Int32(byte_idx) * Int32(2)
+
+                byte = Int32(sWpacked[n_idx, k_byte])
+
+                lo_code = byte & Int32(0xF)
+                hi_code = (byte >> Int32(4)) & Int32(0xF)
+
+                # FP4 magnitude LUT (bits 0..2) -> {0, 0.5, 1.0, 1.5,
+                # 2.0, 3.0, 4.0, 6.0}.  Chained ternary in const_expr
+                # form so the compiler unrolls to a register table.
+                def _mag(mag_code):
+                    return (
+                        Float32(0.0) if mag_code == Int32(0) else
+                        Float32(0.5) if mag_code == Int32(1) else
+                        Float32(1.0) if mag_code == Int32(2) else
+                        Float32(1.5) if mag_code == Int32(3) else
+                        Float32(2.0) if mag_code == Int32(4) else
+                        Float32(3.0) if mag_code == Int32(5) else
+                        Float32(4.0) if mag_code == Int32(6) else
+                        Float32(6.0)
+                    )
+
+                lo_mag = _mag(lo_code & Int32(7))
+                lo_sign = Float32(-1.0) if (lo_code & Int32(8)) != Int32(0) else Float32(1.0)
+                lo_val = lo_sign * lo_mag * combined_scale
+
+                hi_mag = _mag(hi_code & Int32(7))
+                hi_sign = Float32(-1.0) if (hi_code & Int32(8)) != Int32(0) else Float32(1.0)
+                hi_val = hi_sign * hi_mag * combined_scale
+
+                sB_bf16[n_idx, k_elem + Int32(0)] = BFloat16(lo_val)
+                sB_bf16[n_idx, k_elem + Int32(1)] = BFloat16(hi_val)
+
+            cute.arch.sync_threads()
+
+            # ---- Step 3 diagnostic write-back (Constexpr-gated) ----
+            # While Steps 4-5 are pending the MMA-and-store path, the
+            # kernel can be asked to dump the dequantised ``sB`` tile
+            # into ``out_gmem`` transposed (k->m) so we can compare
+            # element-for-element against
+            # ``b12x.gemm.w4a16.reference.dense_reference_w4a16``.
+            #
+            # Disabled in v1 production: when False the kernel writes
+            # nothing, ``out_gmem`` stays at the NaN sentinel, and
+            # ``micro.py`` falls back to the Triton kernel.  Flip to
+            # True locally to bisect any regression in Step 3.
+            DUMP_SB: cutlass.Constexpr = False
+            if cutlass.const_expr(DUMP_SB):
+                for chunk_i in cutlass.range_constexpr(8):
+                    m_pos = Int32(chunk_i) * Int32(2) + (tidx // Int32(64))
+                    n_pos = tidx % Int32(64)
+                    out_gmem[
+                        Int32(block_m) * Int32(_BLOCK_M) + m_pos,
+                        Int32(block_n) * Int32(_BLOCK_N) + n_pos,
+                    ] = sB_bf16[n_pos, m_pos]
+                cute.arch.sync_threads()
+
+            # ---------------------------------------------------------
+            # Steps 4-5 (not yet implemented):
+            #
             # (4) MMA accumulation with ``cute.gemm``, looping over K.
             # (5) Epilogue: fp32 acc -> bf16 -> gmem.
             #
-            # Body stops here for Step 2; output stays NaN so the
-            # micro.py fallback routes to the Triton kernel.
+            # Body stops here for Step 3 — the diagnostic write above
+            # surfaces the dequantized sB tile so we can compare it
+            # against ``dense_reference_w4a16``'s intermediate.
             pass
 
         @cute.jit
@@ -257,29 +333,32 @@ if _CUTE_AVAILABLE:
             stream,
         ):
             self._setup_attributes()
+            # All host tensors are row-major (last dim stride 1) after
+            # the ``.contiguous()`` shuttle in micro.py.  Express that
+            # with ``order=(1, 0)`` (axis 1 is contiguous / stride 1).
             x = cute.make_tensor(
                 x_ptr,
                 layout=cute.make_ordered_layout(
-                    (self.m, self.k), order=(0, 1),
+                    (self.m, self.k), order=(1, 0),
                 ),
             )
             w = cute.make_tensor(
                 w_ptr,
                 layout=cute.make_ordered_layout(
-                    (self.n, self.k // 2), order=(0, 1),
+                    (self.n, self.k // 2), order=(1, 0),
                 ),
             )
             sf = cute.make_tensor(
                 sf_ptr,
                 layout=cute.make_ordered_layout(
-                    (self.n, self.k // _SF_VEC_SIZE), order=(0, 1),
+                    (self.n, self.k // _SF_VEC_SIZE), order=(1, 0),
                 ),
             )
             alpha = cute.make_tensor(alpha_ptr, layout=cute.make_layout((1,)))
             out = cute.make_tensor(
                 out_ptr,
                 layout=cute.make_ordered_layout(
-                    (self.m, self.n), order=(0, 1),
+                    (self.m, self.n), order=(1, 0),
                 ),
             )
 
