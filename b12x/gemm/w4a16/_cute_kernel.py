@@ -53,7 +53,7 @@ except ImportError:
 
 
 _BLOCK_M = 16
-_BLOCK_N = 64
+_BLOCK_N = 32   # matches the tiled-MMA permutation (16, 32, 16) below
 _BLOCK_K = 32
 _NUM_WARPS = 4
 _THREADS_PER_WARP = 32
@@ -90,10 +90,15 @@ if _CUTE_AVAILABLE:
         def _setup_attributes(self):
             """Build MMA + smem layouts + SharedStorage.  Must be called from
             within ``@cute.jit`` (e.g. from ``__call__``)."""
+            # 1 warp along M (BLOCK_M=16), 4 warps along N (each warp
+            # handles 8 N rows via the (16, 8, 16) atom -> total
+            # 4*8 = 32 = BLOCK_N).  Total tile per MMA issue is
+            # (16, 32, 16); the K-loop inside this CTA iterates
+            # BLOCK_K / 16 = 2 times to consume the staged sA/sB tile.
             self.tiled_mma = cute.make_tiled_mma(
                 _warp.MmaF16BF16Op(BFloat16, Float32, (16, 8, 16)),
-                (_NUM_WARPS, 1, 1),
-                permutation_mnk=(_NUM_WARPS * 16, 16, 16),
+                (1, _NUM_WARPS, 1),
+                permutation_mnk=(_BLOCK_M, _BLOCK_N, 16),
             )
 
             # ---- Step 1: smem layouts ----
@@ -155,12 +160,12 @@ if _CUTE_AVAILABLE:
             )  # (16, 8) = 128 threads
             self.vA_layout = cute.make_layout((1, 4))
 
-            # W: (BLOCK_N=64, BLOCK_K/2=16) uint8 = 1024 elems / 128
-            # threads -> 8 elems per thread.
+            # W: (BLOCK_N=32, BLOCK_K/2=16) uint8 = 512 elems / 128
+            # threads -> 4 elems per thread.
             self.tW_layout = cute.make_ordered_layout(
-                (_BLOCK_N, (_BLOCK_K // 2) // 8), order=(1, 0),
-            )  # (64, 2) = 128 threads
-            self.vW_layout = cute.make_layout((1, 8))
+                (_BLOCK_N, (_BLOCK_K // 2) // 4), order=(1, 0),
+            )  # (32, 4) = 128 threads
+            self.vW_layout = cute.make_layout((1, 4))
 
             atom_copy_bf16 = cute.make_copy_atom(
                 cute.nvgpu.CopyUniversalOp(),
@@ -193,6 +198,7 @@ if _CUTE_AVAILABLE:
             sWpacked_layout: cute.Layout,
             gmem_tiled_copy_A: cute.TiledCopy,
             gmem_tiled_copy_W: cute.TiledCopy,
+            tiled_mma: cute.TiledMma,
         ):
             # ---- Step 1: allocate the smem tiles ----
             smem = cutlass.utils.SmemAllocator()
@@ -208,119 +214,160 @@ if _CUTE_AVAILABLE:
             block_m, block_n, _ = cute.arch.block_idx()
             tidx, _, _ = cute.arch.thread_idx()
 
-            # ---- Step 2: gmem -> smem copies for the first K tile ----
-            # Slice the global tensors to this CTA's tile of A and W.
-            # ``local_tile`` partitions a tensor into (tile_shape,
-            # rest_shape) and we pick our CTA's coord.
+            # ---- Setup: slice gmem to this CTA's tile of A, W, and SF ----
             gA = cute.local_tile(
                 x_gmem, (_BLOCK_M, _BLOCK_K), (block_m, None)
-            )  # (BLOCK_M, BLOCK_K, K // BLOCK_K)
+            )  # (BLOCK_M, BLOCK_K, num_k_tiles)
             gW = cute.local_tile(
                 w_gmem, (_BLOCK_N, _BLOCK_K // 2), (block_n, None)
-            )  # (BLOCK_N, BLOCK_K // 2, K // BLOCK_K)
+            )  # (BLOCK_N, BLOCK_K // 2, num_k_tiles)
+            # SF has one scale per FP4 group of 16 elements; per K-tile
+            # this means BLOCK_K // 16 sf-groups.
+            gSF = cute.local_tile(
+                sf_gmem, (_BLOCK_N, _BLOCK_K // _SF_VEC_SIZE), (block_n, None)
+            )  # (BLOCK_N, BLOCK_K / 16, num_k_tiles)
 
-            # Partition each thread's view of the copy source/dest.
+            # Partition copies.  Source has the trailing K-iter axis;
+            # destination smem holds one tile at a time so the K-iter
+            # only appears on source-side slices.
             thr_copy_A = gmem_tiled_copy_A.get_slice(tidx)
-            tAgA = thr_copy_A.partition_S(gA)                # (..., K_iter)
-            tAsA = thr_copy_A.partition_D(sA)                # (...,)
-
+            tAgA = thr_copy_A.partition_S(gA)
+            tAsA = thr_copy_A.partition_D(sA)
             thr_copy_W = gmem_tiled_copy_W.get_slice(tidx)
             tWgW = thr_copy_W.partition_S(gW)
             tWsW = thr_copy_W.partition_D(sWpacked)
 
-            # Issue copies for the first K-tile only (Step 2 is a
-            # single-tile sanity check; the K-loop is part of Step 4).
-            cute.copy(gmem_tiled_copy_A, tAgA[None, None, None, 0], tAsA)
-            cute.copy(gmem_tiled_copy_W, tWgW[None, None, None, 0], tWsW)
-            cute.arch.sync_threads()
+            # ---- Step 4 setup: MMA partitions (one-time per CTA) ----
+            # Output gmem partition.
+            gC = cute.local_tile(
+                out_gmem, (_BLOCK_M, _BLOCK_N), (block_m, block_n)
+            )
+            thr_mma = tiled_mma.get_slice(tidx)
+            tCgC = thr_mma.partition_C(gC)
 
-            # ---- Step 3: FP4 nibble dequant -> bf16 in sB ----
-            #
-            # Thread layout: tW_layout = (BLOCK_N=64, BLOCK_K/2/8=2),
-            # order=(1, 0).  Thread tidx maps to:
-            #     n_idx = tidx // 2,   k_chunk_idx = tidx % 2
-            # Each thread owns 8 packed bytes = 16 FP4 elements, which
-            # is exactly one FP4 block (sf_vec_size = 16).  That means
-            # each thread reads **one** sf value and applies it to all
-            # 16 decoded values.
+            # Register fragments for A/B/C.
+            tCsA = thr_mma.partition_A(sA)
+            tCsB = thr_mma.partition_B(sB_bf16)
+            tCrA = tiled_mma.make_fragment_A(tCsA[None, None, None])
+            tCrB = tiled_mma.make_fragment_B(tCsB[None, None, None])
+
+            acc_shape = tCgC.shape
+            accumulators = cute.make_rmem_tensor(acc_shape, Float32)
+            accumulators.fill(0.0)
+
+            # Smem -> register copy.  Plain element-wise universal copy
+            # (v3 will replace with LdMatrix8x8x16bOp for perf).
+            smem_copy_atom_AB = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(), BFloat16,
+            )
+            smem_tiled_copy_A = cute.make_tiled_copy_A(smem_copy_atom_AB, tiled_mma)
+            smem_tiled_copy_B = cute.make_tiled_copy_B(smem_copy_atom_AB, tiled_mma)
+            thr_smem_copy_A = smem_tiled_copy_A.get_slice(tidx)
+            thr_smem_copy_B = smem_tiled_copy_B.get_slice(tidx)
+            tCsA_copy = thr_smem_copy_A.partition_S(sA)
+            tCsB_copy = thr_smem_copy_B.partition_S(sB_bf16)
+            tCrA_copy_view = thr_smem_copy_A.retile(tCrA)
+            tCrB_copy_view = thr_smem_copy_B.retile(tCrB)
+            num_k_blocks = cute.size(tCrA, mode=[2])
+
+            # Alpha is global (one scalar for the whole call); load once.
             alpha_val = Float32(alpha_gmem[0])
 
-            n_idx = Int32(tidx // 2)
-            k_chunk_idx = Int32(tidx % 2)
-            global_n = Int32(block_n) * Int32(_BLOCK_N) + n_idx
-
-            sf_val = Float32(sf_gmem[global_n, k_chunk_idx])
-            combined_scale = sf_val * alpha_val
-
-            for byte_idx in cutlass.range_constexpr(8):
-                k_byte = k_chunk_idx * Int32(8) + Int32(byte_idx)
-                k_elem = k_chunk_idx * Int32(16) + Int32(byte_idx) * Int32(2)
-
-                byte = Int32(sWpacked[n_idx, k_byte])
-
-                lo_code = byte & Int32(0xF)
-                hi_code = (byte >> Int32(4)) & Int32(0xF)
-
-                # FP4 magnitude LUT (bits 0..2) -> {0, 0.5, 1.0, 1.5,
-                # 2.0, 3.0, 4.0, 6.0}.  Chained ternary in const_expr
-                # form so the compiler unrolls to a register table.
-                def _mag(mag_code):
-                    return (
-                        Float32(0.0) if mag_code == Int32(0) else
-                        Float32(0.5) if mag_code == Int32(1) else
-                        Float32(1.0) if mag_code == Int32(2) else
-                        Float32(1.5) if mag_code == Int32(3) else
-                        Float32(2.0) if mag_code == Int32(4) else
-                        Float32(3.0) if mag_code == Int32(5) else
-                        Float32(4.0) if mag_code == Int32(6) else
-                        Float32(6.0)
-                    )
-
-                lo_mag = _mag(lo_code & Int32(7))
-                lo_sign = Float32(-1.0) if (lo_code & Int32(8)) != Int32(0) else Float32(1.0)
-                lo_val = lo_sign * lo_mag * combined_scale
-
-                hi_mag = _mag(hi_code & Int32(7))
-                hi_sign = Float32(-1.0) if (hi_code & Int32(8)) != Int32(0) else Float32(1.0)
-                hi_val = hi_sign * hi_mag * combined_scale
-
-                sB_bf16[n_idx, k_elem + Int32(0)] = BFloat16(lo_val)
-                sB_bf16[n_idx, k_elem + Int32(1)] = BFloat16(hi_val)
-
-            cute.arch.sync_threads()
-
-            # ---- Step 3 diagnostic write-back (Constexpr-gated) ----
-            # While Steps 4-5 are pending the MMA-and-store path, the
-            # kernel can be asked to dump the dequantised ``sB`` tile
-            # into ``out_gmem`` transposed (k->m) so we can compare
-            # element-for-element against
-            # ``b12x.gemm.w4a16.reference.dense_reference_w4a16``.
-            #
-            # Disabled in v1 production: when False the kernel writes
-            # nothing, ``out_gmem`` stays at the NaN sentinel, and
-            # ``micro.py`` falls back to the Triton kernel.  Flip to
-            # True locally to bisect any regression in Step 3.
-            DUMP_SB: cutlass.Constexpr = False
-            if cutlass.const_expr(DUMP_SB):
-                for chunk_i in cutlass.range_constexpr(8):
-                    m_pos = Int32(chunk_i) * Int32(2) + (tidx // Int32(64))
-                    n_pos = tidx % Int32(64)
-                    out_gmem[
-                        Int32(block_m) * Int32(_BLOCK_M) + m_pos,
-                        Int32(block_n) * Int32(_BLOCK_N) + n_pos,
-                    ] = sB_bf16[n_pos, m_pos]
+            # ---- Step 4b: K-loop over outer K-tiles ----
+            num_k_tiles = cute.size(gA, mode=[2])
+            for k_tile in cutlass.range_constexpr(num_k_tiles):
+                # ---- Step 2: gmem -> smem for this K-tile ----
+                cute.copy(
+                    gmem_tiled_copy_A,
+                    tAgA[None, None, None, k_tile],
+                    tAsA,
+                )
+                cute.copy(
+                    gmem_tiled_copy_W,
+                    tWgW[None, None, None, k_tile],
+                    tWsW,
+                )
                 cute.arch.sync_threads()
 
-            # ---------------------------------------------------------
-            # Steps 4-5 (not yet implemented):
-            #
-            # (4) MMA accumulation with ``cute.gemm``, looping over K.
-            # (5) Epilogue: fp32 acc -> bf16 -> gmem.
-            #
-            # Body stops here for Step 3 — the diagnostic write above
-            # surfaces the dequantized sB tile so we can compare it
-            # against ``dense_reference_w4a16``'s intermediate.
-            pass
+                # ---- Step 3: FP4 nibble dequant -> bf16 in sB ----
+                # Thread layout tW = (BLOCK_N=32, 4) order=(1,0): each
+                # thread owns 4 packed bytes = 8 FP4 elems = half an
+                # sf-block.  Reads one sf value per thread.
+                n_idx = Int32(tidx // 4)
+                k_quarter = Int32(tidx % 4)
+                sf_block_idx = k_quarter // Int32(2)
+                global_n = Int32(block_n) * Int32(_BLOCK_N) + n_idx
+                # sf index along K for this outer K-tile: each k_tile
+                # covers BLOCK_K/16 = 2 sf-groups.
+                global_sf_k = Int32(k_tile) * Int32(_BLOCK_K // _SF_VEC_SIZE) + sf_block_idx
+
+                sf_val = Float32(sf_gmem[global_n, global_sf_k])
+                combined_scale = sf_val * alpha_val
+
+                for byte_idx in cutlass.range_constexpr(4):
+                    k_byte = k_quarter * Int32(4) + Int32(byte_idx)
+                    k_elem = k_quarter * Int32(8) + Int32(byte_idx) * Int32(2)
+                    byte = Int32(sWpacked[n_idx, k_byte])
+                    lo_code = byte & Int32(0xF)
+                    hi_code = (byte >> Int32(4)) & Int32(0xF)
+
+                    def _mag(mag_code):
+                        return (
+                            Float32(0.0) if mag_code == Int32(0) else
+                            Float32(0.5) if mag_code == Int32(1) else
+                            Float32(1.0) if mag_code == Int32(2) else
+                            Float32(1.5) if mag_code == Int32(3) else
+                            Float32(2.0) if mag_code == Int32(4) else
+                            Float32(3.0) if mag_code == Int32(5) else
+                            Float32(4.0) if mag_code == Int32(6) else
+                            Float32(6.0)
+                        )
+
+                    lo_mag = _mag(lo_code & Int32(7))
+                    lo_sign = Float32(-1.0) if (lo_code & Int32(8)) != Int32(0) else Float32(1.0)
+                    hi_mag = _mag(hi_code & Int32(7))
+                    hi_sign = Float32(-1.0) if (hi_code & Int32(8)) != Int32(0) else Float32(1.0)
+                    sB_bf16[n_idx, k_elem + Int32(0)] = BFloat16(lo_sign * lo_mag * combined_scale)
+                    sB_bf16[n_idx, k_elem + Int32(1)] = BFloat16(hi_sign * hi_mag * combined_scale)
+
+                cute.arch.sync_threads()
+
+                # ---- Step 4: MMA over this K-tile's BLOCK_K/16 K-blocks ----
+                for k_block in cutlass.range_constexpr(num_k_blocks):
+                    cute.copy(
+                        smem_tiled_copy_A,
+                        tCsA_copy[None, None, k_block],
+                        tCrA_copy_view[None, None, k_block],
+                    )
+                    cute.copy(
+                        smem_tiled_copy_B,
+                        tCsB_copy[None, None, k_block],
+                        tCrB_copy_view[None, None, k_block],
+                    )
+                    cute.gemm(
+                        tiled_mma,
+                        accumulators,
+                        tCrA[None, None, k_block],
+                        tCrB[None, None, k_block],
+                        accumulators,
+                    )
+                cute.arch.sync_threads()
+
+            # ---- Step 4 diagnostic dump: write fp32 accumulator (bf16 cast) to gmem ----
+            # Step 5 will replace this with the proper epilogue
+            # (tiled smem store + global write).  For v1 we directly
+            # write each thread's accumulator fragments into the
+            # corresponding output positions, which is correct but
+            # uncoalesced.
+            DUMP_ACC: cutlass.Constexpr = True
+            if cutlass.const_expr(DUMP_ACC):
+                acc_bf16 = cute.make_fragment_like(accumulators, BFloat16)
+                acc_bf16.store(accumulators.load().to(BFloat16))
+                cute.copy(
+                    cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), BFloat16),
+                    acc_bf16,
+                    tCgC,
+                )
 
         @cute.jit
         def __call__(
@@ -372,6 +419,7 @@ if _CUTE_AVAILABLE:
                 self.SharedStorage,
                 self.sA_layout, self.sB_layout, self.sWpacked_layout,
                 self.gmem_tiled_copy_A, self.gmem_tiled_copy_W,
+                self.tiled_mma,
             ).launch(
                 grid=grid,
                 block=(_BLOCK_DIM, 1, 1),
@@ -407,8 +455,11 @@ class DenseGemmW4A16CuteKernel:
         from .micro import DenseGemmW4A16MicroKernel
         if not DenseGemmW4A16MicroKernel.is_supported(m, k, n):
             return False
-        # Stricter constraints once the kernel-body is implemented.
-        if m > _BLOCK_M:
+        # v1 cute kernel writes a full (BLOCK_M, BLOCK_N) tile per CTA
+        # with no residual handling.  Restrict to exact-multiple shapes
+        # so we don't write out of bounds on smaller M.  The Triton
+        # backend covers M < BLOCK_M.
+        if m != _BLOCK_M:
             return False
         if n % _BLOCK_N != 0:
             return False
