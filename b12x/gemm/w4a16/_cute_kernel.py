@@ -281,8 +281,14 @@ if _CUTE_AVAILABLE:
             accumulators = cute.make_rmem_tensor(acc_shape, Float32)
             accumulators.fill(0.0)
 
-            # Smem -> register copy.  Plain element-wise universal copy
-            # (v3 will replace with LdMatrix8x8x16bOp for perf).
+            # Smem -> register copy.  Plain element-wise universal
+            # copy.  Attempted LdMatrix8x8x16bOp in v3.2 hit an
+            # illegal memory access: LdMatrix requires either swizzled
+            # smem layouts (as in b12x/gemm/dense.py:190+) or
+            # specifically aligned row-major sub-tiles to match the
+            # 8x8 fragment ldmatrix.x{2,4} instruction's address
+            # pattern.  Tracked for a focused v3.x pass that lifts
+            # dense.py's sm120_make_smem_layout_sf{a,b} swizzles.
             smem_copy_atom_AB = cute.make_copy_atom(
                 cute.nvgpu.CopyUniversalOp(), BFloat16,
             )
@@ -388,6 +394,9 @@ if _CUTE_AVAILABLE:
             # Pattern lifted from b12x/gemm/dense.py:1031-1056 but
             # using CopyUniversalOp instead of StMatrix8x8x16bOp
             # (v3 swap-in for perf).
+            # Register -> smem via CopyUniversalOp (StMatrix attempted
+            # in v3.2 hit the same alignment issue as LdMatrix; see
+            # smem_copy_atom_AB note above).
             copy_atom_r2s = cute.make_copy_atom(
                 cute.nvgpu.CopyUniversalOp(), BFloat16,
             )
