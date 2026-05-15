@@ -28,8 +28,6 @@ errors the public entry falls back to the Triton kernel — see
 ``micro.py``.
 """
 
-from __future__ import annotations
-
 import functools
 import os
 from typing import Optional, Tuple
@@ -75,20 +73,61 @@ def _cute_backend_enabled() -> bool:
 if _CUTE_AVAILABLE:
 
     class _DenseGemmW4A16CuteJit:
-        """JIT-compiled CuTe-DSL kernel for one ``(BLOCK_M, BLOCK_N, BLOCK_K)`` config."""
+        """JIT-compiled CuTe-DSL kernel for one ``(BLOCK_M, BLOCK_N, BLOCK_K)`` config.
+
+        The MMA atom, tiled MMA, smem layouts, and SharedStorage struct
+        are built lazily inside the ``@cute.jit`` scope (in
+        ``_setup_attributes``) because ``cute.make_tiled_mma`` requires
+        an active MLIR context.  See ``b12x/gemm/dense.py`` for the
+        same pattern.
+        """
 
         def __init__(self, m: int, n: int, k: int):
             self.m = m
             self.n = n
             self.k = k
 
+        def _setup_attributes(self):
+            """Build MMA + smem layouts + SharedStorage.  Must be called from
+            within ``@cute.jit`` (e.g. from ``__call__``)."""
             self.tiled_mma = cute.make_tiled_mma(
                 _warp.MmaF16BF16Op(BFloat16, Float32, (16, 8, 16)),
                 (_NUM_WARPS, 1, 1),
                 permutation_mnk=(_NUM_WARPS * 16, 16, 16),
             )
 
-        @cute.jit
+            # ---- Step 1: smem layouts ----
+            # Simple row-major bf16 tiles for the staged operands.
+            # ``sA`` holds the activation tile ``[BLOCK_M, BLOCK_K]``.
+            # ``sB`` holds the *dequantized* weight tile
+            # ``[BLOCK_N, BLOCK_K]``.  No swizzle / no staging — v1 is
+            # synchronous; the v3 round will add stages + swizzled
+            # layouts once the body is otherwise correct.
+            self.sA_layout = cute.make_ordered_layout(
+                (_BLOCK_M, _BLOCK_K), order=(0, 1),
+            )
+            self.sB_layout = cute.make_ordered_layout(
+                (_BLOCK_N, _BLOCK_K), order=(0, 1),
+            )
+
+            # ---- Step 1: shared-storage struct ----
+            buffer_align_bytes = 128
+
+            @cute.struct
+            class SharedStorage:
+                sA: cute.struct.Align[
+                    cute.struct.MemRange[BFloat16, cute.cosize(self.sA_layout)],
+                    buffer_align_bytes,
+                ]
+                sB: cute.struct.Align[
+                    cute.struct.MemRange[BFloat16, cute.cosize(self.sB_layout)],
+                    buffer_align_bytes,
+                ]
+
+            self.SharedStorage = SharedStorage
+            self.smem_bytes = SharedStorage.size_in_bytes()
+
+        @cute.kernel
         def kernel(
             self,
             x_gmem: cute.Tensor,      # [M, K] bf16
@@ -96,52 +135,44 @@ if _CUTE_AVAILABLE:
             sf_gmem: cute.Tensor,     # [N, K // 16] f32 (UNswizzled)
             alpha_gmem: cute.Tensor,  # [1] f32
             out_gmem: cute.Tensor,    # [M, N] bf16
+            SharedStorage: cutlass.Constexpr,
+            sA_layout: cute.Layout,
+            sB_layout: cute.Layout,
         ):
+            # ---- Step 1: allocate the smem tiles ----
+            # Allocates [BLOCK_M, BLOCK_K] bf16 for ``sA`` and
+            # [BLOCK_N, BLOCK_K] bf16 for ``sB``.  The two smem tensors
+            # are typed CuTe ``Tensor`` views over the underlying smem
+            # storage; downstream steps will partition them with the
+            # tiled-MMA's thread-fragments.
+            smem = cutlass.utils.SmemAllocator()
+            storage = smem.allocate(SharedStorage)
+            sA = storage.sA.get_tensor(sA_layout)
+            sB = storage.sB.get_tensor(sB_layout)
+
+            # Compile-time assertion: cosize matches the declared shape.
+            # This forces the cute compiler to validate that the smem
+            # layout is constructible end-to-end (i.e., Step 1 typechecks).
+            cutlass.const_expr(cute.cosize(sA.layout) == _BLOCK_M * _BLOCK_K)
+            cutlass.const_expr(cute.cosize(sB.layout) == _BLOCK_N * _BLOCK_K)
+
             # ---------------------------------------------------------
-            # WIP — kernel body skeleton.
+            # Steps 2-5 (not yet implemented):
             #
-            # Implementation plan (each block is roughly one focused
-            # session's worth of iterating on a live CuTe compiler):
+            # (2) Partition gmem -> smem copies (``cute.copy``).
+            # (3) Dequant FP4 nibbles -> bf16, multiply by sf+alpha,
+            #     store into sB.
+            # (4) MMA accumulation with ``cute.gemm``.
+            # (5) Epilogue: fp32 acc -> bf16 -> gmem.
             #
-            # (1) Smem allocation.  Declare two shared-memory regions:
-            #       sA : (BLOCK_M, BLOCK_K) bf16
-            #       sB : (BLOCK_N, BLOCK_K) bf16 (the *dequantized* W)
-            #     Use ``cute.make_smem_layout`` + ``cute.struct.Align``
-            #     just like ``b12x/attention/contiguous/forward.py``.
-            #
-            # (2) Partition gmem -> smem copies.
-            #     ``thr_copy_a = make_tiled_copy(...).get_slice(tid)``
-            #     ``cute.copy(thr_copy_a, gA, sA)``  for A.
-            #     For W (uint8) we load packed bytes; assign each
-            #     thread a slab of ``(BLOCK_N // num_threads, BLOCK_K // 2)``
-            #     ``uint8`` values.
-            #
-            # (3) Dequant.
-            #     For each FP4 nibble in a thread's W slab: decode the
-            #     magnitude (8-entry LUT chained via const_expr if/else)
-            #     and sign, multiply by the corresponding ``sf_gmem``
-            #     entry (broadcast across the 16-element FP4 group),
-            #     multiply by the scalar alpha, store as bf16 into sB.
-            #     Mirror ``_triton_kernel.py``'s ``_decode`` chain.
-            #
-            # (4) MMA accumulation.
-            #     ``mma = self.tiled_mma.get_slice(tid)``
-            #     ``tCrA = mma.partition_A(sA)``
-            #     ``tCrB = mma.partition_B(sB)``
-            #     ``tCrC = mma.make_fragment_C((BLOCK_M, BLOCK_N))``
-            #     ``cute.gemm(mma, tCrA, tCrB, tCrC)``
-            #
-            # (5) Epilogue.
-            #     Cast ``tCrC`` (fp32) -> bf16 register fragment.
-            #     ``cute.copy(epi_copy, tCrC_bf16, gC_slice)`` to gmem.
-            #
-            # Until (1)-(5) are wired up, raise compile-time so the
-            # outer driver can fall back to the Triton kernel.
-            cutlass.const_expr(
-                False,
-                "CuTe-DSL W4A16 dense kernel body not yet implemented; "
-                "v2 scaffold only.  Triton backend remains the default."
-            )
+            # The kernel body intentionally stops here for v1-step-1.
+            # No output is written; ``micro.py`` recognises this via a
+            # NaN-sentinel on the output buffer and falls back to the
+            # Triton kernel.  (Removing the early ``return`` here is
+            # deliberate — ``@cute.jit`` transforms the function into
+            # a launch-builder and an explicit ``return`` short-circuits
+            # that transformation.)
+            pass
 
         @cute.jit
         def __call__(
@@ -153,6 +184,7 @@ if _CUTE_AVAILABLE:
             out_ptr: cute.Pointer,
             stream,
         ):
+            self._setup_attributes()
             x = cute.make_tensor(
                 x_ptr,
                 layout=cute.make_ordered_layout(
@@ -184,10 +216,13 @@ if _CUTE_AVAILABLE:
                 (self.n + _BLOCK_N - 1) // _BLOCK_N,
                 1,
             )
-            self.kernel(x, w, sf, alpha, out).launch(
+            self.kernel(
+                x, w, sf, alpha, out,
+                self.SharedStorage, self.sA_layout, self.sB_layout,
+            ).launch(
                 grid=grid,
                 block=(_BLOCK_DIM, 1, 1),
-                smem=0,
+                smem=self.smem_bytes,
                 stream=stream,
             )
 
