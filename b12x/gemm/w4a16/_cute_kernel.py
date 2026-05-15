@@ -151,57 +151,51 @@ if _CUTE_AVAILABLE:
             self.SharedStorage = SharedStorage
             self.smem_bytes = SharedStorage.size_in_bytes()
 
-            # ---- Step 2: gmem -> smem tiled-copy descriptors ----
-            # Build two cooperative copies, one per operand.  This v1
-            # uses ``CopyUniversalOp`` at the element width to sidestep
-            # cp.async's 128-bit alignment requirement (the cute
-            # compiler can't yet see our 16-byte pointer alignment past
-            # ``local_tile``).  v3 will switch to 128-bit cp.async once
-            # alignment metadata is propagated via ``recast_tensor``.
-            #
-            # Each thread owns 1 element per copy; total elements per
-            # operand are divided evenly across the 128-thread CTA.
+            # ---- Step 2 (v3.1): gmem -> smem tiled copies via uint32 view ----
+            # The kernel body recasts bf16 / uint8 source tensors to
+            # Uint32 so cute sees wider elements (4 bytes each), then
+            # 128-bit copies = 4 uint32 = 16 bytes per copy.  All Nano35
+            # K dims are 16-byte aligned and our host tensors are
+            # ``.contiguous()``-shuttled to row-major, so the recast is
+            # always safe.
+            atom_copy_u32_128 = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(),
+                cutlass.Uint32,
+                num_bits_per_copy=128,
+            )
 
-            # A: (BLOCK_M=16, BLOCK_K=32) bf16 = 512 elems / 128 threads
-            # -> 4 elems per thread.
+            # A (bf16 view): (BLOCK_M, BLOCK_K)   -> 512 bf16
+            # A (u32 view) : (BLOCK_M, BLOCK_K/2) -> 256 uint32
+            # 64 threads x 4 uint32 = 256 elems = 16 bytes/thread = 128 bits ✓
             self.tA_layout = cute.make_ordered_layout(
-                (_BLOCK_M, _BLOCK_K // 4), order=(1, 0),
-            )  # (16, 8) = 128 threads
+                (_BLOCK_M, (_BLOCK_K // 2) // 4), order=(1, 0),
+            )  # (16, 4) = 64 threads
             self.vA_layout = cute.make_layout((1, 4))
-
-            # W: (BLOCK_N=32, BLOCK_K/2=16) uint8 = 512 elems / 128
-            # threads -> 4 elems per thread.
-            self.tW_layout = cute.make_ordered_layout(
-                (_BLOCK_N, (_BLOCK_K // 2) // 4), order=(1, 0),
-            )  # (32, 4) = 128 threads
-            self.vW_layout = cute.make_layout((1, 4))
-
-            atom_copy_bf16 = cute.make_copy_atom(
-                cute.nvgpu.CopyUniversalOp(),
-                BFloat16,
-                num_bits_per_copy=BFloat16.width,  # 16 bits / element
-            )
-            atom_copy_u8 = cute.make_copy_atom(
-                cute.nvgpu.CopyUniversalOp(),
-                Uint8,
-                num_bits_per_copy=8,
-            )
             self.gmem_tiled_copy_A = cute.make_tiled_copy_tv(
-                atom_copy_bf16, self.tA_layout, self.vA_layout,
-            )
-            self.gmem_tiled_copy_W = cute.make_tiled_copy_tv(
-                atom_copy_u8, self.tW_layout, self.vW_layout,
+                atom_copy_u32_128, self.tA_layout, self.vA_layout,
             )
 
-            # Epilogue smem -> gmem tiled copy (Step 5).
-            # (BLOCK_M=16) x (BLOCK_N=32) = 512 elems / 128 threads ->
-            # 4 elems per thread.
+            # W (u8 view):  (BLOCK_N, BLOCK_K/2)   -> 512 uint8
+            # W (u32 view): (BLOCK_N, BLOCK_K/8)   -> 128 uint32
+            # 32 threads x 4 uint32 = 128 elems = 16 bytes/thread = 128 bits ✓
+            self.tW_layout = cute.make_ordered_layout(
+                (_BLOCK_N, (_BLOCK_K // 8) // 4), order=(1, 0),
+            )  # (32, 1) = 32 threads
+            self.vW_layout = cute.make_layout((1, 4))
+            self.gmem_tiled_copy_W = cute.make_tiled_copy_tv(
+                atom_copy_u32_128, self.tW_layout, self.vW_layout,
+            )
+
+            # Epilogue smem -> gmem tiled copy (Step 5, v3.1).
+            # sC (bf16 view): (BLOCK_M, BLOCK_N)   -> 512 bf16
+            # sC (u32 view) : (BLOCK_M, BLOCK_N/2) -> 256 uint32
+            # 64 threads x 4 uint32 = 16 bytes/thread = 128 bits ✓
             self.tC_layout = cute.make_ordered_layout(
-                (_BLOCK_M, _BLOCK_N // 4), order=(1, 0),
-            )  # (16, 8) = 128 threads
+                (_BLOCK_M, (_BLOCK_N // 2) // 4), order=(1, 0),
+            )  # (16, 4) = 64 threads
             self.vC_layout = cute.make_layout((1, 4))
             self.gmem_tiled_copy_C = cute.make_tiled_copy_tv(
-                atom_copy_bf16, self.tC_layout, self.vC_layout,
+                atom_copy_u32_128, self.tC_layout, self.vC_layout,
             )
 
         @cute.kernel
@@ -239,27 +233,35 @@ if _CUTE_AVAILABLE:
             tidx, _, _ = cute.arch.thread_idx()
 
             # ---- Setup: slice gmem to this CTA's tile of A, W, and SF ----
+            # gmem copies operate on a Uint32 view of the operands so
+            # cute can issue 128-bit (4-uint32) loads.  sA / sWpacked
+            # are likewise recast to Uint32 for the dest side; their
+            # Step 3 readers (bf16 / uint8) see the same underlying
+            # bytes via a separate recast.
+            x_u32 = cute.recast_tensor(x_gmem, cutlass.Uint32)
+            w_u32 = cute.recast_tensor(w_gmem, cutlass.Uint32)
+            sA_u32 = cute.recast_tensor(sA, cutlass.Uint32)
+            sWpacked_u32 = cute.recast_tensor(sWpacked, cutlass.Uint32)
+
             gA = cute.local_tile(
-                x_gmem, (_BLOCK_M, _BLOCK_K), (block_m, None)
-            )  # (BLOCK_M, BLOCK_K, num_k_tiles)
+                x_u32, (_BLOCK_M, _BLOCK_K // 2), (block_m, None)
+            )  # uint32 view, (BLOCK_M, BLOCK_K/2, num_k_tiles)
             gW = cute.local_tile(
-                w_gmem, (_BLOCK_N, _BLOCK_K // 2), (block_n, None)
-            )  # (BLOCK_N, BLOCK_K // 2, num_k_tiles)
-            # SF has one scale per FP4 group of 16 elements; per K-tile
-            # this means BLOCK_K // 16 sf-groups.
+                w_u32, (_BLOCK_N, _BLOCK_K // 8), (block_n, None)
+            )  # uint32 view, (BLOCK_N, BLOCK_K/8, num_k_tiles)
+            # SF has one scale per FP4 group of 16 elements; kept as
+            # fp32 because dequant reads it as a scalar per thread.
             gSF = cute.local_tile(
                 sf_gmem, (_BLOCK_N, _BLOCK_K // _SF_VEC_SIZE), (block_n, None)
             )  # (BLOCK_N, BLOCK_K / 16, num_k_tiles)
 
-            # Partition copies.  Source has the trailing K-iter axis;
-            # destination smem holds one tile at a time so the K-iter
-            # only appears on source-side slices.
+            # Partition copies via uint32 view.
             thr_copy_A = gmem_tiled_copy_A.get_slice(tidx)
             tAgA = thr_copy_A.partition_S(gA)
-            tAsA = thr_copy_A.partition_D(sA)
+            tAsA = thr_copy_A.partition_D(sA_u32)
             thr_copy_W = gmem_tiled_copy_W.get_slice(tidx)
             tWgW = thr_copy_W.partition_S(gW)
-            tWsW = thr_copy_W.partition_D(sWpacked)
+            tWsW = thr_copy_W.partition_D(sWpacked_u32)
 
             # ---- Step 4 setup: MMA partitions (one-time per CTA) ----
             # Output gmem partition.
@@ -405,10 +407,14 @@ if _CUTE_AVAILABLE:
             cute.arch.sync_threads()
 
             # sC -> gmem via the cooperative tiled copy built in
-            # _setup_attributes (128 threads, 4 bf16 each).
+            # _setup_attributes.  Recast sC and gC to Uint32 so the
+            # 128-bit cooperative store fires (16 bytes / thread, 64
+            # threads cover the 512-bf16 = 256-uint32 output tile).
+            sC_u32 = cute.recast_tensor(sC, cutlass.Uint32)
+            gC_u32 = cute.recast_tensor(gC, cutlass.Uint32)
             thr_gmem_copy_C = gmem_tiled_copy_C.get_slice(tidx)
-            tCsC_for_gmem = thr_gmem_copy_C.partition_S(sC)
-            tCgC_for_gmem = thr_gmem_copy_C.partition_D(gC)
+            tCsC_for_gmem = thr_gmem_copy_C.partition_S(sC_u32)
+            tCgC_for_gmem = thr_gmem_copy_C.partition_D(gC_u32)
             cute.copy(gmem_tiled_copy_C, tCsC_for_gmem, tCgC_for_gmem)
 
         @cute.jit
