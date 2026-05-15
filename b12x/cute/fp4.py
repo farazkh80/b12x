@@ -276,7 +276,7 @@ def ld_global_v4_u32(
         [Int64(base_ptr).ir_value(loc=loc, ip=ip)],
         "ld.global.v4.u32 {$0, $1, $2, $3}, [$4];",
         "=r,=r,=r,=r,l",
-        has_side_effects=False,
+        has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
         loc=loc,
@@ -340,7 +340,7 @@ def ld_global_nc_v2_u32(
         [Int64(base_ptr).ir_value(loc=loc, ip=ip)],
         "ld.global.nc.v2.u32 {$0, $1}, [$2];",
         "=r,=r,l",
-        has_side_effects=False,
+        has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
         loc=loc,
@@ -362,7 +362,7 @@ def ld_global_nc_v4_u32(
         [Int64(base_ptr).ir_value(loc=loc, ip=ip)],
         "ld.global.nc.v4.u32 {$0, $1, $2, $3}, [$4];",
         "=r,=r,=r,=r,l",
-        has_side_effects=False,
+        has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
         loc=loc,
@@ -504,6 +504,63 @@ def st_global_v4_f32(
 
 
 @dsl_user_op
+def ld_global_v4_f32(
+    base_ptr: Int64,
+    *,
+    loc=None,
+    ip=None,
+) -> Tuple[Float32, Float32, Float32, Float32]:
+    """Load 128 bits (4 x float32) from global memory."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32(), T.f32(), T.f32()]),
+        [Int64(base_ptr).ir_value(loc=loc, ip=ip)],
+        "ld.global.v4.f32 {$0, $1, $2, $3}, [$4];",
+        "=f,=f,=f,=f,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    r0 = llvm.extractvalue(T.f32(), result, [0], loc=loc, ip=ip)
+    r1 = llvm.extractvalue(T.f32(), result, [1], loc=loc, ip=ip)
+    r2 = llvm.extractvalue(T.f32(), result, [2], loc=loc, ip=ip)
+    r3 = llvm.extractvalue(T.f32(), result, [3], loc=loc, ip=ip)
+    return Float32(r0), Float32(r1), Float32(r2), Float32(r3)
+
+
+@dsl_user_op
+def st_global_v4_u32(
+    base_ptr: Int64,
+    v0: Uint32,
+    v1: Uint32,
+    v2: Uint32,
+    v3: Uint32,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Store 128 bits (4 x uint32) to global memory."""
+    llvm.inline_asm(
+        None,
+        [
+            Int64(base_ptr).ir_value(loc=loc, ip=ip),
+            Uint32(v0).ir_value(loc=loc, ip=ip),
+            Uint32(v1).ir_value(loc=loc, ip=ip),
+            Uint32(v2).ir_value(loc=loc, ip=ip),
+            Uint32(v3).ir_value(loc=loc, ip=ip),
+        ],
+        "st.global.v4.u32 [$0], {$1, $2, $3, $4};",
+        "l,r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def smem_ptr_to_addr(ptr: cute.Pointer, *, loc=None, ip=None) -> Int32:
     """Convert a generic/smem pointer to a shared-memory u32 address for PTX."""
     generic_addr = llvm.ptrtoint(T.i64(), ptr.llvm_ptr, loc=loc, ip=ip)
@@ -545,6 +602,25 @@ def ldmatrix_m8n8x4_b16(smem_addr: Int32, *, loc=None, ip=None) -> Tuple[Uint32,
     r2 = llvm.extractvalue(T.i32(), result, [2], loc=loc, ip=ip)
     r3 = llvm.extractvalue(T.i32(), result, [3], loc=loc, ip=ip)
     return Uint32(r0), Uint32(r1), Uint32(r2), Uint32(r3)
+
+
+@dsl_user_op
+def ldmatrix_m8n8x2_b16(smem_addr: Int32, *, loc=None, ip=None) -> Tuple[Uint32, Uint32]:
+    """Issue `ldmatrix.sync.aligned.m8n8.x2.shared.b16` from a shared-memory byte address."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [Int32(smem_addr).ir_value(loc=loc, ip=ip)],
+        "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {$0, $1}, [$2];",
+        "=r,=r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    r0 = llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)
+    r1 = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
+    return Uint32(r0), Uint32(r1)
 
 
 @dsl_user_op
@@ -654,7 +730,7 @@ def ld_shared_v4_u32(smem_addr: Int32, *, loc=None, ip=None) -> Tuple[Uint32, Ui
         [Int32(smem_addr).ir_value(loc=loc, ip=ip)],
         "ld.shared.v4.u32 {$0, $1, $2, $3}, [$4];",
         "=r,=r,=r,=r,r",
-        has_side_effects=False,
+        has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
         loc=loc,
@@ -665,6 +741,25 @@ def ld_shared_v4_u32(smem_addr: Int32, *, loc=None, ip=None) -> Tuple[Uint32, Ui
     r2 = llvm.extractvalue(T.i32(), result, [2], loc=loc, ip=ip)
     r3 = llvm.extractvalue(T.i32(), result, [3], loc=loc, ip=ip)
     return Uint32(r0), Uint32(r1), Uint32(r2), Uint32(r3)
+
+
+@dsl_user_op
+def ld_shared_v2_u32(smem_addr: Int32, *, loc=None, ip=None) -> Tuple[Uint32, Uint32]:
+    """Load 64 bits (2 x uint32) from shared memory."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [Int32(smem_addr).ir_value(loc=loc, ip=ip)],
+        "ld.shared.v2.u32 {$0, $1}, [$2];",
+        "=r,=r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    r0 = llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)
+    r1 = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
+    return Uint32(r0), Uint32(r1)
 
 
 @dsl_user_op
@@ -727,6 +822,69 @@ def st_shared_u8(smem_addr: Int32, value: Uint8, *, loc=None, ip=None):
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def cp_async4_shared_global(smem_addr: Int32, gmem_addr: Int64, *, loc=None, ip=None):
+    """16-byte `cp.async.cg.shared.global` copy."""
+    llvm.inline_asm(
+        None,
+        [
+            Int32(smem_addr).ir_value(loc=loc, ip=ip),
+            Int64(gmem_addr).ir_value(loc=loc, ip=ip),
+        ],
+        "cp.async.cg.shared.global [$0], [$1], 16;",
+        "r,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def cp_async4_shared_global_pred(
+    smem_addr: Int32, gmem_addr: Int64, pred: Int32, *, loc=None, ip=None
+):
+    """Predicated 16-byte `cp.async.cg.shared.global` copy."""
+    llvm.inline_asm(
+        None,
+        [
+            Int32(pred).ir_value(loc=loc, ip=ip),
+            Int32(smem_addr).ir_value(loc=loc, ip=ip),
+            Int64(gmem_addr).ir_value(loc=loc, ip=ip),
+        ],
+        "{ .reg .pred p; setp.ne.b32 p, $0, 0; @p cp.async.cg.shared.global [$1], [$2], 16; }",
+        "r,r,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def cp_async4_ca_shared_global_pred(
+    smem_addr: Int32, gmem_addr: Int64, pred: Int32, *, loc=None, ip=None
+):
+    """Predicated 16-byte `cp.async.ca.shared.global` copy."""
+    llvm.inline_asm(
+        None,
+        [
+            Int32(pred).ir_value(loc=loc, ip=ip),
+            Int32(smem_addr).ir_value(loc=loc, ip=ip),
+            Int64(gmem_addr).ir_value(loc=loc, ip=ip),
+        ],
+        "{ .reg .pred p; setp.ne.b32 p, $0, 0; @p cp.async.ca.shared.global [$1], [$2], 16; }",
+        "r,r,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
     )
 
 
@@ -870,14 +1028,32 @@ def ld_shared_i32(addr: Int32, *, loc=None, ip=None) -> Int32:
 
 @dsl_user_op
 def ld_shared_i32_relaxed(addr: Int32, *, loc=None, ip=None) -> Int32:
-    """Load int32 from shared memory when ordinary scheduling/CSE is safe."""
+    """Load int32 from shared memory at a 32-bit byte address."""
     return Int32(
         llvm.inline_asm(
             T.i32(),
             [Int32(addr).ir_value(loc=loc, ip=ip)],
             "ld.shared.s32 $0, [$1];",
             "=r,r",
-            has_side_effects=False,
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def ld_shared_u32(addr: Int32, *, loc=None, ip=None) -> Uint32:
+    """Load uint32 from shared memory at a 32-bit byte address."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int32(addr).ir_value(loc=loc, ip=ip)],
+            "ld.shared.u32 $0, [$1];",
+            "=r,r",
+            has_side_effects=True,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
             loc=loc,
@@ -906,6 +1082,25 @@ def st_shared_i32(addr: Int32, val: Int32, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def st_shared_u32(addr: Int32, val: Uint32, *, loc=None, ip=None):
+    """Store uint32 to shared memory at a 32-bit byte address."""
+    llvm.inline_asm(
+        None,
+        [
+            Int32(addr).ir_value(loc=loc, ip=ip),
+            Uint32(val).ir_value(loc=loc, ip=ip),
+        ],
+        "st.shared.u32 [$0], $1;",
+        "r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def ld_shared_f32(addr: Int32, *, loc=None, ip=None) -> Float32:
     """Load float32 from shared memory at a 32-bit byte address."""
     return Float32(
@@ -914,13 +1109,36 @@ def ld_shared_f32(addr: Int32, *, loc=None, ip=None) -> Float32:
             [Int32(addr).ir_value(loc=loc, ip=ip)],
             "ld.shared.f32 $0, [$1];",
             "=f,r",
-            has_side_effects=False,
+            has_side_effects=True,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
             loc=loc,
             ip=ip,
         )
     )
+
+
+@dsl_user_op
+def ld_shared_v4_f32(
+    addr: Int32, *, loc=None, ip=None
+) -> Tuple[Float32, Float32, Float32, Float32]:
+    """Load 128 bits (4 x float32) from shared memory."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32(), T.f32(), T.f32()]),
+        [Int32(addr).ir_value(loc=loc, ip=ip)],
+        "ld.shared.v4.f32 {$0, $1, $2, $3}, [$4];",
+        "=f,=f,=f,=f,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    r0 = llvm.extractvalue(T.f32(), result, [0], loc=loc, ip=ip)
+    r1 = llvm.extractvalue(T.f32(), result, [1], loc=loc, ip=ip)
+    r2 = llvm.extractvalue(T.f32(), result, [2], loc=loc, ip=ip)
+    r3 = llvm.extractvalue(T.f32(), result, [3], loc=loc, ip=ip)
+    return Float32(r0), Float32(r1), Float32(r2), Float32(r3)
 
 
 
@@ -933,7 +1151,7 @@ def ld_shared_bf16_to_f32(addr: Int32, *, loc=None, ip=None) -> Float32:
             [Int32(addr).ir_value(loc=loc, ip=ip)],
             "{.reg .b16 tmp; ld.shared.b16 tmp, [$1]; cvt.f32.bf16 $0, tmp;}",
             "=f,r",
-            has_side_effects=False,
+            has_side_effects=True,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
             loc=loc,
@@ -952,6 +1170,75 @@ def st_shared_f32(addr: Int32, val: Float32, *, loc=None, ip=None):
             Float32(val).ir_value(loc=loc, ip=ip),
         ],
         "st.shared.f32 [$0], $1;",
+        "r,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def st_shared_v4_f32(
+    addr: Int32,
+    v0: Float32,
+    v1: Float32,
+    v2: Float32,
+    v3: Float32,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Store 128 bits (4 x float32) to shared memory."""
+    llvm.inline_asm(
+        None,
+        [
+            Int32(addr).ir_value(loc=loc, ip=ip),
+            Float32(v0).ir_value(loc=loc, ip=ip),
+            Float32(v1).ir_value(loc=loc, ip=ip),
+            Float32(v2).ir_value(loc=loc, ip=ip),
+            Float32(v3).ir_value(loc=loc, ip=ip),
+        ],
+        "st.shared.v4.f32 [$0], {$1, $2, $3, $4};",
+        "r,f,f,f,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def st_shared_bf16_from_f32(addr: Int32, val: Float32, *, loc=None, ip=None):
+    """Convert float32 to BF16 and store one 16-bit value to shared memory."""
+    llvm.inline_asm(
+        None,
+        [
+            Int32(addr).ir_value(loc=loc, ip=ip),
+            Float32(val).ir_value(loc=loc, ip=ip),
+        ],
+        "{ .reg .b16 tmp; cvt.rn.bf16.f32 tmp, $1; st.shared.b16 [$0], tmp; }",
+        "r,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def st_shared_f16_from_f32(addr: Int32, val: Float32, *, loc=None, ip=None):
+    """Convert float32 to FP16 and store one 16-bit value to shared memory."""
+    llvm.inline_asm(
+        None,
+        [
+            Int32(addr).ir_value(loc=loc, ip=ip),
+            Float32(val).ir_value(loc=loc, ip=ip),
+        ],
+        "{ .reg .b16 tmp; cvt.rn.f16.f32 tmp, $1; st.shared.b16 [$0], tmp; }",
         "r,f",
         has_side_effects=True,
         is_align_stack=False,
@@ -992,7 +1279,7 @@ def ld_global_acquire_i32(addr: Int64, *, loc=None, ip=None) -> Int32:
             [Int64(addr).ir_value(loc=loc, ip=ip)],
             "ld.global.acquire.gpu.s32 $0, [$1];",
             "=r,l",
-            has_side_effects=False,
+            has_side_effects=True,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
             loc=loc,
@@ -1236,6 +1523,22 @@ def half2_mul(a: Uint32, b: Uint32, *, loc=None, ip=None) -> Uint32:
 
 
 @dsl_user_op
+def broadcast_f32_to_half2(x: Float32, *, loc=None, ip=None) -> Uint32:
+    """Pack one float32 value into both lanes of an f16x2 register."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Float32(x).ir_value(loc=loc, ip=ip)],
+            "cvt.rn.f16x2.f32 $0, $1, $1;",
+            "=r,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
 def hadd2(a: Uint32, b: Uint32, *, loc=None, ip=None) -> Uint32:
     """Add two Half2 values element-wise: (a.x+b.x, a.y+b.y)."""
     return Uint32(
@@ -1358,6 +1661,39 @@ def bfloat2_mul(a: Uint32, b: Uint32, *, loc=None, ip=None) -> Uint32:
             has_side_effects=False,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def bfloat2_broadcast_lane(x: Uint32, lane: Int32, *, loc=None, ip=None) -> Uint32:
+    """Duplicate one BF16 lane from a packed bf16x2 register into both lanes."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                Uint32(x).ir_value(loc=loc, ip=ip),
+                Int32(lane).ir_value(loc=loc, ip=ip),
+            ],
+            """
+            {
+                .reg .pred p;
+                .reg .b32 lo, hi, val, shifted;
+                and.b32 lo, $1, 0x0000ffff;
+                shr.u32 hi, $1, 16;
+                setp.eq.s32 p, $2, 0;
+                @p  mov.b32 val, lo;
+                @!p mov.b32 val, hi;
+                shl.b32 shifted, val, 16;
+                or.b32 $0, val, shifted;
+            }
+            """,
+            "=r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
         )
     )
 
@@ -1504,6 +1840,160 @@ def fp8x4_e4m3_to_bfloat2x2(packed: Uint32, *, loc=None, ip=None) -> Tuple[Uint3
 
 
 @dsl_user_op
+def packed_dequant_e2m1x4_to_bfloat2x2(
+    packed: Uint32, *, loc=None, ip=None
+) -> Tuple[Uint32, Uint32]:
+    """FE2M1 -> BF16 register dequant for one packed 4-value fragment."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [Uint32(packed).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .b32 q, out1, out2, tmp;
+
+            and.b32 out1, $2, 0x80008000;
+            and.b32 tmp, $2, 0x70007000;
+            shr.u32 tmp, tmp, 6;
+            or.b32 out1, out1, tmp;
+
+            shl.b32 q, $2, 4;
+            and.b32 out2, q, 0x80008000;
+            and.b32 tmp, q, 0x70007000;
+            shr.u32 tmp, tmp, 6;
+            or.b32 out2, out2, tmp;
+
+            mov.b32 $0, out2;
+            mov.b32 $1, out1;
+        }
+        """,
+        "=r,=r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    lo = llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)
+    hi = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
+    return Uint32(lo), Uint32(hi)
+
+
+@dsl_user_op
+def packed_dequant_e2m1x4_to_half2x2(
+    packed: Uint32, *, loc=None, ip=None
+) -> Tuple[Uint32, Uint32]:
+    """FE2M1 -> FP16 register dequant for one packed 4-value fragment."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [Uint32(packed).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .b32 q, out1, out2, tmp;
+
+            and.b32 out1, $2, 0x80008000;
+            and.b32 tmp, $2, 0x70007000;
+            shr.u32 tmp, tmp, 3;
+            or.b32 out1, out1, tmp;
+
+            shl.b32 q, $2, 4;
+            and.b32 out2, q, 0x80008000;
+            and.b32 tmp, q, 0x70007000;
+            shr.u32 tmp, tmp, 3;
+            or.b32 out2, out2, tmp;
+
+            mov.b32 $0, out2;
+            mov.b32 $1, out1;
+        }
+        """,
+        "=r,=r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    lo = llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)
+    hi = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
+    return Uint32(lo), Uint32(hi)
+
+
+@dsl_user_op
+def packed_dequant_e4m3x4_to_bfloat2x2(
+    packed: Uint32, *, loc=None, ip=None
+) -> Tuple[Uint32, Uint32]:
+    """FE4M3 scale dequant for one packed 4-value BF16 fragment."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [Uint32(packed).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .b32 q, out1, out2, tmp;
+
+            and.b32 tmp, $2, 0x80008000;
+            shr.u32 out1, tmp, 1;
+            and.b32 tmp, $2, 0x7F007F00;
+            shr.u32 tmp, tmp, 4;
+            or.b32 out1, out1, tmp;
+
+            shl.b32 q, $2, 8;
+            and.b32 tmp, q, 0x80008000;
+            shr.u32 out2, tmp, 1;
+            and.b32 tmp, q, 0x7F007F00;
+            shr.u32 tmp, tmp, 4;
+            or.b32 out2, out2, tmp;
+
+            mov.b32 $0, out2;
+            mov.b32 $1, out1;
+        }
+        """,
+        "=r,=r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    lo = llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)
+    hi = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
+    return Uint32(lo), Uint32(hi)
+
+
+@dsl_user_op
+def packed_dequant_e4m3x4_to_half2x2(
+    packed: Uint32, *, loc=None, ip=None
+) -> Tuple[Uint32, Uint32]:
+    """FE4M3 scale dequant for one packed 4-value FP16 fragment."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [Uint32(packed).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .b32 q, out1, out2;
+
+            and.b32 out1, $2, 0xFF00FF00;
+            shr.u32 out1, out1, 1;
+
+            shl.b32 q, $2, 8;
+            and.b32 out2, q, 0xFF00FF00;
+            shr.u32 out2, out2, 1;
+
+            mov.b32 $0, out2;
+            mov.b32 $1, out1;
+        }
+        """,
+        "=r,=r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    lo = llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)
+    hi = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
+    return Uint32(lo), Uint32(hi)
+
+
+@dsl_user_op
 def bf16_mma_m16n8k16_f32(
     d0: Float32,
     d1: Float32,
@@ -1523,25 +2013,185 @@ def bf16_mma_m16n8k16_f32(
     result = llvm.inline_asm(
         llvm.StructType.get_literal([T.f32(), T.f32(), T.f32(), T.f32()]),
         [
-            Float32(d0).ir_value(loc=loc, ip=ip),
-            Float32(d1).ir_value(loc=loc, ip=ip),
-            Float32(d2).ir_value(loc=loc, ip=ip),
-            Float32(d3).ir_value(loc=loc, ip=ip),
             Uint32(a0).ir_value(loc=loc, ip=ip),
             Uint32(a1).ir_value(loc=loc, ip=ip),
             Uint32(a2).ir_value(loc=loc, ip=ip),
             Uint32(a3).ir_value(loc=loc, ip=ip),
             Uint32(b0).ir_value(loc=loc, ip=ip),
             Uint32(b1).ir_value(loc=loc, ip=ip),
+            Float32(d0).ir_value(loc=loc, ip=ip),
+            Float32(d1).ir_value(loc=loc, ip=ip),
+            Float32(d2).ir_value(loc=loc, ip=ip),
+            Float32(d3).ir_value(loc=loc, ip=ip),
         ],
         """
         mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32
         {$0, $1, $2, $3},
         {$4, $5, $6, $7},
         {$8, $9},
-        {$0, $1, $2, $3};
+        {$10, $11, $12, $13};
         """,
-        "=f,=f,=f,=f,r,r,r,r,r,r,0,1,2,3",
+        "=f,=f,=f,=f,r,r,r,r,r,r,f,f,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    r0 = llvm.extractvalue(T.f32(), result, [0], loc=loc, ip=ip)
+    r1 = llvm.extractvalue(T.f32(), result, [1], loc=loc, ip=ip)
+    r2 = llvm.extractvalue(T.f32(), result, [2], loc=loc, ip=ip)
+    r3 = llvm.extractvalue(T.f32(), result, [3], loc=loc, ip=ip)
+    return Float32(r0), Float32(r1), Float32(r2), Float32(r3)
+
+
+@dsl_user_op
+def f16_mma_m16n8k16_f32(
+    d0: Float32,
+    d1: Float32,
+    d2: Float32,
+    d3: Float32,
+    a0: Uint32,
+    a1: Uint32,
+    a2: Uint32,
+    a3: Uint32,
+    b0: Uint32,
+    b1: Uint32,
+    *,
+    loc=None,
+    ip=None,
+) -> Tuple[Float32, Float32, Float32, Float32]:
+    """Warp MMA helper for `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32`."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32(), T.f32(), T.f32()]),
+        [
+            Uint32(a0).ir_value(loc=loc, ip=ip),
+            Uint32(a1).ir_value(loc=loc, ip=ip),
+            Uint32(a2).ir_value(loc=loc, ip=ip),
+            Uint32(a3).ir_value(loc=loc, ip=ip),
+            Uint32(b0).ir_value(loc=loc, ip=ip),
+            Uint32(b1).ir_value(loc=loc, ip=ip),
+            Float32(d0).ir_value(loc=loc, ip=ip),
+            Float32(d1).ir_value(loc=loc, ip=ip),
+            Float32(d2).ir_value(loc=loc, ip=ip),
+            Float32(d3).ir_value(loc=loc, ip=ip),
+        ],
+        """
+        mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+        {$0, $1, $2, $3},
+        {$4, $5, $6, $7},
+        {$8, $9},
+        {$10, $11, $12, $13};
+        """,
+        "=f,=f,=f,=f,r,r,r,r,r,r,f,f,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    r0 = llvm.extractvalue(T.f32(), result, [0], loc=loc, ip=ip)
+    r1 = llvm.extractvalue(T.f32(), result, [1], loc=loc, ip=ip)
+    r2 = llvm.extractvalue(T.f32(), result, [2], loc=loc, ip=ip)
+    r3 = llvm.extractvalue(T.f32(), result, [3], loc=loc, ip=ip)
+    return Float32(r0), Float32(r1), Float32(r2), Float32(r3)
+
+
+@dsl_user_op
+def bf16_mma_rhs_fragments_as_mma_a_m16n8k16_f32(
+    d0: Float32,
+    d1: Float32,
+    d2: Float32,
+    d3: Float32,
+    b0_0: Uint32,
+    b1_0: Uint32,
+    b0_1: Uint32,
+    b1_1: Uint32,
+    a0: Uint32,
+    a1: Uint32,
+    *,
+    loc=None,
+    ip=None,
+) -> Tuple[Float32, Float32, Float32, Float32]:
+    """BF16 MMA form used by the routed m-block-size-8 path.
+
+    The dequantized RHS fragments feed the hardware A operand, while the
+    routed activation fragment loaded with `ldmatrix.x2` feeds hardware B.
+    """
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32(), T.f32(), T.f32()]),
+        [
+            Uint32(b0_0).ir_value(loc=loc, ip=ip),
+            Uint32(b1_0).ir_value(loc=loc, ip=ip),
+            Uint32(b0_1).ir_value(loc=loc, ip=ip),
+            Uint32(b1_1).ir_value(loc=loc, ip=ip),
+            Uint32(a0).ir_value(loc=loc, ip=ip),
+            Uint32(a1).ir_value(loc=loc, ip=ip),
+            Float32(d0).ir_value(loc=loc, ip=ip),
+            Float32(d1).ir_value(loc=loc, ip=ip),
+            Float32(d2).ir_value(loc=loc, ip=ip),
+            Float32(d3).ir_value(loc=loc, ip=ip),
+        ],
+        """
+        mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32
+        {$0, $1, $2, $3},
+        {$4, $5, $6, $7},
+        {$8, $9},
+        {$10, $11, $12, $13};
+        """,
+        "=f,=f,=f,=f,r,r,r,r,r,r,f,f,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    r0 = llvm.extractvalue(T.f32(), result, [0], loc=loc, ip=ip)
+    r1 = llvm.extractvalue(T.f32(), result, [1], loc=loc, ip=ip)
+    r2 = llvm.extractvalue(T.f32(), result, [2], loc=loc, ip=ip)
+    r3 = llvm.extractvalue(T.f32(), result, [3], loc=loc, ip=ip)
+    return Float32(r0), Float32(r1), Float32(r2), Float32(r3)
+
+
+@dsl_user_op
+def f16_mma_rhs_fragments_as_mma_a_m16n8k16_f32(
+    d0: Float32,
+    d1: Float32,
+    d2: Float32,
+    d3: Float32,
+    b0_0: Uint32,
+    b1_0: Uint32,
+    b0_1: Uint32,
+    b1_1: Uint32,
+    a0: Uint32,
+    a1: Uint32,
+    *,
+    loc=None,
+    ip=None,
+) -> Tuple[Float32, Float32, Float32, Float32]:
+    """FP16 MMA form used by the routed m-block-size-8 path."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32(), T.f32(), T.f32()]),
+        [
+            Uint32(b0_0).ir_value(loc=loc, ip=ip),
+            Uint32(b1_0).ir_value(loc=loc, ip=ip),
+            Uint32(b0_1).ir_value(loc=loc, ip=ip),
+            Uint32(b1_1).ir_value(loc=loc, ip=ip),
+            Uint32(a0).ir_value(loc=loc, ip=ip),
+            Uint32(a1).ir_value(loc=loc, ip=ip),
+            Float32(d0).ir_value(loc=loc, ip=ip),
+            Float32(d1).ir_value(loc=loc, ip=ip),
+            Float32(d2).ir_value(loc=loc, ip=ip),
+            Float32(d3).ir_value(loc=loc, ip=ip),
+        ],
+        """
+        mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+        {$0, $1, $2, $3},
+        {$4, $5, $6, $7},
+        {$8, $9},
+        {$10, $11, $12, $13};
+        """,
+        "=f,=f,=f,=f,r,r,r,r,r,r,f,f,f,f",
         has_side_effects=False,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,

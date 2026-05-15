@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-import torch.nn.functional as F
 from b12x.cute.fp4 import fp4_quantize_values_torch
 
 
@@ -40,11 +39,19 @@ def compare_to_reference(actual: torch.Tensor, reference: torch.Tensor) -> Oracl
     actual_fp32 = actual.float()
     reference_fp32 = reference.float()
     diff = actual_fp32 - reference_fp32
-    cos = F.cosine_similarity(
-        actual_fp32.reshape(actual_fp32.shape[0], -1),
-        reference_fp32.reshape(reference_fp32.shape[0], -1),
-        dim=1,
-    ).mean().item()
+    actual_rows = actual_fp32.reshape(actual_fp32.shape[0], -1)
+    reference_rows = reference_fp32.reshape(reference_fp32.shape[0], -1)
+    dot = (actual_rows * reference_rows).sum(dim=1)
+    actual_norm = actual_rows.norm(dim=1)
+    reference_norm = reference_rows.norm(dim=1)
+    denom = actual_norm * reference_norm
+    both_zero = (actual_norm <= 1e-12) & (reference_norm <= 1e-12)
+    cos_rows = torch.where(
+        both_zero,
+        torch.ones_like(dot),
+        torch.where(denom > 1e-24, dot / denom, torch.zeros_like(dot)),
+    )
+    cos = cos_rows.mean().item()
     return OracleMetrics(
         max_abs=diff.abs().max().item(),
         rmse=diff.square().mean().sqrt().item(),

@@ -34,17 +34,6 @@ from b12x.moe.fused.micro import (
     _direct_k_segments_for_k,
     _direct_k_segments_supported,
 )
-from b12x.moe.fused.w4a16.relu2 import (
-    MoEDynamicKernelRelu2 as W4A16MoEDynamicKernelRelu2,
-    MoEMicroKernelRelu2 as W4A16MoEMicroKernelRelu2,
-    MoEStaticKernelRelu2 as W4A16MoEStaticKernelRelu2,
-)
-from b12x.moe.fused.w4a16.fc2_direct_mma import compile_w4a16_fc2_direct_mma
-from b12x.moe.fused.w4a16.silu import (
-    MoEDynamicKernelSilu as W4A16MoEDynamicKernelSilu,
-    MoEMicroKernelSilu as W4A16MoEMicroKernelSilu,
-    MoEStaticKernelSilu as W4A16MoEStaticKernelSilu,
-)
 from b12x.moe.tuning import lookup_max_active_clusters
 from b12x.runtime_control import raise_if_kernel_resolution_frozen
 
@@ -52,10 +41,14 @@ _NVFP4_BLOCK_SIZE = 16
 _RUNTIME_MEMREF_LIMIT = (1 << 31) - 1
 _LEVEL_TILE_M = 128
 _LEVEL_TILE_N = 128
-_W4A16_LEVEL_TILE_M = 32
-_W4A16_LEVEL_TILE_N = 64
 _DYNAMIC_SLICE_CHUNK = 1
 _MOE_FORCE_A16_ENV = "B12X_MOE_FORCE_A16"
+_FP4_SOURCE_FORMATS = {
+    "modelopt": "modelopt",
+    "compressed_tensors": "compressed_tensors",
+    "compressed-tensors": "compressed_tensors",
+    "ct": "compressed_tensors",
+}
 
 
 @dataclass(kw_only=True)
@@ -184,6 +177,14 @@ class B12XFP4ExpertWeights:
     w2_fp4: torch.Tensor
     w2_blockscale: torch.Tensor
     w2_alphas: torch.Tensor
+    source_format: str = "modelopt"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "source_format",
+            _normalize_fp4_source_format(self.source_format),
+        )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -343,24 +344,6 @@ _ACTIVATION_KERNEL_SPECS = {
 }
 
 
-_W4A16_ACTIVATION_KERNEL_SPECS = {
-    "silu": _ActivationKernelSpec(
-        activation="silu",
-        is_gated=True,
-        micro_kernel_cls=W4A16MoEMicroKernelSilu,
-        static_kernel_cls=W4A16MoEStaticKernelSilu,
-        dynamic_kernel_cls=W4A16MoEDynamicKernelSilu,
-    ),
-    "relu2": _ActivationKernelSpec(
-        activation="relu2",
-        is_gated=False,
-        micro_kernel_cls=W4A16MoEMicroKernelRelu2,
-        static_kernel_cls=W4A16MoEStaticKernelRelu2,
-        dynamic_kernel_cls=W4A16MoEDynamicKernelRelu2,
-    ),
-}
-
-
 def _env_flag(name: str, *, default: bool) -> bool:
     value = os.environ.get(name)
     if value is None:
@@ -381,6 +364,25 @@ def _normalize_quant_mode(quant_mode: str | None) -> str:
     return normalized
 
 
+def _normalize_fp4_source_format(source_format: str) -> str:
+    try:
+        return _FP4_SOURCE_FORMATS[source_format.lower()]
+    except KeyError as exc:
+        raise ValueError(
+            "source_format must be one of 'modelopt' or 'compressed_tensors', "
+            f"got {source_format!r}"
+        ) from exc
+
+
+def _validate_fp4_source_format_for_quant_mode(*, source_format: str, quant_mode: str) -> None:
+    if source_format == "compressed_tensors" and quant_mode != "w4a16":
+        raise ValueError(
+            "source_format='compressed_tensors' is only supported with "
+            "quant_mode='w4a16'; the NVFP4 kernels currently support only "
+            "source_format='modelopt'"
+        )
+
+
 def _assert_reciprocal_input_scale_contract(input_scales_are_reciprocal: bool | None) -> None:
     assert input_scales_are_reciprocal is None or input_scales_are_reciprocal is True, (
         "input_scales_are_reciprocal is deprecated; b12x always expects reciprocal input scales"
@@ -392,26 +394,34 @@ def _get_activation_kernel_spec(
     *,
     quant_mode: str = "nvfp4",
 ) -> _ActivationKernelSpec:
-    specs = (
-        _W4A16_ACTIVATION_KERNEL_SPECS
-        if _normalize_quant_mode(quant_mode) == "w4a16"
-        else _ACTIVATION_KERNEL_SPECS
-    )
+    if _normalize_quant_mode(quant_mode) == "w4a16":
+        raise ValueError("W4A16 dispatch uses b12x.moe.fused.w4a16.kernel directly")
     try:
-        return specs[activation]
+        return _ACTIVATION_KERNEL_SPECS[activation]
     except KeyError as exc:
         raise ValueError(f"unsupported activation {activation!r}") from exc
 
 
+def _activation_w1_rows(activation: str, n: int) -> int:
+    if activation == "silu":
+        return 2 * n
+    if activation == "relu2":
+        return n
+    raise ValueError(f"unsupported activation {activation!r}")
+
+
 def _dynamic_tile_n(quant_mode: str = "nvfp4") -> int:
-    return _W4A16_LEVEL_TILE_N if _normalize_quant_mode(quant_mode) == "w4a16" else _LEVEL_TILE_N
+    _normalize_quant_mode(quant_mode)
+    return _LEVEL_TILE_N
 
 
 def _dynamic_tile_m(quant_mode: str = "nvfp4") -> int:
-    return _W4A16_LEVEL_TILE_M if _normalize_quant_mode(quant_mode) == "w4a16" else _LEVEL_TILE_M
+    _normalize_quant_mode(quant_mode)
+    return _LEVEL_TILE_M
 
 
 _WEIGHT_CACHE: Dict[Tuple[int, int, int], _WeightViews] = {}
+_W4A16_PACKED_WEIGHT_CACHE: Dict[Tuple[object, ...], object] = {}
 _MICRO_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
 _STATIC_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
 _DYNAMIC_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
@@ -421,7 +431,6 @@ _W4A16_ALPHA_CACHE: Dict[Tuple, torch.Tensor] = {}
 _MICRO_COMPACT_CUTOVER_PAIRS_DEFAULT = 20
 _MICRO_COMPACT_CUTOVER_PAIRS_MULTI_TOPK_DEFAULT = 80
 _STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT = 640
-_W4A16_STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT = 128
 _MICRO_COMPACT_CUTOVER_PAIRS_CACHE: int | None = None
 _STATIC_COMPACT_CUTOVER_PAIRS_CACHE: Dict[str, int] = {}
 _DYNAMIC_MULTICTA_CACHE: bool | None = None
@@ -434,7 +443,6 @@ _EXACT_RELU2_BS1_NEMOTRON_CACHE: Dict[Tuple, _ExactRelu2Bs1NemotronLauncher] = {
 _LAST_EXACT_RELU2_BS1_NEMOTRON: Tuple = (None, None)  # (cache_key, launcher)
 _CURRENT_DISPATCH_STAGE: str | None = None
 _DIRECT_MICRO_SHAPE_ATTR = "_b12x_direct_micro_shape"
-_W4A16_DIRECT_MICRO_MAX_TOKENS = 32
 
 
 @contextmanager
@@ -454,6 +462,8 @@ def clear_tp_moe_caches() -> None:
     Explicit workspaces and workspace pools are caller-owned and intentionally
     unaffected by this helper.
     """
+    from b12x.moe.fused.w4a16.kernel import clear_w4a16_kernel_cache
+
     global _LAST_WEIGHTS
     global _LAST_KERNEL
     global _LAST_EXACT_RELU2_BS1_NEMOTRON
@@ -463,6 +473,8 @@ def clear_tp_moe_caches() -> None:
     global _DYNAMIC_CHUNK_MULTIPLIER_CACHE
     global _DYNAMIC_DOWN_SCALE_CACHE
     _WEIGHT_CACHE.clear()
+    _W4A16_PACKED_WEIGHT_CACHE.clear()
+    clear_w4a16_kernel_cache()
     _MICRO_KERNEL_CACHE.clear()
     _STATIC_KERNEL_CACHE.clear()
     _DYNAMIC_KERNEL_CACHE.clear()
@@ -496,20 +508,13 @@ def _get_static_compact_cutover_pairs(quant_mode: str = "nvfp4") -> int:
     quant_mode = _normalize_quant_mode(quant_mode)
     cached = _STATIC_COMPACT_CUTOVER_PAIRS_CACHE.get(quant_mode)
     if cached is None:
-        cutover_names = (
+        cutover = _first_env(
             "B12X_STATIC_COMPACT_CUTOVER_PAIRS",
             "B12X_DYNAMIC_STATIC_CUTOVER_PAIRS",
             "B12X_LEVEL10_STATIC_CUTOVER_PAIRS",
         )
-        if quant_mode == "w4a16":
-            cutover_names = ("B12X_W4A16_STATIC_COMPACT_CUTOVER_PAIRS", *cutover_names)
-        cutover = _first_env(*cutover_names)
         if cutover is None:
-            cached = (
-                _W4A16_STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT
-                if quant_mode == "w4a16"
-                else _STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT
-            )
+            cached = _STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT
         else:
             cached = max(0, int(cutover))
         _STATIC_COMPACT_CUTOVER_PAIRS_CACHE[quant_mode] = cached
@@ -563,10 +568,6 @@ def _get_relu2_bs1_spark_micro_cap() -> int:
     if cap is None:
         return 42
     return max(1, int(cap))
-
-
-def _w4a16_fc2_mma_enabled() -> bool:
-    return _env_flag("B12X_W4A16_FC2_MMA", default=False)
 
 
 def _flatten_routing_ids(topk_ids: torch.Tensor) -> torch.Tensor:
@@ -881,23 +882,6 @@ def _refresh_dynamic_workspace_scales(
 
 def _finalize_workspace_views(workspace: TPMoEWorkspace) -> None:
     sf_dtype = cutlass.Float8E4M3FN
-    if workspace.quant_mode == "w4a16":
-        workspace.packed_a_view = workspace.packed_input.permute(1, 2, 0)
-        workspace.packed_a_flat = workspace.packed_input.view(torch.uint8)
-        workspace.scale_flat = workspace.packed_input_scale.view(-1)
-        workspace.sfa_ptr = make_ptr(
-            sf_dtype,
-            workspace.packed_input_scale.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        )
-        workspace.packed_a_storage_ptr = make_ptr(
-            cutlass.Uint8,
-            workspace.packed_a_flat.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        )
-        return
     # Keep as uint8 — the float4 element type is conveyed to CUTLASS via
     # _gptr / compile-time dtype, and dlpack does not support float4.
     workspace.packed_a_view = workspace.packed_input.permute(1, 2, 0)
@@ -957,26 +941,13 @@ def _plan_core_workspace(
     quant_mode = _normalize_quant_mode(quant_mode)
     cols_pad_k = align_up(k // _NVFP4_BLOCK_SIZE, 4)
     direct_micro_tokens = max(1, routed_rows // max(1, num_topk))
-    if quant_mode == "w4a16":
-        direct_micro_k_supported = (
-            k > 0
-            and k % _NVFP4_BLOCK_SIZE == 0
-            and k % 128 == 0
-            and _direct_k_segments_supported(_direct_k_segments_for_k(k))
-        )
-        direct_micro_token_supported = (
-            0 < direct_micro_tokens <= _W4A16_DIRECT_MICRO_MAX_TOKENS
-        )
-        direct_micro_resource_supported = not (direct_micro_tokens >= 4 and n >= 4096)
-    else:
-        direct_micro_k_supported = (
-            k > 0
-            and k % _NVFP4_BLOCK_SIZE == 0
-            and k % 128 == 0
-            and _direct_k_segments_supported(_direct_k_segments_for_k(k))
-        )
-        direct_micro_token_supported = direct_micro_tokens in (1, 2, 4, 8)
-        direct_micro_resource_supported = True
+    direct_micro_k_supported = (
+        k > 0
+        and k % _NVFP4_BLOCK_SIZE == 0
+        and k % 128 == 0
+        and _direct_k_segments_supported(_direct_k_segments_for_k(k))
+    )
+    direct_micro_token_supported = direct_micro_tokens in (1, 2, 4, 8)
     direct_micro_candidate = (
         implementation == "static"
         and n % _NVFP4_BLOCK_SIZE == 0
@@ -985,7 +956,6 @@ def _plan_core_workspace(
         and weight_E > 0
         and routed_rows == direct_micro_tokens * num_topk
         and direct_micro_token_supported
-        and direct_micro_resource_supported
     )
     barrier_slots = max(1, routed_rows)
     if direct_micro_candidate:
@@ -996,14 +966,9 @@ def _plan_core_workspace(
         _TensorAllocSpec("barrier_epoch", (barrier_slots,), torch.int32, init="zeros"),
     )
     if implementation == "static":
-        if quant_mode == "w4a16":
-            max_rows = max(max_rows, 128)
         static_rows_pad_k = align_up(max_rows, 128)
         packed_input_shape = (state_E, max_rows, k // 2)
         packed_input_dtype = torch.uint8
-        if quant_mode == "w4a16":
-            packed_input_shape = (state_E, max_rows, k)
-            packed_input_dtype = torch.bfloat16
         micro_intermediate_elements = state_E * n
         if direct_micro_candidate:
             fc2_n_chunks = (n // 2 + 127) // 128
@@ -1057,9 +1022,6 @@ def _plan_core_workspace(
     dynamic_rows_padded = dynamic_tiles * dynamic_tile_m
     packed_input_shape = (1, dynamic_rows_padded, k // 2)
     packed_input_dtype = torch.uint8
-    if quant_mode == "w4a16":
-        packed_input_shape = (1, dynamic_rows_padded, k)
-        packed_input_dtype = torch.bfloat16
     return _TPCoreWorkspacePlan(
         implementation=implementation,
         quant_mode=quant_mode,
@@ -1408,6 +1370,50 @@ def _get_weight_views(
     _WEIGHT_CACHE[key] = views
     _LAST_WEIGHTS = (key, views)
     return views
+
+
+def _get_w4a16_packed_weights(
+    w1_fp4: torch.Tensor,
+    w1_blockscale: torch.Tensor,
+    w1_alphas: torch.Tensor,
+    w2_fp4: torch.Tensor,
+    w2_blockscale: torch.Tensor,
+    w2_alphas: torch.Tensor,
+    *,
+    activation: str,
+    params_dtype: torch.dtype,
+    source_format: str = "modelopt",
+):
+    from b12x.moe.fused.w4a16.prepare import prepare_w4a16_packed_weights
+
+    source_format = _normalize_fp4_source_format(source_format)
+    key = (
+        w1_fp4.data_ptr(),
+        w1_blockscale.data_ptr(),
+        w1_alphas.data_ptr(),
+        w2_fp4.data_ptr(),
+        w2_blockscale.data_ptr(),
+        w2_alphas.data_ptr(),
+        activation,
+        params_dtype,
+        source_format,
+    )
+    cached = _W4A16_PACKED_WEIGHT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    prepared = prepare_w4a16_packed_weights(
+        w1_fp4,
+        w1_blockscale,
+        w1_alphas,
+        w2_fp4,
+        w2_blockscale,
+        w2_alphas,
+        activation=activation,
+        params_dtype=params_dtype,
+        source_format=source_format,
+    )
+    _W4A16_PACKED_WEIGHT_CACHE[key] = prepared
+    return prepared
 
 
 def _resolve_workspace_layout(
@@ -2016,16 +2022,6 @@ def _select_micro_mma_tiler_mn(
     return (128, 128)
 
 
-def _select_w4a16_micro_mma_tiler_mn(max_rows: int, n: int) -> tuple[int, int]:
-    if os.environ.get("B12X_MOE_TILE_MN"):
-        return tuple(int(x) for x in os.environ["B12X_MOE_TILE_MN"].split("x"))
-    # The W4A16 compact micro path follows the old micro structure, but the
-    # BF16 inline-dequant tile contract needs a 64-wide N/K tile.
-    if max_rows <= 128:
-        return (64, 64)
-    return (128, 64)
-
-
 def _get_static_kernel(
     state_E: int,
     weight_E: int,
@@ -2049,15 +2045,9 @@ def _get_static_kernel(
     sf_vec_size = 16
     mac = mac_override if mac_override is not None else _get_impl_mac("static")
     routed_rows = m * num_topk
-    # The W4A16 static path follows the BF16 fused-kernel tile contract:
-    # FC1 N is reused as FC2 K, and a 64-wide BF16 tile keeps the gated
-    # A/B/up-B/C shared-memory footprint within the SM120 launch limit.
-    if quant_mode == "w4a16":
-        mma_tiler_mn = (32, 128) if routed_rows <= 100 or routed_rows >= 320 else (32, 64)
-    else:
-        mma_tiler_mn = (128, 128)
-    dynamic_down_scale = False if quant_mode == "w4a16" else _dynamic_down_scale_enabled()
-    if quant_mode != "w4a16" and num_topk > 1:
+    mma_tiler_mn = (128, 128)
+    dynamic_down_scale = _dynamic_down_scale_enabled()
+    if num_topk > 1:
         mma_tiler_mn = _select_micro_mma_tiler_mn(routed_rows, n, resident_clusters=mac)
 
     global _LAST_KERNEL
@@ -2079,7 +2069,7 @@ def _get_static_kernel(
 
 
     weight_dtype = cutlass.Float4E2M1FN
-    a_scratch_dtype = cutlass.BFloat16 if quant_mode == "w4a16" else weight_dtype
+    a_scratch_dtype = weight_dtype
     sf_dtype = cutlass.Float8E4M3FN
     a_dtype = cutlass.BFloat16
     alpha_dtype = cutlass.Float32
@@ -2118,8 +2108,6 @@ def _get_static_kernel(
     )
     sfa_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     packed_a_storage_elements = state_E * max_rows * (k // 2)
-    if quant_mode == "w4a16":
-        packed_a_storage_elements = state_E * max_rows * k * _dtype_nbytes(torch.bfloat16)
     packed_a_storage_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Uint8, (packed_a_storage_elements,), assumed_align=16,
     )
@@ -2196,160 +2184,6 @@ def _get_static_kernel(
     return result
 
 
-def _get_w4a16_micro_compact_kernel(
-    state_E: int,
-    weight_E: int,
-    m: int,
-    k: int,
-    n: int,
-    num_topk: int,
-    max_rows: int,
-    *,
-    topk_ids_dtype: torch.dtype,
-    fast_math: bool,
-    mac_override: int | None = None,
-    activation: str = "silu",
-    single_token: bool = False,
-    share_input_across_experts: bool = False,
-    share_expert_scales: bool = False,
-):
-    quant_mode = "w4a16"
-    activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
-    sf_vec_size = 16
-    mac = mac_override if mac_override is not None else _get_impl_mac("micro")
-    routed_rows = m * num_topk
-    mma_tiler_mn = _select_w4a16_micro_mma_tiler_mn(routed_rows, n)
-    dynamic_down_scale = False
-
-    global _LAST_KERNEL
-    cache_key = (
-        quant_mode, "micro_compact", state_E, weight_E, m, k, n, num_topk,
-        max_rows, mac, mma_tiler_mn, topk_ids_dtype,
-        fast_math, activation, single_token, share_input_across_experts,
-        share_expert_scales, dynamic_down_scale,
-    )
-    last_kkey, last_kval = _LAST_KERNEL
-    if last_kkey == cache_key:
-        return last_kval
-    reuse_compiled = os.environ.get("B12X_MICRO_REUSE_COMPILED", "1") != "0"
-    if reuse_compiled:
-        cached = _MICRO_KERNEL_CACHE.get(cache_key)
-        if cached is not None:
-            _LAST_KERNEL = (cache_key, cached)
-            return cached
-
-    weight_dtype = cutlass.Float4E2M1FN
-    sf_dtype = cutlass.Float8E4M3FN
-    a_dtype = cutlass.BFloat16
-    alpha_dtype = cutlass.Float32
-
-    kernel = activation_spec.make_micro_kernel(
-        sf_vec_size=sf_vec_size,
-        mma_tiler_mn=mma_tiler_mn,
-        output_tile_count_n=max(1, (n + mma_tiler_mn[1] - 1) // mma_tiler_mn[1]),
-        fast_math=fast_math,
-        share_input_across_experts=share_input_across_experts,
-        share_expert_scales=share_expert_scales,
-        single_token=single_token,
-        dynamic_down_scale=dynamic_down_scale,
-    )
-
-    rows_pad_k = align_up(max_rows, 128)
-    cols_pad_k = align_up(k // _NVFP4_BLOCK_SIZE, 4)
-
-    a_input_fake = cute.runtime.make_fake_compact_tensor(
-        a_dtype, (m, k), stride_order=(1, 0), assumed_align=16,
-    )
-    topk_ids_cutlass_dtype = cutlass.Int32 if topk_ids_dtype == torch.int32 else cutlass.Int64
-    topk_ids_align = 4 if topk_ids_dtype == torch.int32 else 8
-    topk_ids_fake = cute.runtime.make_fake_compact_tensor(
-        topk_ids_cutlass_dtype, (m * num_topk,), assumed_align=topk_ids_align,
-    )
-    topk_weights_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32, (m * num_topk,), assumed_align=4,
-    )
-    packed_a_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.BFloat16, (max_rows, k, state_E), stride_order=(1, 0, 2), assumed_align=16,
-    )
-    sfa_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
-    packed_a_storage_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Uint8,
-        (state_E * max_rows * k * _dtype_nbytes(torch.bfloat16),),
-        assumed_align=16,
-    )
-    scale_storage_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Uint8, (state_E * rows_pad_k * cols_pad_k,), assumed_align=16,
-    )
-    barrier_count_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (1,), assumed_align=4,
-    )
-    barrier_epoch_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (1,), assumed_align=4,
-    )
-    w1_n = activation_spec.w1_rows(n)
-    b_w13_fake = cute.runtime.make_fake_compact_tensor(
-        weight_dtype, (w1_n, k, weight_E), stride_order=(1, 0, 2), assumed_align=16,
-    )
-    sfb_w13_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
-    b_down_fake = cute.runtime.make_fake_compact_tensor(
-        weight_dtype, (k, n, weight_E), stride_order=(1, 0, 2), assumed_align=16,
-    )
-    sfb_down_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
-    row_counts_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (state_E,), assumed_align=4,
-    )
-    active_expert_count_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (1,), assumed_align=4,
-    )
-    weight_expert_ids_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (state_E,), assumed_align=4,
-    )
-    global_to_local_expert_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (weight_E,), assumed_align=4,
-    )
-    input_gs_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype, (weight_E,), assumed_align=16,
-    )
-    alpha_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype, (weight_E,), assumed_align=16,
-    )
-    down_alpha_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype, (weight_E,), assumed_align=16,
-    )
-    global_scale_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype, (weight_E,), assumed_align=16,
-    )
-    scatter_fake = cute.runtime.make_fake_compact_tensor(
-        a_dtype, (m, k), stride_order=(1, 0), assumed_align=16,
-    )
-    token_map_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (state_E, max_rows), stride_order=(1, 0), assumed_align=4,
-    )
-    token_weights_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype, (state_E, max_rows), stride_order=(1, 0), assumed_align=16,
-    )
-    raise_if_kernel_resolution_frozen("cute.compile", target=kernel, cache_key=cache_key)
-    compiled = cute.compile(
-        kernel,
-        a_input_fake, topk_ids_fake, topk_weights_fake,
-        packed_a_fake, sfa_fake,
-        packed_a_storage_fake, scale_storage_fake,
-        barrier_count_fake, barrier_epoch_fake,
-        b_w13_fake, sfb_w13_fake,
-        b_down_fake, sfb_down_fake,
-        row_counts_fake, active_expert_count_fake, weight_expert_ids_fake, global_to_local_expert_fake,
-        input_gs_fake, alpha_fake, down_alpha_fake, global_scale_fake,
-        scatter_fake, token_map_fake, token_weights_fake,
-        mac, current_cuda_stream(),
-    )
-
-    result = (compiled, mac)
-    if reuse_compiled:
-        _MICRO_KERNEL_CACHE[cache_key] = result
-    _LAST_KERNEL = (cache_key, result)
-    return result
-
-
 def _get_micro_kernel(
     weight_E: int,
     m: int,
@@ -2370,23 +2204,7 @@ def _get_micro_kernel(
     quant_mode = _normalize_quant_mode(quant_mode)
     activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
     mac = mac_override if mac_override is not None else _get_impl_mac("micro")
-    if (
-        mac_override is None
-        and quant_mode == "w4a16"
-        and m > 1
-        and _first_env("B12X_MICRO_MAX_ACTIVE_CLUSTERS") is None
-    ):
-        mac = min(mac, 148 if m == 4 else 60)
-    if (
-        mac_override is None
-        and quant_mode == "w4a16"
-        and m > 8
-        and _first_env("B12X_MICRO_MAX_ACTIVE_CLUSTERS") is None
-    ):
-        # Static-window W4A16 direct batches are L1TEX/DRAM-bound; a slightly
-        # smaller resident grid reduces memory pressure on bs10-32.
-        mac = min(mac, 171)
-    dynamic_down_scale = False if quant_mode == "w4a16" else _dynamic_down_scale_enabled()
+    dynamic_down_scale = _dynamic_down_scale_enabled()
 
     global _LAST_KERNEL
     cache_key = (
@@ -2467,176 +2285,7 @@ def _get_micro_kernel(
     return result
 
 
-def _get_w4a16_fc1_direct_kernel(
-    weight_E: int,
-    m: int,
-    k: int,
-    n: int,
-    num_topk: int,
-    *,
-    topk_ids_dtype: torch.dtype,
-    fast_math: bool,
-    share_input_across_experts: bool = False,
-    share_expert_scales: bool = False,
-    single_token: bool = False,
-    activation: str = "relu2",
-    device: torch.device | None = None,
-):
-    activation_spec = _get_activation_kernel_spec(activation, quant_mode="w4a16")
-    mac = _get_impl_mac("micro")
-    if m > 1 and _first_env("B12X_MICRO_MAX_ACTIVE_CLUSTERS") is None:
-        mac = min(mac, 148 if m == 4 else 60)
-    if m > 8 and _first_env("B12X_MICRO_MAX_ACTIVE_CLUSTERS") is None:
-        mac = min(mac, 171)
-
-    global _LAST_KERNEL
-    cache_key = (
-        "w4a16_fc1_direct_phase",
-        m,
-        k,
-        n,
-        num_topk,
-        weight_E,
-        topk_ids_dtype,
-        mac,
-        fast_math,
-        share_input_across_experts,
-        share_expert_scales,
-        single_token,
-        activation,
-    )
-    last_kkey, last_kval = _LAST_KERNEL
-    if last_kkey == cache_key:
-        return last_kval
-    reuse_compiled = os.environ.get("B12X_MICRO_REUSE_COMPILED", "1") != "0"
-    if reuse_compiled:
-        cached = _MICRO_KERNEL_CACHE.get(cache_key)
-        if cached is not None:
-            _LAST_KERNEL = (cache_key, cached)
-            return cached
-
-    kernel = activation_spec.make_micro_kernel(
-        sf_vec_size=16,
-        mma_tiler_mn=(64, 128),
-        output_tile_count_n=1,
-        fast_math=fast_math,
-        share_input_across_experts=share_input_across_experts,
-        share_expert_scales=share_expert_scales,
-        single_token=single_token,
-        dynamic_down_scale=False,
-        compile_time_phase=1,
-    )
-    kernel.configure(m, k, n, num_topk, weight_E, max_active_ctas=mac, device=device)
-
-    def dummy(dt):
-        return make_ptr(dt, 16, cute.AddressSpace.gmem, assumed_align=16)
-
-    ids_dtype = cutlass.Int32 if topk_ids_dtype == torch.int32 else cutlass.Int64
-    barrier_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (1,), assumed_align=4,
-    )
-
-    raise_if_kernel_resolution_frozen("cute.compile", target=kernel, cache_key=cache_key)
-    compile_kwargs = {}
-    compile_options = os.environ.get("B12X_DIRECT_CUTE_OPTIONS", "")
-    if compile_options:
-        compile_kwargs["options"] = compile_options
-    compiled = cute.compile(
-        kernel,
-        dummy(cutlass.BFloat16),     # x_ptr
-        dummy(cutlass.Uint8),         # w1_ptr
-        dummy(cutlass.Uint8),         # w1s_ptr
-        dummy(cutlass.Float32),       # w1a_ptr
-        dummy(cutlass.Float32),       # a1_ptr
-        dummy(cutlass.Float32),       # a2_ptr
-        dummy(cutlass.Uint32),        # inter_ptr
-        dummy(cutlass.Uint8),         # w2_ptr
-        dummy(cutlass.Uint8),         # w2s_ptr
-        dummy(cutlass.Float32),       # w2a_ptr
-        dummy(ids_dtype),             # tid_ptr
-        dummy(cutlass.Float32),       # tw_ptr
-        dummy(cutlass.BFloat16),      # out_ptr
-        barrier_fake,                 # barrier_count
-        barrier_fake,                 # barrier_epoch
-        Int32(m),                     # m_val
-        Int32(kernel.grid_x),         # grid_x
-        current_cuda_stream(),        # stream
-        **compile_kwargs,
-    )
-    try:
-        setattr(
-            compiled,
-            _DIRECT_MICRO_SHAPE_ATTR,
-            ("w4a16", int(m), int(k), int(n), int(num_topk), int(weight_E)),
-        )
-    except Exception:
-        pass
-
-    result = (compiled, kernel.grid_x)
-    if reuse_compiled:
-        _MICRO_KERNEL_CACHE[cache_key] = result
-    _LAST_KERNEL = (cache_key, result)
-    return result
-
-
-def _get_w4a16_fc2_direct_mma_kernel(
-    *,
-    weight_E: int,
-    m: int,
-    k: int,
-    n: int,
-    num_topk: int,
-    topk_ids_dtype: torch.dtype,
-    unit_scale_contract: bool,
-):
-    tile_n = int(os.environ.get("B12X_W4A16_FC2_DIRECT_MMA_TILE_N", "128"))
-    tile_k = int(os.environ.get("B12X_W4A16_FC2_DIRECT_MMA_TILE_K", "128"))
-    cache_key = (
-        "w4a16_fc2_direct_mma_token_tile",
-        weight_E,
-        m,
-        k,
-        n,
-        num_topk,
-        topk_ids_dtype,
-        unit_scale_contract,
-        tile_n,
-        tile_k,
-    )
-    global _LAST_KERNEL
-    last_kkey, last_kval = _LAST_KERNEL
-    if last_kkey == cache_key:
-        return last_kval
-    reuse_compiled = os.environ.get("B12X_MICRO_REUSE_COMPILED", "1") != "0"
-    if reuse_compiled:
-        cached = _MICRO_KERNEL_CACHE.get(cache_key)
-        if cached is not None:
-            _LAST_KERNEL = (cache_key, cached)
-            return cached
-    result = compile_w4a16_fc2_direct_mma(
-        m=m,
-        k=k,
-        n=n,
-        weight_e=weight_E,
-        num_topk=num_topk,
-        topk_ids_dtype=topk_ids_dtype,
-        unit_scale_contract=unit_scale_contract,
-        tile_n=tile_n,
-        tile_k=tile_k,
-    )
-    if reuse_compiled:
-        _MICRO_KERNEL_CACHE[cache_key] = result
-    _LAST_KERNEL = (cache_key, result)
-    return result
-
-
 def _direct_micro_shape_accepts_block_dim(compiled, block_dim: int) -> bool:
-    shape = getattr(compiled, _DIRECT_MICRO_SHAPE_ATTR, None)
-    if shape is None:
-        return True
-    quant_mode, m, _k, n, _num_topk, _weight_E = shape
-    if quant_mode == "w4a16" and int(m) >= 4 and int(n) >= 4096:
-        return False
     return True
 
 
@@ -2820,7 +2469,7 @@ def _get_dynamic_kernel(
     activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
     sf_vec_size = 16
     mac = mac_override if mac_override is not None else _get_impl_mac("dynamic")
-    dynamic_down_scale = False if quant_mode == "w4a16" else _dynamic_down_scale_enabled()
+    dynamic_down_scale = _dynamic_down_scale_enabled()
     mma_tiler_mn = (
         _dynamic_tile_m(quant_mode),
         _dynamic_tile_n(quant_mode),
@@ -2844,8 +2493,8 @@ def _get_dynamic_kernel(
             _LAST_KERNEL = (cache_key, cached)
             return cached
 
-    weight_dtype = cutlass.Uint8 if quant_mode == "w4a16" else cutlass.Float4E2M1FN
-    a_scratch_dtype = cutlass.BFloat16 if quant_mode == "w4a16" else weight_dtype
+    weight_dtype = cutlass.Float4E2M1FN
+    a_scratch_dtype = weight_dtype
     sf_dtype = cutlass.Float8E4M3FN
     a_dtype = cutlass.BFloat16
     alpha_dtype = cutlass.Float32
@@ -2856,8 +2505,7 @@ def _get_dynamic_kernel(
         fast_math=fast_math,
         dynamic_down_scale=dynamic_down_scale,
     )
-    if quant_mode == "nvfp4":
-        kernel_kwargs["share_input_across_experts"] = share_input_across_experts
+    kernel_kwargs["share_input_across_experts"] = share_input_across_experts
     kernel = activation_spec.make_dynamic_kernel(**kernel_kwargs)
     launch = _DynamicMoELaunch(kernel, k=k, num_topk=num_topk)
 
@@ -2905,14 +2553,12 @@ def _get_dynamic_kernel(
     task_valid_rows_fake = make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4)
     tile_write_count_fake = make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4)
     w1_n = activation_spec.w1_rows(n)
-    w1_fake_cols = k // 2 if quant_mode == "w4a16" else k
-    w2_fake_cols = n // 2 if quant_mode == "w4a16" else n
     b_w13_fake = cute.runtime.make_fake_compact_tensor(
-        weight_dtype, (w1_n, w1_fake_cols, E), stride_order=(1, 0, 2), assumed_align=16,
+        weight_dtype, (w1_n, k, E), stride_order=(1, 0, 2), assumed_align=16,
     )
     sfb_w13_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     b_down_fake = cute.runtime.make_fake_compact_tensor(
-        weight_dtype, (k, w2_fake_cols, E), stride_order=(1, 0, 2), assumed_align=16,
+        weight_dtype, (k, n, E), stride_order=(1, 0, 2), assumed_align=16,
     )
     sfb_down_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     row_counts_fake = cute.runtime.make_fake_compact_tensor(
@@ -3210,12 +2856,11 @@ def _launch_dynamic(
     _gptr = lambda dtype, t, align=16: make_ptr(dtype, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=align)
     ids_cutlass_dtype = cutlass.Int32 if flat_ids.dtype == torch.int32 else cutlass.Int64
     ids_align = 4 if flat_ids.dtype == torch.int32 else 8
-    scratch_cutlass_dtype = cutlass.BFloat16 if quant_mode == "w4a16" else cutlass.Float4E2M1FN
     compiled(
         _gptr(cutlass.BFloat16, a),
         _gptr(ids_cutlass_dtype, flat_ids, ids_align),
         _gptr(cutlass.Float32, flat_weights, 4),
-        _gptr(scratch_cutlass_dtype, workspace.packed_a_view),
+        _gptr(cutlass.Float4E2M1FN, workspace.packed_a_view),
         workspace.sfa_ptr,
         _gptr(cutlass.Uint8, workspace.packed_a_flat),
         _gptr(cutlass.Uint8, workspace.scale_flat),
@@ -3272,95 +2917,10 @@ def _launch_compact_static(
     quant_mode = _normalize_quant_mode(quant_mode)
     activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
     micro_cls = activation_spec.micro_kernel_cls
-    use_micro_direct = quant_mode in {"nvfp4", "w4a16"} and micro_cls.is_supported(
+    use_micro_direct = quant_mode == "nvfp4" and micro_cls.is_supported(
         m=m, k=k, n=n, num_topk=num_topk,
         weight_E=weight_E,
     )
-    use_w4a16_fc2_mma = (
-        quant_mode == "w4a16"
-        and activation == "relu2"
-        and unit_scale_contract
-        and _w4a16_fc2_mma_enabled()
-    )
-    if use_w4a16_fc2_mma:
-        if not use_micro_direct:
-            raise RuntimeError("W4A16 FC2-MMA requires the direct micro FC1 path")
-        if flat_ids.dtype in (torch.int32, torch.int64) and flat_ids.is_contiguous():
-            launch_ids = flat_ids
-        else:
-            launch_ids = workspace.compact_topk_ids[: flat_ids.numel()]
-            launch_ids.copy_(flat_ids.to(torch.int32))
-
-        phase1_compiled, phase1_grid_x = _get_w4a16_fc1_direct_kernel(
-            weight_E,
-            m,
-            k,
-            n,
-            num_topk,
-            topk_ids_dtype=topk_ids_dtype,
-            fast_math=fast_math,
-            share_input_across_experts=share_input_across_experts,
-            share_expert_scales=share_expert_scales,
-            single_token=(m == 1),
-            activation=activation,
-            device=a.device,
-        )
-        if not _compiled_direct_micro_accepts_block_dim(
-            phase1_compiled,
-            _DIRECT_MICRO_BLOCK_DIM,
-        ):
-            raise RuntimeError("forced direct micro FC1 phase rejected its block size")
-
-        fc2_kernel = _get_w4a16_fc2_direct_mma_kernel(
-            weight_E=weight_E,
-            m=m,
-            k=k,
-            n=n,
-            num_topk=num_topk,
-            topk_ids_dtype=topk_ids_dtype,
-            unit_scale_contract=unit_scale_contract,
-        )
-
-        _prepare_workspace_for_launch(workspace)
-        micro_cls.launch(
-            phase1_compiled,
-            x=a,
-            w1_fp4=weights.w1_storage,
-            w1_blockscale=weights.w1_scale_storage,
-            w1_alphas=weights.w1_alpha,
-            a1_gscale=input_gs,
-            a2_gscale=down_input_scale,
-            inter_fp32=workspace.micro_intermediate,
-            w2_fp4=weights.w2_storage,
-            w2_blockscale=weights.w2_scale_storage,
-            w2_alphas=weights.w2_alpha,
-            topk_ids=launch_ids.view(m, num_topk),
-            topk_weights=flat_weights.view(m, num_topk),
-            out=scatter_output,
-            barrier_count=workspace.barrier_count,
-            barrier_epoch=workspace.barrier_epoch,
-            m=m,
-            grid_x=phase1_grid_x,
-        )
-
-        direct_route_stride_u32 = ((n // 2 + 127) // 128) * 128
-        intermediate_bytes = m * num_topk * direct_route_stride_u32 * 4
-        intermediate_u8 = workspace.micro_intermediate.view(torch.uint8).narrow(
-            0, 0, intermediate_bytes,
-        )
-        fc2_kernel.compiled(
-            intermediate_u8,
-            weights.down_fp4,
-            weights.sfb_down_ptr,
-            weights.w2_alpha,
-            launch_ids.view(m, num_topk),
-            flat_weights.view(m, num_topk),
-            scatter_output,
-            stream,
-        )
-        return
-
-    use_w4a16_micro_compact = False
     if use_micro_direct:
         if flat_ids.dtype in (torch.int32, torch.int64) and flat_ids.is_contiguous():
             launch_ids = flat_ids
@@ -3405,48 +2965,13 @@ def _launch_compact_static(
             )
             return
 
-    if use_w4a16_micro_compact:
-        micro_tile_n = _select_w4a16_micro_mma_tiler_mn(routed_rows, n)[1]
-        micro_work_tiles = max(1, routed_rows * max(1, (n + micro_tile_n - 1) // micro_tile_n))
-        micro_mac = min(_get_impl_mac("micro", routed_rows=routed_rows), micro_work_tiles)
-        compiled, mac = _get_w4a16_micro_compact_kernel(
-            workspace.state_E, weight_E, m, k, n, num_topk, workspace.max_rows,
-            topk_ids_dtype=topk_ids_dtype,
-            fast_math=fast_math,
-            mac_override=micro_mac,
-            activation=activation,
-            single_token=(m == 1),
-            share_input_across_experts=share_input_across_experts,
-            share_expert_scales=share_expert_scales,
-        )
-        _prepare_workspace_for_launch(workspace)
-        compiled(
-            a, flat_ids, flat_weights,
-            workspace.packed_a_view, workspace.sfa_ptr,
-            workspace.packed_a_flat, workspace.scale_flat,
-            workspace.barrier_count, workspace.barrier_epoch,
-            weights.w13_fp4, weights.sfb_w13_ptr,
-            weights.down_fp4, weights.sfb_down_ptr,
-            workspace.row_counts, workspace.active_expert_count, workspace.weight_expert_ids, workspace.global_to_local_expert,
-            input_gs, weights.w1_alpha, weights.w2_alpha, down_input_scale,
-            scatter_output, workspace.token_map, workspace.token_weights,
-            stream,
-        )
-        return
-
-    if quant_mode == "w4a16":
-        # Existing static MAC tuning was collected for the NVFP4 path. W4A16's
-        # inline BF16 dequant keeps each CTA latency-bound, so compact decode
-        # needs all SMs active instead of the lower NVFP4 ladder entries.
-        static_mac = _get_impl_mac("static")
-    else:
-        static_mac = _get_impl_mac("static", routed_rows=routed_rows)
-        if routed_rows <= 16:
-            static_mac = min(static_mac, 32)
-        elif routed_rows < 40:
-            # Tiny compact launches have very little FC2 tile work, so capping
-            # resident clusters avoids idle CTA participation in the barrier phases.
-            static_mac = min(static_mac, 64)
+    static_mac = _get_impl_mac("static", routed_rows=routed_rows)
+    if routed_rows <= 16:
+        static_mac = min(static_mac, 32)
+    elif routed_rows < 40:
+        # Tiny compact launches have very little FC2 tile work, so capping
+        # resident clusters avoids idle CTA participation in the barrier phases.
+        static_mac = min(static_mac, 64)
 
     compiled, mac = _get_static_kernel(
         workspace.state_E, weight_E, m, k, n, num_topk, workspace.max_rows,
@@ -3498,6 +3023,7 @@ def b12x_moe_fp4(
     activation: str = "silu",
     quant_mode: str | None = None,
     unit_scale_contract: bool = False,
+    source_format: str = "modelopt",
 ) -> torch.Tensor:
     """MoE with shape-selected fused static or dynamic kernels.
 
@@ -3508,12 +3034,16 @@ def b12x_moe_fp4(
     _assert_reciprocal_input_scale_contract(input_scales_are_reciprocal)
     quant_mode_arg = quant_mode
     quant_mode = _normalize_quant_mode(quant_mode_arg)
-    activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
+    source_format = _normalize_fp4_source_format(source_format)
+    _validate_fp4_source_format_for_quant_mode(
+        source_format=source_format,
+        quant_mode=quant_mode,
+    )
     m, k = a.shape
     E = w1_fp4.shape[0]
     weight_E = E
     n = w2_fp4.shape[2] * 2  # intermediate_size
-    expected_w1_rows = activation_spec.w1_rows(n)
+    expected_w1_rows = _activation_w1_rows(activation, n)
     if w1_fp4.shape[1] != expected_w1_rows:
         raise ValueError(
             f"expected w1_fp4.shape[1] == {expected_w1_rows} for activation "
@@ -3522,7 +3052,7 @@ def b12x_moe_fp4(
     num_topk = topk_ids.shape[1]
     routed_rows = m * num_topk
     device = a.device
-    if apply_router_weight_on_input:
+    if apply_router_weight_on_input and quant_mode != "w4a16":
         raise NotImplementedError("apply_router_weight_on_input is not implemented in b12x_moe_fp4")
     if fast_math is None:
         fast_math = _FAST_MATH_DEFAULT
@@ -3543,6 +3073,60 @@ def b12x_moe_fp4(
         input_scales_static
         or (a1_gscale.numel() == 1 and a2_gscale.numel() == 1)
     )
+    if quant_mode == "w4a16":
+        from b12x.moe.fused.w4a16.kernel import run_w4a16_moe
+        from b12x.moe.fused.w4a16.prepare import (
+            make_w4a16_packed_buffers as make_w4a16_buffers,
+        )
+
+        if output is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise ValueError("CUDA graph capture requires a caller-owned output buffer")
+            scatter_output = torch.empty(m, k, dtype=a.dtype, device=device)
+        else:
+            scatter_output = output
+        if scatter_output.shape != (m, k):
+            raise ValueError(f"output must have shape {(m, k)}, got {tuple(scatter_output.shape)}")
+        if scatter_output.dtype != a.dtype:
+            raise ValueError(f"output must have dtype {a.dtype}, got {scatter_output.dtype}")
+        if scatter_output.device != device:
+            raise ValueError(f"output must be on device {device}, got {scatter_output.device}")
+        if not scatter_output.is_contiguous():
+            raise ValueError("output must be contiguous")
+
+        prepared = _get_w4a16_packed_weights(
+            w1_fp4,
+            w1_blockscale,
+            w1_alphas,
+            w2_fp4,
+            w2_blockscale,
+            w2_alphas,
+            activation=activation,
+            params_dtype=a.dtype,
+            source_format=source_format,
+        )
+        buffers = make_w4a16_buffers(
+            prepared,
+            m=m,
+            topk=num_topk,
+            dtype=a.dtype,
+            device=device,
+        )
+        return run_w4a16_moe(
+            a,
+            prepared,
+            topk_weights.contiguous(),
+            topk_ids.contiguous(),
+            activation=activation,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            fast_math=fast_math,
+            intermediate_cache13=buffers.intermediate_cache13,
+            intermediate_cache2=buffers.intermediate_cache2,
+            output=scatter_output,
+            fc1_c_tmp=buffers.fc1_c_tmp,
+            fc2_c_tmp=buffers.fc2_c_tmp,
+        )
+    activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
     if (
         quant_mode == "nvfp4"
         and _is_exact_relu2_bs1_nemotron_case(
@@ -4242,7 +3826,11 @@ def b12x_sparse_moe_fp4(
 
     _assert_reciprocal_input_scale_contract(input_scales_are_reciprocal)
     quant_mode_arg = quant_mode
-    _normalize_quant_mode(quant_mode_arg)
+    quant_mode_normalized = _normalize_quant_mode(quant_mode_arg)
+    _validate_fp4_source_format_for_quant_mode(
+        source_format=experts.source_format,
+        quant_mode=quant_mode_normalized,
+    )
 
     if routing is not None:
         if top_k is not None or gate_weight is not None or gate_bias is not None or router_logits is not None:
@@ -4283,6 +3871,7 @@ def b12x_sparse_moe_fp4(
         fast_math=fast_math,
         activation=activation,
         quant_mode=quant_mode_arg,
+        source_format=experts.source_format,
     )
     if routed_scaling_factor != 1.0:
         routed_output.mul_(routed_scaling_factor)

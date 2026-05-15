@@ -166,14 +166,6 @@ def _direct_micro_launchable(
     return _compiled_direct_micro_accepts_block_dim(compiled, _DIRECT_MICRO_BLOCK_DIM)
 
 
-def test_w4a16_direct_micro_resource_gate_rejects_wide_m4() -> None:
-    _skip_if_no_sm120()
-
-    assert _direct_micro_launchable("w4a16", 4, 256)
-    assert _direct_micro_launchable("w4a16", 2, 4096)
-    assert not _direct_micro_launchable("w4a16", 4, 4096)
-
-
 def test_nvfp4_direct_micro_resource_gate_rejects_qwen_bs8_shape() -> None:
     _skip_if_no_sm120()
 
