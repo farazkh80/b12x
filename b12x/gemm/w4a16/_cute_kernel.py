@@ -39,8 +39,8 @@ import torch
 try:
     import cutlass
     import cutlass.cute as cute
-    from cutlass import BFloat16, Float32, Int32
-    from cutlass.cute.nvgpu import warp as _warp
+    from cutlass import BFloat16, Float32, Int32, Uint8
+    from cutlass.cute.nvgpu import cpasync, warp as _warp
 
     from b12x.cute.utils import (
         current_cuda_stream,
@@ -109,6 +109,12 @@ if _CUTE_AVAILABLE:
             self.sB_layout = cute.make_ordered_layout(
                 (_BLOCK_N, _BLOCK_K), order=(0, 1),
             )
+            # Packed FP4 weight smem region — half the K dimension
+            # because FP4 is two-per-byte.  Distinct from sB so the
+            # bf16 dequant target stays untouched until Step 3.
+            self.sWpacked_layout = cute.make_ordered_layout(
+                (_BLOCK_N, _BLOCK_K // 2), order=(0, 1),
+            )
 
             # ---- Step 1: shared-storage struct ----
             buffer_align_bytes = 128
@@ -123,9 +129,55 @@ if _CUTE_AVAILABLE:
                     cute.struct.MemRange[BFloat16, cute.cosize(self.sB_layout)],
                     buffer_align_bytes,
                 ]
+                sWpacked: cute.struct.Align[
+                    cute.struct.MemRange[Uint8, cute.cosize(self.sWpacked_layout)],
+                    buffer_align_bytes,
+                ]
 
             self.SharedStorage = SharedStorage
             self.smem_bytes = SharedStorage.size_in_bytes()
+
+            # ---- Step 2: gmem -> smem tiled-copy descriptors ----
+            # Build two cooperative copies, one per operand.  This v1
+            # uses ``CopyUniversalOp`` at the element width to sidestep
+            # cp.async's 128-bit alignment requirement (the cute
+            # compiler can't yet see our 16-byte pointer alignment past
+            # ``local_tile``).  v3 will switch to 128-bit cp.async once
+            # alignment metadata is propagated via ``recast_tensor``.
+            #
+            # Each thread owns 1 element per copy; total elements per
+            # operand are divided evenly across the 128-thread CTA.
+
+            # A: (BLOCK_M=16, BLOCK_K=32) bf16 = 512 elems / 128 threads
+            # -> 4 elems per thread.
+            self.tA_layout = cute.make_ordered_layout(
+                (_BLOCK_M, _BLOCK_K // 4), order=(1, 0),
+            )  # (16, 8) = 128 threads
+            self.vA_layout = cute.make_layout((1, 4))
+
+            # W: (BLOCK_N=64, BLOCK_K/2=16) uint8 = 1024 elems / 128
+            # threads -> 8 elems per thread.
+            self.tW_layout = cute.make_ordered_layout(
+                (_BLOCK_N, (_BLOCK_K // 2) // 8), order=(1, 0),
+            )  # (64, 2) = 128 threads
+            self.vW_layout = cute.make_layout((1, 8))
+
+            atom_copy_bf16 = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(),
+                BFloat16,
+                num_bits_per_copy=BFloat16.width,  # 16 bits / element
+            )
+            atom_copy_u8 = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(),
+                Uint8,
+                num_bits_per_copy=8,
+            )
+            self.gmem_tiled_copy_A = cute.make_tiled_copy_tv(
+                atom_copy_bf16, self.tA_layout, self.vA_layout,
+            )
+            self.gmem_tiled_copy_W = cute.make_tiled_copy_tv(
+                atom_copy_u8, self.tW_layout, self.vW_layout,
+            )
 
         @cute.kernel
         def kernel(
@@ -138,40 +190,60 @@ if _CUTE_AVAILABLE:
             SharedStorage: cutlass.Constexpr,
             sA_layout: cute.Layout,
             sB_layout: cute.Layout,
+            sWpacked_layout: cute.Layout,
+            gmem_tiled_copy_A: cute.TiledCopy,
+            gmem_tiled_copy_W: cute.TiledCopy,
         ):
             # ---- Step 1: allocate the smem tiles ----
-            # Allocates [BLOCK_M, BLOCK_K] bf16 for ``sA`` and
-            # [BLOCK_N, BLOCK_K] bf16 for ``sB``.  The two smem tensors
-            # are typed CuTe ``Tensor`` views over the underlying smem
-            # storage; downstream steps will partition them with the
-            # tiled-MMA's thread-fragments.
             smem = cutlass.utils.SmemAllocator()
             storage = smem.allocate(SharedStorage)
             sA = storage.sA.get_tensor(sA_layout)
-            sB = storage.sB.get_tensor(sB_layout)
-
-            # Compile-time assertion: cosize matches the declared shape.
-            # This forces the cute compiler to validate that the smem
-            # layout is constructible end-to-end (i.e., Step 1 typechecks).
+            sB_bf16 = storage.sB.get_tensor(sB_layout)
+            sWpacked = storage.sWpacked.get_tensor(sWpacked_layout)
             cutlass.const_expr(cute.cosize(sA.layout) == _BLOCK_M * _BLOCK_K)
-            cutlass.const_expr(cute.cosize(sB.layout) == _BLOCK_N * _BLOCK_K)
+            cutlass.const_expr(cute.cosize(sB_bf16.layout) == _BLOCK_N * _BLOCK_K)
+            cutlass.const_expr(cute.cosize(sWpacked.layout) == _BLOCK_N * (_BLOCK_K // 2))
+
+            # Identify this CTA's output tile.
+            block_m, block_n, _ = cute.arch.block_idx()
+            tidx, _, _ = cute.arch.thread_idx()
+
+            # ---- Step 2: gmem -> smem copies for the first K tile ----
+            # Slice the global tensors to this CTA's tile of A and W.
+            # ``local_tile`` partitions a tensor into (tile_shape,
+            # rest_shape) and we pick our CTA's coord.
+            gA = cute.local_tile(
+                x_gmem, (_BLOCK_M, _BLOCK_K), (block_m, None)
+            )  # (BLOCK_M, BLOCK_K, K // BLOCK_K)
+            gW = cute.local_tile(
+                w_gmem, (_BLOCK_N, _BLOCK_K // 2), (block_n, None)
+            )  # (BLOCK_N, BLOCK_K // 2, K // BLOCK_K)
+
+            # Partition each thread's view of the copy source/dest.
+            thr_copy_A = gmem_tiled_copy_A.get_slice(tidx)
+            tAgA = thr_copy_A.partition_S(gA)                # (..., K_iter)
+            tAsA = thr_copy_A.partition_D(sA)                # (...,)
+
+            thr_copy_W = gmem_tiled_copy_W.get_slice(tidx)
+            tWgW = thr_copy_W.partition_S(gW)
+            tWsW = thr_copy_W.partition_D(sWpacked)
+
+            # Issue copies for the first K-tile only (Step 2 is a
+            # single-tile sanity check; the K-loop is part of Step 4).
+            cute.copy(gmem_tiled_copy_A, tAgA[None, None, None, 0], tAsA)
+            cute.copy(gmem_tiled_copy_W, tWgW[None, None, None, 0], tWsW)
+            cute.arch.sync_threads()
 
             # ---------------------------------------------------------
-            # Steps 2-5 (not yet implemented):
+            # Steps 3-5 (not yet implemented):
             #
-            # (2) Partition gmem -> smem copies (``cute.copy``).
-            # (3) Dequant FP4 nibbles -> bf16, multiply by sf+alpha,
-            #     store into sB.
-            # (4) MMA accumulation with ``cute.gemm``.
+            # (3) Dequant FP4 nibbles -> bf16 in registers, multiply by
+            #     sf+alpha, write into ``sB_bf16``.
+            # (4) MMA accumulation with ``cute.gemm``, looping over K.
             # (5) Epilogue: fp32 acc -> bf16 -> gmem.
             #
-            # The kernel body intentionally stops here for v1-step-1.
-            # No output is written; ``micro.py`` recognises this via a
-            # NaN-sentinel on the output buffer and falls back to the
-            # Triton kernel.  (Removing the early ``return`` here is
-            # deliberate — ``@cute.jit`` transforms the function into
-            # a launch-builder and an explicit ``return`` short-circuits
-            # that transformation.)
+            # Body stops here for Step 2; output stays NaN so the
+            # micro.py fallback routes to the Triton kernel.
             pass
 
         @cute.jit
@@ -218,7 +290,9 @@ if _CUTE_AVAILABLE:
             )
             self.kernel(
                 x, w, sf, alpha, out,
-                self.SharedStorage, self.sA_layout, self.sB_layout,
+                self.SharedStorage,
+                self.sA_layout, self.sB_layout, self.sWpacked_layout,
+                self.gmem_tiled_copy_A, self.gmem_tiled_copy_W,
             ).launch(
                 grid=grid,
                 block=(_BLOCK_DIM, 1, 1),
