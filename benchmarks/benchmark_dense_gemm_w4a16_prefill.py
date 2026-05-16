@@ -40,6 +40,7 @@ os.environ.setdefault("B12X_GEMM_W4A16_USE_CUTE", "1")
 from b12x.gemm.w4a16 import quantize_dense_weight_to_fp4
 from b12x.gemm.w4a16._cute_dense_kernel import DenseGemmW4A16CuteDenseKernel
 from b12x.gemm.w4a16._cute_prefill_kernel import DenseGemmW4A16CutePrefillKernel
+from b12x.gemm.w4a16.micro import _DEFAULT_N_PER_CTA2_M, _N_PER_CTA2_NT_MIN
 
 
 _NANO35_DENSE_SHAPES = [
@@ -103,14 +104,19 @@ def main() -> int:
 
     hdr = (
         f"{'shape':18s} {'M':>5s} {'K':>5s} {'N':>6s}  "
-        f"{'bf16_us':>9s}  {'v4_us':>9s}  {'v5_us':>9s}  "
+        f"{'bf16_us':>9s}  {'v4_us':>9s}  {'v5_us':>9s}  {'v5_tag':>6s}  "
         f"{'v4/bf16':>8s}  {'v5/bf16':>8s}  {'v5/v4':>7s}"
     )
     print(hdr, flush=True)
     print("-" * len(hdr), flush=True)
 
     decode_kernel = None if args.skip_decode else DenseGemmW4A16CuteDenseKernel()
-    prefill_kernel = DenseGemmW4A16CutePrefillKernel()
+    # Two prefill instances: n_per_cta=1 (general) and n_per_cta=2
+    # (A-reuse).  Pick per-call based on the M crossover used by the
+    # production dispatch, so this column reflects what the public
+    # ``dense_gemm_w4a16`` would actually call.
+    prefill_n1 = DenseGemmW4A16CutePrefillKernel(n_per_cta=1)
+    prefill_n2 = DenseGemmW4A16CutePrefillKernel(n_per_cta=2)
 
     for name, k, n in shapes:
         torch.manual_seed(args.seed)
@@ -145,11 +151,21 @@ def main() -> int:
                 except Exception as e:
                     print(f"# {name} M={m}: v4 failed: {e}", flush=True)
 
-            # v5 prefill kernel
+            # v5 prefill kernel — pick n_per_cta to match production
+            # dispatch: n_per_cta=2 when M >= threshold AND
+            # num_n_tiles % 2 == 0, else n_per_cta=1.
             v5_us = None
-            if prefill_kernel.is_supported_instance(m, k, n):
+            num_n_tiles = n // DenseGemmW4A16CutePrefillKernel._TILE_N
+            use_n2 = (
+                m >= _DEFAULT_N_PER_CTA2_M
+                and num_n_tiles % 2 == 0
+                and num_n_tiles >= _N_PER_CTA2_NT_MIN
+            )
+            v5 = prefill_n2 if use_n2 else prefill_n1
+            v5_label = "v5_n2" if use_n2 else "v5_n1"
+            if v5.is_supported_instance(m, k, n):
                 def call_v5():
-                    return prefill_kernel(x, w_fp4, w_bs, w_alpha, out=out_v5)
+                    return v5(x, w_fp4, w_bs, w_alpha, out=out_v5)
                 try:
                     v5_us = _bench(call_v5, warmup=args.warmup, iters=args.iters)
                 except Exception as e:
@@ -163,6 +179,7 @@ def main() -> int:
             print(
                 f"{name:18s} {m:5d} {k:5d} {n:6d}  "
                 f"{fmt(bf16_us):>9s}  {fmt(v4_us):>9s}  {fmt(v5_us):>9s}  "
+                f"{v5_label:>6s}  "
                 f"{ratio(v4_us, bf16_us):>8s}  {ratio(v5_us, bf16_us):>8s}  "
                 f"{ratio(v5_us, v4_us):>7s}",
                 flush=True,

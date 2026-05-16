@@ -1,18 +1,24 @@
 """W4A16 dense GEMM micro kernel for SM120 / SM121.
 
-Two-backend dispatch:
+Three-tier dispatch:
 
-* **Decode** (M ≤ ``_DECODE_M_MAX``): v4 forked CuTe-DSL kernel
-  (``_cute_dense_kernel.py``), warp-level bf16 MMA, tile (32, 64, 64),
-  4 MMA warps.  Sweet spot for the Nano3.5 decode linears.
-* **Prefill** (M > ``_DECODE_M_MAX``): v5 scaled-up CuTe-DSL kernel
-  (``_cute_prefill_kernel.py``), same MMA primitive but tile
-  (128, 64, 64), 8 MMA warps — absorbs 4× more M-rows per A K-tile
-  load, dramatically reducing per-call overhead at M ≥ 64.
+* **Decode** (M < ``B12X_GEMM_W4A16_PREFILL_M``, default 256):
+  v4 forked CuTe-DSL kernel (``_cute_dense_kernel.py``), warp-level
+  bf16 MMA, tile (32, 64, 64), 4 MMA warps.  Sweet spot for the
+  Nano3.5 decode linears (M ≤ 32 originally; v4 still runs correctly
+  at any M).
+* **Prefill / n_per_cta=1**
+  (``B12X_GEMM_W4A16_PREFILL_M`` ≤ M < ``B12X_GEMM_W4A16_N_PER_CTA2_M``,
+  default 256 ≤ M < 1024): v5 scaled-up CuTe-DSL kernel
+  (``_cute_prefill_kernel.py``), tile (128, 64, 64), 8 MMA warps.
+  General fallback — works at any (N, K) within the envelope.
+* **Prefill / n_per_cta=2** (M ≥ ``B12X_GEMM_W4A16_N_PER_CTA2_M``,
+  default 1024, and ``num_n_tiles % 2 == 0``): v5 with A-reuse across
+  2 consecutive N-tiles per CTA — cuts A TMA traffic in half, wins
+  ~25-30% at large M.  Falls back to n_per_cta=1 when N isn't a
+  multiple of 128 (e.g. ``mamba_in_proj`` with N=10304).
 
-Both backends share weight layout and accuracy gates.  Crossover M is
-exposed via ``B12X_GEMM_W4A16_PREFILL_M`` so we can sweep it in the
-benchmark (default 33: anything above v4's per-CTA M cap).
+Both backends share weight layout and accuracy gates.
 
 Set ``B12X_GEMM_W4A16_FORCE_REFERENCE=1`` to fall back to the Python
 reference (useful for accuracy debugging — runs on CPU).
@@ -37,6 +43,18 @@ _DECODE_M_MAX = 32   # v4 was tuned for M ∈ [1, 32] but can run at any M
 # equal — default to v5 from 256 onward to be safe; override via env.
 _DEFAULT_PREFILL_M = int(os.environ.get("B12X_GEMM_W4A16_PREFILL_M", "256"))
 
+# v5's n_per_cta=2 path reuses rA across 2 consecutive N-tiles in one
+# work-pair — cuts A traffic in half, wins ~25-30% at M ≥ 1024 on
+# wide-N shapes (o_proj, shared.dn, mamba_out at N=2688).  Loses
+# when N is small (k_proj N=256: ~2× slower) because pairing two N
+# tiles halves parallelism but the kernel is already SM-saturation
+# bound there, not A-traffic bound.  Conditions to engage:
+#   1. M ≥ _DEFAULT_N_PER_CTA2_M     (enough M to amortize)
+#   2. num_n_tiles % 2 == 0          (kernel constraint)
+#   3. num_n_tiles ≥ _N_PER_CTA2_NT  (preserve grid parallelism)
+_DEFAULT_N_PER_CTA2_M = int(os.environ.get("B12X_GEMM_W4A16_N_PER_CTA2_M", "1024"))
+_N_PER_CTA2_NT_MIN = int(os.environ.get("B12X_GEMM_W4A16_N_PER_CTA2_NT_MIN", "8"))
+
 
 def _use_prefill(m: int) -> bool:
     return m >= _DEFAULT_PREFILL_M
@@ -54,7 +72,26 @@ class DenseGemmW4A16MicroKernel:
 
     def __init__(self) -> None:
         self._decode: DenseGemmW4A16CuteDenseKernel | None = None
-        self._prefill: DenseGemmW4A16CutePrefillKernel | None = None
+        # Two prefill instances: n_per_cta=1 (general) and n_per_cta=2
+        # (A-reuse fast path).  Pick by M + N divisibility at call time.
+        self._prefill_n1: DenseGemmW4A16CutePrefillKernel | None = None
+        self._prefill_n2: DenseGemmW4A16CutePrefillKernel | None = None
+
+    def _pick_prefill(self, m: int, n: int) -> DenseGemmW4A16CutePrefillKernel:
+        tile_n = DenseGemmW4A16CutePrefillKernel._TILE_N
+        num_n_tiles = n // tile_n
+        use_n2 = (
+            m >= _DEFAULT_N_PER_CTA2_M
+            and num_n_tiles % 2 == 0
+            and num_n_tiles >= _N_PER_CTA2_NT_MIN
+        )
+        if use_n2:
+            if self._prefill_n2 is None:
+                self._prefill_n2 = DenseGemmW4A16CutePrefillKernel(n_per_cta=2)
+            return self._prefill_n2
+        if self._prefill_n1 is None:
+            self._prefill_n1 = DenseGemmW4A16CutePrefillKernel(n_per_cta=1)
+        return self._prefill_n1
 
     def __call__(
         self,
@@ -77,9 +114,7 @@ class DenseGemmW4A16MicroKernel:
             return out
 
         if _use_prefill(m):
-            if self._prefill is None:
-                self._prefill = DenseGemmW4A16CutePrefillKernel()
-            return self._prefill(
+            return self._pick_prefill(m, n)(
                 x.contiguous(), w_fp4.contiguous(), w_blockscale.contiguous(),
                 w_alpha.contiguous(), out=out,
             )

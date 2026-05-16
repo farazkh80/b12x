@@ -523,6 +523,15 @@ if _CUTE_AVAILABLE:
                                 cute.copy(smem_copy_A, csA_p[None, None, k_block_idx],
                                           crA[None, None, k_block_idx])
                             for nn in cutlass.range_constexpr(n_per_cta_c):
+                                # Between nn iterations, wait for the
+                                # prior nn's incremental LdMatrix reads
+                                # of sB to finish before restaging sB.
+                                # Otherwise lagging warps can read sB
+                                # while fast warps overwrite it for the
+                                # next nn (race shows up as silent
+                                # accuracy failure at larger K).
+                                if cutlass.const_expr(nn > 0):
+                                    self.epilog_sync_barrier.arrive_and_wait()
                                 n_tile_inner = n_tile_base + Int32(nn)
                                 self._stage_b_fp4_tile(
                                     b_w, sfb_ptr, sB, cons_state.index,

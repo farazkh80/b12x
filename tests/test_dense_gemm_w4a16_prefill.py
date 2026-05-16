@@ -108,6 +108,43 @@ def test_prefill_is_supported_envelope():
     assert not kc.is_supported(0, 2688, 4096)
 
 
+@pytest.mark.parametrize("k,n", [(2688, 4096), (4096, 2688), (3712, 2688)])
+@pytest.mark.parametrize("m", [1024, 2048])
+def test_prefill_n_per_cta_2_accuracy(k, n, m):
+    """v5 n_per_cta=2 path matches reference.
+
+    Regression guard: the n_per_cta>1 staging loop had a missing sync
+    between nn iterations.  Fast warps would re-stage sB for nn=1 while
+    slow warps were still reading sB for nn=0's MMA inner loop, silently
+    corrupting outputs.  Manifested at K=4096 (cos ≈ 0.986).  Fix adds a
+    barrier before each nn ≥ 1's staging.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    num_n_tiles = n // DenseGemmW4A16CutePrefillKernel._TILE_N
+    if num_n_tiles % 2 != 0:
+        pytest.skip(f"n_per_cta=2 unsupported for num_n_tiles={num_n_tiles}")
+
+    device = torch.device("cuda")
+    torch.manual_seed(hash(("n2", k, n, m)) & 0xFFFFFFFF)
+    x = (torch.randn(m, k, dtype=torch.bfloat16, device=device) * 0.5).contiguous()
+    w = (torch.randn(n, k, dtype=torch.bfloat16, device=device) * 0.1).contiguous()
+    w_fp4, w_bs, w_alpha = quantize_dense_weight_to_fp4(w)
+
+    kernel = DenseGemmW4A16CutePrefillKernel(n_per_cta=2)
+    out = kernel(x, w_fp4, w_bs, w_alpha)
+    ref = dense_reference_w4a16(
+        x.cpu(), w_fp4=w_fp4.cpu(), w_blockscale=w_bs.cpu(), w_alpha=w_alpha.cpu(),
+    ).to(device)
+    metrics = compare_to_reference(out, ref)
+    ref_max_abs = ref.abs().max().item()
+    rel_thresh = max(0.04, 0.01 * ref_max_abs)
+    assert metrics.cos > 0.9999, f"k={k} n={n} m={m}: cos={metrics.cos}"
+    assert metrics.max_abs <= rel_thresh, (
+        f"k={k} n={n} m={m}: max_abs={metrics.max_abs} cos={metrics.cos}"
+    )
+
+
 def test_prefill_padding_safe_for_m_below_tile_m():
     """M=64 (< tile_M=128) writes only the visible rows; no OOB.
 

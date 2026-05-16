@@ -502,6 +502,20 @@ if _CUTE_AVAILABLE:
                                 cute.copy(smem_copy_A, csA_p[None, None, k_block_idx],
                                           crA[None, None, k_block_idx])
                             for nn in cutlass.range_constexpr(n_per_cta_c):
+                                # Between nn iterations: wait for the
+                                # previous nn's MMA-loop LdMatrix reads
+                                # of sB to complete before any thread
+                                # starts overwriting sB for the new nn.
+                                # The barrier inside the staging block
+                                # below only orders staging→LdMatrix
+                                # within the SAME nn — it does not
+                                # protect against fast warps re-staging
+                                # over slow warps' still-pending reads.
+                                # Timing-sensitive race that surfaced at
+                                # K=4096 (more k_tiles = more chance for
+                                # warps to drift out of phase).
+                                if cutlass.const_expr(nn > 0):
+                                    self.epilog_sync_barrier.arrive_and_wait()
                                 n_tile_inner = n_tile_base + Int32(nn)
                                 self._stage_b_fp4_tile(
                                     b_w, sfb_ptr, sB, cons_state.index,
