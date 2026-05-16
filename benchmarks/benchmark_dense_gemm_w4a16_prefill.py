@@ -17,10 +17,16 @@ Compares three implementations across the Nano3.5 dense linear shapes:
 Reports median per-call time in microseconds.  Use ``--m-list`` to
 override the default sweep.
 
-Open question (captured in the design doc): per-M Marlin baselines for
-the prefill regime are not yet available — only M=1 Marlin numbers
-exist.  Once those are correlated from the Spark nsys trace, the
-``_MARLIN_PER_M`` table below can be populated.
+Marlin baseline (column ``marlin_us``): per-(shape, M) p50 µs from a
+correlation pass on the Nano3.5 nsys trace (Spark GB10, SM121, mem BW
+~273 GB/s) at the closest single-chunk prefill M.  Captured by
+``scripts/correlate_marlin_prefill.py``; raw data in
+``.claude_docs/marlin-baseline/`` (CSV + markdown).  Caveat: the
+trace is from Spark hardware while this benchmark runs on the local
+SM120 dev GPU (RTX PRO 6000 Blackwell), so the absolute µs aren't
+directly comparable — but the v5/Marlin ratio is informative because
+both kernels are W4A16 and both are memory-traffic-bound at the
+weight loads.
 """
 
 from __future__ import annotations
@@ -53,6 +59,54 @@ _NANO35_DENSE_SHAPES = [
     ("mamba_in_proj",      2688,  10304),
     ("mamba_output_proj",  4096,   2688),
 ]
+
+
+# Marlin baseline p50 µs at each prefill M, captured by
+# scripts/correlate_marlin_prefill.py from the Spark nsys trace
+# (single-chunk iterations; M=1521 omitted as anomalous).  Keyed by
+# the b12x shape name; missing entries fall back to '—' in the table.
+# q_proj/k_proj/v_proj separately don't exist in the Nano3.5 trace
+# (qkv is fused into a single 'self_attn_qkv_linear' call with
+# N=4608 = 4096 + 256 + 256).
+_MARLIN_BASELINE_US = {
+    # (b12x shape, marlin_M) -> p50_us
+    ("o_proj",             579):  182.0,
+    ("o_proj",            1823):  526.1,
+    ("o_proj",            2001):  584.3,
+    ("o_proj",            2015):  578.0,
+    ("shared.up",          579):  174.5,   # K=2688, N=3712 = shared_fc1
+    ("shared.up",         1823):  486.7,
+    ("shared.up",         2001):  536.2,
+    ("shared.up",         2015):  534.3,
+    ("shared.dn",          579):  163.9,   # K=3712, N=2688 = shared_fc2
+    ("shared.dn",         1823):  486.3,
+    ("shared.dn",         2001):  532.7,
+    ("shared.dn",         2015):  531.0,
+    ("mamba_in_proj",      579):  563.6,   # K=2688, N=10304
+    ("mamba_in_proj",     1823):  654.1,
+    ("mamba_in_proj",     2001):  814.2,
+    ("mamba_in_proj",     2015):  810.0,
+    ("mamba_output_proj",  579):  183.2,   # K=4096, N=2688
+    ("mamba_output_proj", 1823):  526.1,
+    ("mamba_output_proj", 2001):  581.8,
+    ("mamba_output_proj", 2015):  578.7,
+}
+
+# Map b12x bench M values to the nearest Marlin-traced M.
+_MARLIN_M_NEAREST = {
+    64: None, 128: None, 256: None,
+    512: 579,
+    1024: None,   # no clean Marlin sample at this M
+    2048: 2015,
+    4096: None,
+}
+
+
+def _marlin_baseline_us(shape_name: str, m: int):
+    marlin_M = _MARLIN_M_NEAREST.get(m)
+    if marlin_M is None:
+        return None
+    return _MARLIN_BASELINE_US.get((shape_name, marlin_M))
 
 
 def _bench(fn: Callable, warmup: int = 10, iters: int = 50) -> float:
@@ -105,7 +159,7 @@ def main() -> int:
     hdr = (
         f"{'shape':18s} {'M':>5s} {'K':>5s} {'N':>6s}  "
         f"{'bf16_us':>9s}  {'v4_us':>9s}  {'v5_us':>9s}  {'v5_tag':>6s}  "
-        f"{'v4/bf16':>8s}  {'v5/bf16':>8s}  {'v5/v4':>7s}"
+        f"{'marlin_us':>10s}  {'v5/v4':>7s}  {'v5/marlin':>9s}"
     )
     print(hdr, flush=True)
     print("-" * len(hdr), flush=True)
@@ -176,12 +230,13 @@ def main() -> int:
                 if num is None or den is None or den <= 0: return "      -"
                 return f"{num/den:6.2f}x"
 
+            marlin_us = _marlin_baseline_us(name, m)
             print(
                 f"{name:18s} {m:5d} {k:5d} {n:6d}  "
                 f"{fmt(bf16_us):>9s}  {fmt(v4_us):>9s}  {fmt(v5_us):>9s}  "
                 f"{v5_label:>6s}  "
-                f"{ratio(v4_us, bf16_us):>8s}  {ratio(v5_us, bf16_us):>8s}  "
-                f"{ratio(v5_us, v4_us):>7s}",
+                f"{fmt(marlin_us):>10s}  "
+                f"{ratio(v5_us, v4_us):>7s}  {ratio(v5_us, marlin_us):>9s}",
                 flush=True,
             )
         print("-" * len(hdr), flush=True)
