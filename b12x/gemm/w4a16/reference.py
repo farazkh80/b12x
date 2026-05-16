@@ -25,7 +25,7 @@ from b12x.cute.fp4 import (
     pack_grouped_fp4_values,
     swizzle_block_scale,
 )
-from b12x.moe.fused.w4a16.reference import (
+from b12x.moe.fused.reference import (
     _apply_block_scales,
     _dequant_fp4,
     _make_fp4_lut,

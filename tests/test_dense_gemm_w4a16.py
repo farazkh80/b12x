@@ -11,7 +11,7 @@ from b12x.gemm.w4a16 import (
     dense_reference_w4a16,
     quantize_dense_weight_to_fp4,
 )
-from b12x.moe.fused.w4a16.reference import compare_to_reference
+from b12x.moe.fused.reference import compare_to_reference
 
 
 def test_dense_reference_w4a16_signature():
@@ -65,27 +65,29 @@ def test_dense_gemm_w4a16_signature_callable():
 
 
 def test_dense_gemm_w4a16_is_supported_matrix():
-    """is_supported gate matches the documented decode envelope."""
-    # M ladder
-    for m in (1, 2, 4, 8, 10, 12, 16, 24, 32):
-        assert DenseGemmW4A16MicroKernel.is_supported(m, 2688, 4096)
-    for m in (0, 3, 5, 17, 33, 64):
-        assert not DenseGemmW4A16MicroKernel.is_supported(m, 2688, 4096)
-    # K must be a multiple of 128.  All Nano35 dense K values qualify.
+    """is_supported gate matches the actual envelope (decode + prefill dispatch)."""
+    # M ladder.  Decode kernel (v4) covers any M ∈ [1, 32]; prefill
+    # (v5) takes over for M ≥ B12X_GEMM_W4A16_PREFILL_M (default 33),
+    # so every positive M is supported as long as the shape envelope
+    # (N % 64 == 0, K % 64 == 0) holds.
+    for m in (1, 2, 3, 4, 8, 16, 24, 32, 33, 64, 128, 1024):
+        assert DenseGemmW4A16MicroKernel.is_supported(m, 2688, 4096), f"M={m} should be supported"
+    assert not DenseGemmW4A16MicroKernel.is_supported(0, 2688, 4096)
+    # K must be a multiple of 64.  All Nano35 dense K values qualify.
     for k in (2688, 3712, 4096):
         assert DenseGemmW4A16MicroKernel.is_supported(1, k, 256)
-    assert not DenseGemmW4A16MicroKernel.is_supported(1, 511, 16)
-    assert not DenseGemmW4A16MicroKernel.is_supported(1, 256 + 64, 16)
-    # N must be a multiple of 16.
-    assert DenseGemmW4A16MicroKernel.is_supported(1, 512, 16)
+    assert not DenseGemmW4A16MicroKernel.is_supported(1, 511, 256)
+    # N must be a multiple of 64.
+    assert DenseGemmW4A16MicroKernel.is_supported(1, 512, 64)
     assert not DenseGemmW4A16MicroKernel.is_supported(1, 512, 15)
+    assert not DenseGemmW4A16MicroKernel.is_supported(1, 512, 16)
 
 
 def test_dense_gemm_w4a16_stub_matches_reference_cpu():
     """Stub kernel call returns the reference output (CPU path)."""
     device = torch.device("cpu")
     torch.manual_seed(42)
-    m, k, n = 1, 512, 16
+    m, k, n = 1, 512, 64
     x = torch.randn(m, k, dtype=torch.bfloat16, device=device) * 0.5
     w = torch.randn(n, k, dtype=torch.bfloat16, device=device) * 0.1
     w_fp4, w_bs, w_alpha = quantize_dense_weight_to_fp4(w)

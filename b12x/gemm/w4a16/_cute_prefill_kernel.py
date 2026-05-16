@@ -1,26 +1,26 @@
-"""W4A16 dense GEMM kernel — forked from b12x/moe/fused/w4a16/static.py.
+"""W4A16 dense GEMM kernel — prefill (v5).
 
-Stripped of MoE routing / gated SwiGLU / scatter-output. Pure dense:
+Scaled-up sibling of ``_cute_dense_kernel.py`` (v4) for the large-M
+prefill regime.  Same FP4 staging path (gmem → reg → smem cooperative
+decode with hardware ``cvt.rn.f16x2.e2m1x2`` + per-block FP8 scale fold)
+and same warp-level bf16 MMA primitive (``MmaF16BF16Op`` m16n8k16) —
+just bigger:
 
-    out[M, N] = (A[M, K] @ dequant(W_fp4[N, K/2], W_sf[N, K/16]).T) * alpha
+* ``mma_tiler_mn``     : (128, 64)   vs v4's (32, 64)
+* ``num_mma_warps``    : 8           vs v4's 4
+* ``atom_layout``      : (4, 2, 1)   vs v4's (2, 2, 1)
+* ``permutation_mnk``  : (128, 64, 16) — each CTA covers 128×64 in
+  one atom group; the FP4 K-tile is still 64 (= 4 MMA k_blocks).
 
-* A: bf16, row-major (M, K)
-* W: FP4-packed uint8, (N, K/2), one expert (no expert dim)
-* SF: FP8 e4m3, swizzled per ``_swizzled_e4m3_offset`` (same as MoE)
-* alpha: scalar fp32
-* C: bf16, row-major (M, N)
+This is the *production* prefill path: each CTA does substantially more
+work per A K-tile TMA load (8 MMA warps × 64 BLOCK_K) so the per-call
+launch/setup overhead is amortized.  M is padded up to 128 inside the
+caller (``micro.py``), so callers using M=64 take a 2× A-load penalty
+— hence the dispatch crossover (see ``micro.py``).
 
-Architecture (kept from static.py):
-* TMA load for A (async, multi-stage).
-* Multi-stage AB pipeline (``ab_stage = 2``) via ``PipelineTmaAsync``.
-* Warp specialization: ``num_mma_warps`` MMA warps + 1 DMA warp.
-* Swizzled smem layouts via ``sm90_utils.get_smem_layout_atom``.
-* Hardware FP4 decode: ``cvt.rn.f16x2.e2m1x2`` PTX (``fp4_decode_4bytes``).
-* LdMatrix.x4 sA/sB → reg, StMatrix.x2 reg → sC.
-* Persistent CTA scheduler over (m_tile, n_tile).
-
-Enable via ``B12X_GEMM_W4A16_USE_CUTE=1``; falls back to Triton on
-compile / runtime errors (see ``micro.py``).
+Same micro-architecture knobs as v4: ``B12X_GEMM_W4A16_USE_CUTE``,
+``B12X_GEMM_W4A16_MAX_ACTIVE``, cutlass-dsl ≥ 4.3.4 (4.4+ unlocks
+``setmaxregister_*`` for slightly better register budgeting).
 """
 
 from __future__ import annotations
@@ -80,12 +80,14 @@ if _CUTE_AVAILABLE:
             )
         )
 
-    class _DenseGemmW4A16CuteJit:
-        """JIT-compiled forked dense W4A16 kernel.
+    class _DenseGemmW4A16PrefillCuteJit:
+        """JIT-compiled W4A16 prefill kernel.
 
-        Per-call attributes (``a_dtype``, ``b_dtype``, layouts) are set on
-        ``__call__`` from the input tensors; MMA + smem layouts are
-        derived in ``_setup_attributes`` inside the ``@cute.jit`` scope.
+        Differences from v4 (``_DenseGemmW4A16CuteJit``) are confined to
+        ``_setup_attributes()``: bigger atom layout, more warps, bigger
+        permutation_mnk.  Everything else — TMA-A, FP4 staging, MMA
+        loop, StMatrix epilogue, persistent CTA scheduler — is structurally
+        identical and inherits its correctness from v4.
         """
 
         def __init__(
@@ -93,7 +95,7 @@ if _CUTE_AVAILABLE:
             m: int,
             n: int,
             k: int,
-            mma_tiler_mn: Tuple[int, int] = (32, 64),
+            mma_tiler_mn: Tuple[int, int] = (128, 64),
             tile_k: Optional[int] = None,
             ab_stage: int = 2,
             n_per_cta: int = 1,
@@ -104,23 +106,20 @@ if _CUTE_AVAILABLE:
             self.k = k
             self.sf_vec_size = sf_vec_size
             self.acc_dtype = Float32
-            # Allow tile_k != mma_tiler_mn[1] so the K-tile can be tuned
-            # independently of N.  Default keeps the legacy behavior
-            # (tile_K = tile_N).
             if tile_k is None:
                 tile_k = mma_tiler_mn[1]
             self._ab_stage_cfg = ab_stage
-            # n_per_cta: how many consecutive N-tiles each CTA processes
-            # in one work-pair, sharing the A K-tile loads.  >1 reduces
-            # A traffic at the cost of more registers for the extra
-            # accumulators.  Must divide num_n_tiles.
             self.n_per_cta = n_per_cta
             self.tile_shape_mnk = (mma_tiler_mn[0], mma_tiler_mn[1], tile_k)
             self.sa_tile_shape_mk = (mma_tiler_mn[0], tile_k)
             self.epi_tile = (mma_tiler_mn[0], mma_tiler_mn[1])
             self.cluster_shape_mnk = (1, 1, 1)
             self.cluster_shape_mn = (1, 1)
-            self.num_mma_warps = 4
+            # 8 MMA warps (vs v4's 4) for the prefill regime.  4-warp ×
+            # (4,2,1) atom layout covers (64, 16) per atom; with the
+            # permutation_mnk repeat factors below we lift this to the
+            # full (128, 64) CTA tile in one atom group.
+            self.num_mma_warps = 8
             self.tma_load_warp_id = self.num_mma_warps
             self.num_threads_per_warp = 32
             self.threads_per_cta = (self.num_mma_warps + 1) * self.num_threads_per_warp
@@ -140,8 +139,6 @@ if _CUTE_AVAILABLE:
             return cpasync.make_tiled_tma_atom(
                 op, tensor, smem_layout, smem_tile, num_multicast=1,
             )
-
-        # --- smem layout builders (lifted from MoE static, unchanged) ---
 
         def _make_a_smem_layout(self, ab_stage: int):
             a_is_k_major = self.a_layout.is_k_major_a()
@@ -183,15 +180,23 @@ if _CUTE_AVAILABLE:
             return a_smem_staged, b_smem_staged, epi_smem_staged
 
         def _setup_attributes(self):
+            # Warp-level Hopper bf16 MMA atom (m16, n8, k16).  Same atom
+            # as v4 — only the tiling above it changes.
             self.mma_inst_mnk = (16, 8, 16)
             mma_op = cute.nvgpu.warp.MmaF16BF16Op(
                 self.a_dtype, self.acc_dtype, self.mma_inst_mnk,
             )
-            atom_layout = cute.make_layout((2, 2, 1))
+            # 8 MMA warps split (4, 2, 1) across (M, N, K).  With the
+            # permutation_mnk below we then stretch each warp's coverage
+            # to span the full (128, 64) CTA tile in M and N:
+            #   permutation_M = atom_M(4) * mma_inst_M(16) * M_repeat(2) = 128
+            #   permutation_N = atom_N(2) * mma_inst_N(8)  * N_repeat(4) = 64
+            #   permutation_K = mma_inst_K(16)                          = 16
+            atom_layout = cute.make_layout((4, 2, 1))
             permutation_mnk = (
-                2 * self.mma_inst_mnk[0],
-                2 * self.mma_inst_mnk[1] * 2,
-                self.mma_inst_mnk[2],
+                2 * 4 * self.mma_inst_mnk[0],   # 128
+                4 * 2 * self.mma_inst_mnk[1],   #  64
+                self.mma_inst_mnk[2],           #  16
             )
             self.tiled_mma = cute.make_tiled_mma(
                 mma_op, atom_layout, permutation_mnk=permutation_mnk,
@@ -202,15 +207,12 @@ if _CUTE_AVAILABLE:
                 self.tile_shape_mnk[0] // self.epi_tile[0]
             )
             self.epi_stage = min(epi_stage_max, 4)
-            # AB pipeline depth — tunable per backend instance.
             self.ab_stage = self._ab_stage_cfg
             (
                 self.a_smem_layout_staged,
                 self.b_smem_layout_staged,
                 self.epi_smem_layout_staged,
             ) = self._make_staged_layouts(self.ab_stage)
-
-        # --- helpers for FP4 weight staging (lifted from MoE static) ---
 
         @cute.jit
         def _swizzled_e4m3_offset(
@@ -232,26 +234,26 @@ if _CUTE_AVAILABLE:
         @cute.jit
         def _stage_b_fp4_tile(
             self,
-            packed_w: cute.Tensor,    # W view as Uint8
-            sfb_ptr: cute.Pointer,    # SF as Uint8 ptr
+            packed_w: cute.Tensor,
+            sfb_ptr: cute.Pointer,
             sB: cute.Tensor,
             stage_idx: Int32,
             n_tile_idx: Int32,
             k_tile_idx: Int32,
-            weight_rows: Int32,       # N
-            weight_cols: Int32,       # K (logical, unpacked)
-            sf_cols: Int32,           # padded ceil(K/16, 4)
+            weight_rows: Int32,
+            weight_cols: Int32,
+            sf_cols: Int32,
             copy_start: Int32,
             copy_stride: Int32,
         ):
             """Cooperative FP4 → bf16 stage from gmem W into sB[stage].
 
-            Each thread loads 8 packed bytes (= 16 FP4 elems) via
+            Each thread loads 8 packed bytes (16 FP4 elems) via
             ``ld.global.nc.u32`` ×2, decodes with hardware cvt, multiplies
-            by per-block FP8 scale, casts to bf16, stores to swizzled sB.
-
-            Pattern verbatim from b12x/moe/fused/w4a16/static.py:457+
-            with the expert offset stripped.
+            by the per-block FP8 scale, casts to bf16, stores to swizzled
+            sB.  Verbatim from v4 — coordinates scale with
+            ``tile_shape_mnk`` so the larger prefill tiles work without
+            change.
             """
             w_base = packed_w.iterator.toint()
             sf_base = sfb_ptr.toint()
@@ -306,17 +308,15 @@ if _CUTE_AVAILABLE:
                 sB[local_n, local_k + Int32(15), stage_idx] = BFloat16(f1 * scale)
                 copy_idx += copy_stride
 
-        # --- kernel entry: GEMM tile loop ---
-
         @cute.kernel
         def kernel(
             self,
-            a_input: cute.Tensor,       # [M_pad, K] bf16 (padded to tile_M)
+            a_input: cute.Tensor,
             tma_a: cute.CopyAtom, mA: cute.Tensor,
-            b_w: cute.Tensor,           # [N, K/2] uint8 packed FP4
+            b_w: cute.Tensor,
             sfb_ptr: cute.Pointer,
-            alpha: cute.Tensor,         # [1] fp32
-            c_out: cute.Tensor,         # [M, N] bf16
+            alpha: cute.Tensor,
+            c_out: cute.Tensor,
             tiled_mma: cute.TiledMma,
             cta_layout_mnk: cute.Layout,
             a_smem_staged: cute.ComposedLayout,
@@ -399,7 +399,6 @@ if _CUTE_AVAILABLE:
             epi_m_scale = self.tile_shape_mnk[0] // self.epi_tile[0]
             sub_shape = tCsC_for_shape.shape[:3]
             acc_shape = (sub_shape[0], sub_shape[1] * epi_m_scale, sub_shape[2])
-            # One accumulator per N-tile in the work-pair (n_per_cta accs).
             accs = []
             for _ in cutlass.range_constexpr(self.n_per_cta):
                 accs.append(cute.make_rmem_tensor(acc_shape, self.acc_dtype))
@@ -410,22 +409,14 @@ if _CUTE_AVAILABLE:
 
             alpha_value = Float32(alpha[Int32(0)])
 
-            # Persistent scheduler: each work-pair covers n_per_cta
-            # consecutive N-tiles for the same M-tile.  Total work-pairs
-            # = num_m_tiles * num_n_tiles / n_per_cta.  Caller ensures
-            # num_n_tiles is divisible by n_per_cta.
             n_per_cta_c = cutlass.const_expr(self.n_per_cta)
             total_pairs = num_m_tiles * (num_n_tiles // Int32(n_per_cta_c))
             work_idx = Int32(bidz)
 
             # ===================================================================
-            # MMA warps (warps 0..num_mma_warps-1)
+            # MMA warps
             # ===================================================================
             if warp_idx < self.num_mma_warps:
-                # setmaxregister_{increase,decrease} only exist on
-                # cutlass-dsl >= 4.4; on Spark (4.3.4) we skip them.
-                # The kernel still runs correctly without dedicated
-                # register budgets; only perf may suffer slightly.
                 if cutlass.const_expr(hasattr(cute.arch, "setmaxregister_increase")):
                     cute.arch.setmaxregister_increase(self.mma_register_requirement)
                 num_k_blocks = cute.size(tCrA, mode=[2])
@@ -458,8 +449,6 @@ if _CUTE_AVAILABLE:
                 tiled_copy_r2s = cute.make_tiled_copy_S(copy_atom_r2s, tiled_copy_C_Atom)
                 thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
                 tRS_sD = thr_copy_r2s.partition_D(sC)
-                # rD_out is laid out like one accumulator's retile —
-                # reused across n_per_cta epilogue passes.
                 tRS_rAcc0 = tiled_copy_r2s.retile(accs[0])
                 rD_out = cute.make_fragment_like(tRS_rAcc0, BFloat16)
 
@@ -468,10 +457,6 @@ if _CUTE_AVAILABLE:
                 )
 
                 while work_idx < total_pairs:
-                    # Each work-pair = n_per_cta consecutive N-tiles
-                    # for the same M-tile.  DMA warp issues ONE round of
-                    # A K-tile TMA loads; MMA warps reuse rA across the
-                    # n_per_cta inner iterations.
                     pairs_per_m = num_n_tiles // Int32(n_per_cta_c)
                     m_tile = work_idx // pairs_per_m
                     pair_in_m = work_idx - m_tile * pairs_per_m
@@ -487,9 +472,6 @@ if _CUTE_AVAILABLE:
                         csA_p = csA[None, None, None, cons_state.index]
 
                         if cutlass.const_expr(n_per_cta_c == 1):
-                            # n_per_cta=1: keep the original progressive
-                            # rA/rB k_block load pattern so smem→reg loads
-                            # overlap with MMA.
                             self._stage_b_fp4_tile(
                                 b_w, sfb_ptr, sB, cons_state.index,
                                 n_tile_base, k_tile,
@@ -516,9 +498,6 @@ if _CUTE_AVAILABLE:
                                     cute.copy(smem_copy_B, csB_p[None, None, k_next],
                                               crB[None, None, k_next])
                         else:
-                            # n_per_cta > 1: pre-load all k_blocks of rA
-                            # once, then reuse across n_per_cta inner MMA
-                            # passes (each with its own rB).
                             for k_block_idx in cutlass.range_constexpr(num_k_blocks):
                                 cute.copy(smem_copy_A, csA_p[None, None, k_block_idx],
                                           crA[None, None, k_block_idx])
@@ -551,7 +530,7 @@ if _CUTE_AVAILABLE:
                         ml_pipeline.consumer_release(cons_state)
                         cons_state.advance()
 
-                    # Epilogue: alpha-scale + cast + store each acc.
+                    # Epilogue: alpha-scale + cast + thread-strided gmem store
                     tile_m_base = m_tile * Int32(self.tile_shape_mnk[0])
                     m_valid = Int32(self.m) - tile_m_base
                     if m_valid > Int32(self.tile_shape_mnk[0]):
@@ -584,19 +563,13 @@ if _CUTE_AVAILABLE:
                                 local_m, local_n, Int32(0)
                             ]
                             copy_idx += Int32(self.num_mma_warps * self.num_threads_per_warp)
-                        # Sync between epilogue passes only when there's
-                        # a next one — protects sC reuse across nn.
                         if cutlass.const_expr(n_per_cta_c > 1):
                             self.epilog_sync_barrier.arrive_and_wait()
 
                     work_idx += Int32(gdim_z)
 
             # ===================================================================
-            # DMA warp (warps == num_mma_warps): drives TMA loads for A.
-            # With n_per_cta > 1, each work-pair = n_per_cta N-tiles for
-            # the same M-tile, but the DMA warp still issues k_tile_cnt
-            # TMA loads (one per K-tile) — the MMA warps reuse rA across
-            # the inner n_per_cta MMA passes.
+            # DMA warp: TMA load for A.
             # ===================================================================
             else:
                 if cutlass.const_expr(hasattr(cute.arch, "setmaxregister_decrease")):
@@ -633,8 +606,6 @@ if _CUTE_AVAILABLE:
             max_active_clusters: Int32,
             stream,
         ):
-            # Build tensors. A is padded along M to tile_M (caller's
-            # responsibility) so we can use a single TMA descriptor.
             tile_m = self.tile_shape_mnk[0]
             tile_n = self.tile_shape_mnk[1]
             m_padded = ((self.m + tile_m - 1) // tile_m) * tile_m
@@ -684,20 +655,21 @@ if _CUTE_AVAILABLE:
 
 else:
 
-    class _DenseGemmW4A16CuteJit:  # type: ignore[no-redef]
+    class _DenseGemmW4A16PrefillCuteJit:  # type: ignore[no-redef]
         def __init__(self, *args, **kwargs):
             raise ImportError("cutlass.cute (DSL) not available")
 
 
-class DenseGemmW4A16CuteDenseKernel:
-    """W4A16 dense GEMM cute backend, v4 (forked from MoE static).
+class DenseGemmW4A16CutePrefillKernel:
+    """W4A16 dense GEMM cute backend, v5 (prefill, scaled-up v4).
 
-    Consumes the *swizzled* FP8 block-scales directly (no host-side
-    unswizzle round-trip).  Supports M ∈ {1..tile_M}, N % tile_N == 0,
-    K % tile_K == 0; tile_M=32, tile_N=tile_K=64 by default.
+    Same FP4 staging + bf16 MMA as v4, but with 8 MMA warps + atom_layout
+    (4, 2, 1) + tile (128, 64, 64) so each CTA absorbs 4× more M-rows
+    per A K-tile load.  M is padded up to ``_TILE_M`` (128) in the
+    caller; supply the dispatch threshold from ``micro.py``.
     """
 
-    _TILE_M = 32
+    _TILE_M = 128
     _TILE_N = 64
     _TILE_K = 64
     _AB_STAGE = 2
@@ -705,11 +677,6 @@ class DenseGemmW4A16CuteDenseKernel:
 
     @classmethod
     def is_supported(cls, m: int, k: int, n: int) -> bool:
-        # v4 was tuned for decode (M ≤ tile_M = 32) but the kernel
-        # itself loops over m_tiles, so any positive M runs correctly
-        # — just suboptimally at large M (where v5 prefill takes over).
-        # ``micro.py`` picks v4 vs v5 by M; both should accept the
-        # full N/K envelope.
         if m <= 0 or k <= 0 or n <= 0:
             return False
         if n % cls._TILE_N != 0:
@@ -725,7 +692,6 @@ class DenseGemmW4A16CuteDenseKernel:
             return False
         if k % self._tile_k != 0:
             return False
-        # n_per_cta must divide num_n_tiles.
         num_n_tiles = n // self._tile_n
         if num_n_tiles % self._n_per_cta != 0:
             return False
@@ -744,20 +710,19 @@ class DenseGemmW4A16CuteDenseKernel:
         self._tile_k = tile_k if tile_k is not None else self._TILE_K
         self._ab_stage = ab_stage if ab_stage is not None else self._AB_STAGE
         self._n_per_cta = n_per_cta if n_per_cta is not None else self._N_PER_CTA
-        # Cache the cute.compile output per (m, n, k).  Pre-compiling once
-        # avoids the @cute.jit-traced-per-call overhead (~140ms each) that
-        # bites the TMA-pipelined v4 kernel because re-emitting the IR
-        # per call is expensive.  Pattern follows
-        # b12x/integration/tp_moe.py:2398.
         self._compile_cache: dict = {}
 
     def _get_compiled(self, m: int, n: int, k: int):
         if not _CUTE_AVAILABLE:
             raise NotImplementedError("cutlass.cute (DSL) not available")
+        # Key by real M (matches v4): the JIT bakes self.m into the IR
+        # so output layout / epilogue m_valid see the correct bound.
+        # Different real M values share neither IR nor the compiled
+        # binary — but each (M, N, K) is a one-shot compile cost.
         key = (m, n, k, self._tile_m, self._tile_n, self._tile_k,
                self._ab_stage, self._n_per_cta)
         if key not in self._compile_cache:
-            jit_instance = _DenseGemmW4A16CuteJit(
+            jit_instance = _DenseGemmW4A16PrefillCuteJit(
                 m=m, n=n, k=k,
                 mma_tiler_mn=(self._tile_m, self._tile_n),
                 tile_k=self._tile_k,
@@ -770,12 +735,12 @@ class DenseGemmW4A16CuteDenseKernel:
 
             self._compile_cache[key] = cute.compile(
                 jit_instance,
-                _dummy(BFloat16),       # x_ptr
-                _dummy(cutlass.Uint8),  # w_ptr
-                _dummy(cutlass.Uint8),  # sf_ptr (FP8 e4m3 viewed as u8)
-                _dummy(Float32),        # alpha_ptr
-                _dummy(BFloat16),       # out_ptr
-                Int32(128),             # max_active_clusters
+                _dummy(BFloat16),
+                _dummy(cutlass.Uint8),
+                _dummy(cutlass.Uint8),
+                _dummy(Float32),
+                _dummy(BFloat16),
+                Int32(128),
                 current_cuda_stream(),
             )
         return self._compile_cache[key]
@@ -795,9 +760,9 @@ class DenseGemmW4A16CuteDenseKernel:
         if out is None:
             out = torch.empty(m, n, dtype=torch.bfloat16, device=x.device)
 
-        # Pad A along M to tile_M if needed (one-time per call) so the
-        # TMA descriptor covers full tiles. Zero pad is safe — the kernel
-        # bounds-checks on M in the epilogue store.
+        # Pad A up to tile_M.  v5's tile_M=128 means M=64 pays a 2× A-load
+        # penalty — the dispatch crossover in ``micro.py`` accounts for
+        # this.
         if m < self._tile_m:
             x_pad = torch.zeros(self._tile_m, k, dtype=x.dtype, device=x.device)
             x_pad[:m].copy_(x)
@@ -807,9 +772,6 @@ class DenseGemmW4A16CuteDenseKernel:
 
         compiled = self._get_compiled(m, n, k)
         stream = current_cuda_stream()
-        # Persistent scheduler: scale with the device's SM count.
-        # ~3x SM count over-subscribes to keep pipelines full.
-        # Override via B12X_GEMM_W4A16_MAX_ACTIVE for sweeps.
         max_active_env = os.environ.get("B12X_GEMM_W4A16_MAX_ACTIVE")
         if max_active_env is not None:
             max_active = int(max_active_env)
@@ -828,4 +790,4 @@ class DenseGemmW4A16CuteDenseKernel:
         return out
 
 
-__all__ = ["DenseGemmW4A16CuteDenseKernel", "_cute_backend_enabled"]
+__all__ = ["DenseGemmW4A16CutePrefillKernel", "_cute_backend_enabled"]
