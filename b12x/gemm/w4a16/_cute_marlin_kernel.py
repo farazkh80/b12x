@@ -288,59 +288,65 @@ class _W4A16GemmLaunch:
 
 
 class W4A16GemmKernel:
+    """Dense W4A16 GEMM kernel — Marlin-style cp.async + register pipeline.
+
+    Ported from the MoE W4A16 kernel (b12x/moe/fused/w4a16/kernel.py) by
+    stripping the routing/expert/topk axes.  Each CTA computes one
+    (cta_m_size x tile_n) output tile.  Internal field names keep the
+    MoE donor's terminology (e.g. ``cta_m_blocks``, ``moe_block_size``)
+    for line-by-line traceability against the donor; semantically these
+    are now just dense CTA-tile dimensions.
+    """
+
     def __init__(
         self,
         *,
         size_m: int,
         size_n: int,
         size_k: int,
-        num_experts: int,
-        top_k: int,
-        mul_topk_weights: bool,
         tile_n: int,
         tile_k: int,
-        moe_block_size: int,
-        max_m_blocks: int,
+        cta_m_size: int,
         element_dtype: str = "bf16",
-        epilogue_activation: str | None = None,
     ):
         if element_dtype not in {"bf16", "fp16"}:
             raise ValueError(f"unsupported element_dtype {element_dtype!r}")
-        if epilogue_activation not in (None, "relu2"):
-            raise ValueError(
-                "W4A16 GEMM epilogue activation currently supports only relu2"
-            )
         if size_n % tile_n != 0:
             raise ValueError("size_n must be divisible by tile_n")
         if size_k % tile_k != 0:
             raise ValueError("size_k must be divisible by tile_k")
         if tile_n % 16 != 0 or tile_k % 16 != 0:
             raise ValueError("tile_n/tile_k must be multiples of 16")
-        if moe_block_size not in _ALLOWED_ROUTED_SIZES:
-            raise ValueError(f"unsupported moe_block_size {moe_block_size}")
-        if moe_block_size != 8 and moe_block_size % 16 != 0:
-            raise ValueError("moe_block_size must be 8 or a multiple of 16")
+        if cta_m_size not in _ALLOWED_ROUTED_SIZES:
+            raise ValueError(f"unsupported cta_m_size {cta_m_size}")
+        if cta_m_size != 8 and cta_m_size % 16 != 0:
+            raise ValueError("cta_m_size must be 8 or a multiple of 16")
         cta_threads = tile_n * tile_k // 64
         if cta_threads not in (128, 256):
             raise ValueError("W4A16 GEMM expects 128 or 256 CTA threads")
         self.size_m = int(size_m)
         self.size_n = int(size_n)
         self.size_k = int(size_k)
-        self.num_experts = int(num_experts)
-        self.top_k = int(top_k)
-        self.mul_topk_weights = bool(mul_topk_weights)
         self.tile_n = int(tile_n)
         self.tile_k = int(tile_k)
         self.cta_n_blocks = int(tile_n // 16)
         self.cta_k_blocks = int(tile_k // 16)
         self.cta_threads = int(cta_threads)
-        self.moe_block_size = int(moe_block_size)
+        # Keep ``moe_block_size`` field name for parity with the donor's
+        # internal methods (which heavily reference self.moe_block_size).
+        # For dense it's just the per-CTA M-tile size.
+        self.moe_block_size = int(cta_m_size)
         self.element_dtype = element_dtype
         self.is_fp16 = element_dtype == "fp16"
-        self.epilogue_relu2 = epilogue_activation == "relu2"
-        self.cta_m_blocks = int(_covering_count(moe_block_size, 16))
-        self.uses_m_block_8 = moe_block_size == 8
-        self.max_m_blocks = int(max_m_blocks)
+        # Dense path has no in-kernel activation epilogue.
+        self.epilogue_relu2 = False
+        # Routing-axis constants pinned for the dense port.  The MoE donor
+        # branches on these via ``cutlass.const_expr`` so when they're
+        # hard-coded the dead branches compile away.
+        self.top_k = 1
+        self.mul_topk_weights = False
+        self.cta_m_blocks = int(_covering_count(cta_m_size, 16))
+        self.uses_m_block_8 = cta_m_size == 8
         if torch.cuda.is_available():
             props = torch.cuda.get_device_properties(torch.cuda.current_device())
             self.sms = int(props.multi_processor_count)
@@ -353,7 +359,7 @@ class W4A16GemmKernel:
         self.blocks_per_sm = _determine_blocks_per_sm(
             problem_m=self.size_m,
             problem_n=self.size_n,
-            top_k=self.top_k,
+            top_k=1,
             cta_threads=self.cta_threads,
             cta_m_blocks=self.cta_m_blocks,
             tile_n=self.tile_n,
@@ -364,6 +370,8 @@ class W4A16GemmKernel:
         )
 
         # W4A16 shared-memory geometry, in int4 units unless noted.
+        # (Identical to the MoE donor's smem layout — the MMA pipeline +
+        # cp.async staging doesn't change between MoE and dense.)
         self.a_sh_stride = 16 * self.cta_k_blocks // 8
         self.a_sh_stage = self.a_sh_stride * (16 * self.cta_m_blocks)
         self.a_gl_rd_delta_o = 16 * self.cta_k_blocks // 8
@@ -384,15 +392,17 @@ class W4A16GemmKernel:
         self.s_sh_stage = self.s_tb_groups * self.s_sh_stride
         self.tb_n_warps = self.cta_n_blocks // 4
 
-        sh_block_route_indices = self.moe_block_size // 4
-        sh_rd_block_route_indices = self.moe_block_size // 4
-        sh_block_topk_weights = self.moe_block_size // 2
-        self.sh_valid_count_off = (
-            sh_block_route_indices + sh_rd_block_route_indices + sh_block_topk_weights
-        )
+        # Dense kernel has no routing tables -- the donor's
+        # sh_block_route_indices / sh_rd_block_route_indices /
+        # sh_block_topk_weights / sh_valid_count_off smem region is gone.
+        # Set the corresponding offsets to 0 so downstream arithmetic
+        # is structurally identical but reads from "no-op" smem slots
+        # (or, where the field is used as a routing-table base, we
+        # intercept the access at the point of use).
+        self.sh_valid_count_off = 0
         self.sh_route_off = 0
-        self.sh_rd_route_off = sh_block_route_indices
-        self.sh_topk_off = sh_block_route_indices + sh_rd_block_route_indices
+        self.sh_rd_route_off = 0
+        self.sh_topk_off = 0
 
         sh_red_size = (2 * self.cta_n_blocks + 1) * 16 * self.cta_m_blocks
         sh_b_size = _STAGES * self.b_sh_stage
@@ -2729,17 +2739,20 @@ def compile_w4a16_gemm(
         assumed_align=16,
     )
 
+    # NOTE: this caller still passes the donor's MoE-shaped arg list to be
+    # compatible with the existing in-tree call sites; the values for
+    # num_experts/top_k/mul_topk_weights/max_m_blocks/moe_block_size are
+    # accepted in the cache key but only ``moe_block_size`` (renamed to
+    # ``cta_m_size`` in the constructor) is forwarded to the kernel.
+    # num_experts/top_k/mul_topk_weights are now hard-pinned to 1/1/False
+    # inside W4A16GemmKernel.__init__.
     kernel = W4A16GemmKernel(
         size_m=size_m,
         size_n=size_n,
         size_k=size_k,
-        num_experts=num_experts,
-        top_k=top_k,
-        mul_topk_weights=mul_topk_weights,
         tile_n=tile_n,
         tile_k=tile_k,
-        moe_block_size=moe_block_size,
-        max_m_blocks=max_m_blocks,
+        cta_m_size=moe_block_size,
         element_dtype=element_dtype,
     )
     raise_if_kernel_resolution_frozen(
