@@ -528,10 +528,6 @@ class W4A16GemmKernel:
         c_bf16_flat: cute.Tensor,
         scales_i32_flat: cute.Tensor,
         global_scale: cute.Tensor,
-        packed_route_indices: cute.Tensor,
-        block_expert_ids: cute.Tensor,
-        packed_route_count: cute.Tensor,
-        topk_weights_flat: cute.Tensor,
         c_tmp_f32_flat: cute.Tensor,
         locks_i32_flat: cute.Tensor,
         stream: cuda.CUstream,
@@ -544,10 +540,6 @@ class W4A16GemmKernel:
             c_bf16_flat,
             scales_i32_flat,
             global_scale,
-            packed_route_indices,
-            block_expert_ids,
-            packed_route_count,
-            topk_weights_flat,
             c_tmp_f32_flat,
             locks_i32_flat,
         ).launch(
@@ -564,10 +556,6 @@ class W4A16GemmKernel:
         c_bf16_flat: cute.Tensor,
         scales_i32_flat: cute.Tensor,
         global_scale: cute.Tensor,
-        packed_route_indices: cute.Tensor,
-        block_expert_ids: cute.Tensor,
-        packed_route_count: cute.Tensor,
-        topk_weights_flat: cute.Tensor,
         c_tmp_f32_flat: cute.Tensor,
         locks_i32_flat: cute.Tensor,
     ):
@@ -595,10 +583,6 @@ class W4A16GemmKernel:
             c_bf16_flat,
             scales_i32_flat,
             global_scale,
-            packed_route_indices,
-            block_expert_ids,
-            packed_route_count,
-            topk_weights_flat,
             c_tmp_f32_flat,
             locks_i32_flat,
             smem_base,
@@ -615,10 +599,6 @@ class W4A16GemmKernel:
         c_bf16_flat: cute.Tensor,
         scales_i32_flat: cute.Tensor,
         global_scale: cute.Tensor,
-        packed_route_indices: cute.Tensor,
-        block_expert_ids: cute.Tensor,
-        packed_route_count: cute.Tensor,
-        topk_weights_flat: cute.Tensor,
         c_tmp_f32_flat: cute.Tensor,
         locks_i32_flat: cute.Tensor,
         smem_base: Int32,
@@ -627,8 +607,10 @@ class W4A16GemmKernel:
         grid_x: Int32,
     ):
         n_tiles = Int32(self.size_n // self.tile_n)
-        route_blocks = packed_route_count[Int32(0)].to(Int32) // Int32(
-            self.moe_block_size
+        # Number of M-tiles this CTA-grid must cover.  For dense this is
+        # ceil(M / cta_m_size); donor used a route-count tensor here.
+        route_blocks = Int32(
+            (self.size_m + self.moe_block_size - 1) // self.moe_block_size
         )
         k_tiles = Int32(self.size_k // self.tile_k)
         global_mn_tiles = route_blocks * n_tiles
@@ -736,29 +718,28 @@ class W4A16GemmKernel:
                 and reduce_tile_count > Int32(0)
                 and route_block_idx < route_blocks
             ):
-                expert_idx = block_expert_ids[route_block_idx].to(Int32)
-                if expert_idx >= Int32(0):
-                    self._run_tile(
-                        a_bf16_flat,
-                        b_i32_flat,
-                        c_bf16_flat,
-                        scales_i32_flat,
-                        global_scale,
-                        packed_route_indices,
-                        topk_weights_flat,
-                        c_tmp_f32_flat,
-                        locks_i32_flat,
-                        smem_base,
-                        tid,
-                        route_block_idx,
-                        expert_idx,
-                        output_n_tile,
-                        reduce_k_tile,
-                        reduce_tile_count,
-                        reduce_slice_count,
-                        reduce_slice_idx,
-                        lock_slot,
-                    )
+                # Dense: expert_idx is always 0, no need for the donor's
+                # block_expert_ids[route_block_idx] lookup or the
+                # ``expert_idx >= 0`` guard (which was the MoE drop-the-
+                # tile-if-no-expert-assigned path).
+                self._run_tile(
+                    a_bf16_flat,
+                    b_i32_flat,
+                    c_bf16_flat,
+                    scales_i32_flat,
+                    global_scale,
+                    c_tmp_f32_flat,
+                    locks_i32_flat,
+                    smem_base,
+                    tid,
+                    route_block_idx,
+                    output_n_tile,
+                    reduce_k_tile,
+                    reduce_tile_count,
+                    reduce_slice_count,
+                    reduce_slice_idx,
+                    lock_slot,
+                )
 
             if has_work != Int32(0):
                 if in_tail_region == Int32(0):
@@ -770,79 +751,6 @@ class W4A16GemmKernel:
                     if output_n_tile == n_tiles:
                         output_n_tile = Int32(0)
                         route_block_idx += Int32(1)
-
-    @cute.jit
-    def _read_moe_block_data(
-        self,
-        packed_route_indices: cute.Tensor,
-        topk_weights_flat: cute.Tensor,
-        smem_base: Int32,
-        tid: Int32,
-        route_block_idx: Int32,
-        global_scale_f32: cutlass.Float32,
-    ) -> Int32:
-        route_indices_int4_addr = self._int4_addr(
-            smem_base, Int32(self.sh_route_off) + tid
-        )
-        route_indices_gmem = get_ptr_as_int64(
-            packed_route_indices,
-            route_block_idx * Int32(self.moe_block_size) + tid * Int32(4),
-        )
-        cp_async4_shared_global_pred(
-            route_indices_int4_addr,
-            route_indices_gmem,
-            (tid < Int32(self.moe_block_size // 4)).to(Int32),
-        )
-        cute.arch.cp_async_commit_group()
-        cute.arch.cp_async_wait_group(0)
-        cute.arch.sync_threads()
-
-        if tid >= Int32(self.cta_threads - 32):
-            size_per_thread = _covering_count(self.moe_block_size, 32)
-            lane = tid - Int32(self.cta_threads - 32)
-            local_count = Int32(0)
-            for i in cutlass.range_constexpr(size_per_thread):
-                j = lane * Int32(size_per_thread) + Int32(i)
-                if j < Int32(self.moe_block_size):
-                    idx = ld_shared_i32_relaxed(
-                        smem_base + Int32(self.sh_route_off * 16) + j * Int32(4)
-                    )
-                    if idx < Int32(self.size_m * self.top_k):
-                        local_count += Int32(1)
-            valid = cute.arch.warp_redux_sync(local_count, "add")
-            if lane == Int32(0):
-                st_shared_i32(smem_base + Int32(self.sh_valid_count_off * 16), valid)
-
-        if tid < Int32(self.moe_block_size):
-            idx = ld_shared_i32_relaxed(
-                smem_base + Int32(self.sh_route_off * 16) + tid * Int32(4)
-            )
-            rd_row = idx // Int32(self.top_k)
-            st_shared_i32(
-                smem_base + Int32(self.sh_rd_route_off * 16) + tid * Int32(4),
-                rd_row,
-            )
-            if cutlass.const_expr(self.mul_topk_weights):
-                safe_idx = idx
-                if idx >= Int32(self.size_m * self.top_k):
-                    safe_idx = Int32(0)
-                topk = (
-                    topk_weights_flat[safe_idx].to(cutlass.Float32) * global_scale_f32
-                )
-                packed_topk = self._broadcast_f32_to_elem2(topk)
-                # top-k weights are cached as packed element pairs.
-                topk_word_addr = (
-                    smem_base + Int32(self.sh_topk_off * 16) + tid * Int32(4)
-                )
-                st_shared_u32(topk_word_addr, packed_topk)
-
-        cute.arch.sync_threads()
-        valid_count = ld_shared_i32_relaxed(
-            smem_base + Int32(self.sh_valid_count_off * 16)
-        )
-        cute.arch.sync_threads()
-        return valid_count
-
     @cute.jit
     def _run_tile(
         self,
@@ -851,14 +759,11 @@ class W4A16GemmKernel:
         c_bf16_flat: cute.Tensor,
         scales_i32_flat: cute.Tensor,
         global_scale: cute.Tensor,
-        packed_route_indices: cute.Tensor,
-        topk_weights_flat: cute.Tensor,
         c_tmp_f32_flat: cute.Tensor,
         locks_i32_flat: cute.Tensor,
         smem_base: Int32,
         tid: Int32,
-        route_block_idx: Int32,
-        expert_idx: Int32,
+        m_tile_idx: Int32,
         output_n_tile: Int32,
         reduce_k_tile: Int32,
         reduce_tile_count: Int32,
@@ -873,14 +778,11 @@ class W4A16GemmKernel:
                 c_bf16_flat,
                 scales_i32_flat,
                 global_scale,
-                packed_route_indices,
-                topk_weights_flat,
                 c_tmp_f32_flat,
                 locks_i32_flat,
                 smem_base,
                 tid,
-                route_block_idx,
-                expert_idx,
+                m_tile_idx,
                 output_n_tile,
                 reduce_k_tile,
                 reduce_tile_count,
@@ -895,14 +797,11 @@ class W4A16GemmKernel:
                 c_bf16_flat,
                 scales_i32_flat,
                 global_scale,
-                packed_route_indices,
-                topk_weights_flat,
                 c_tmp_f32_flat,
                 locks_i32_flat,
                 smem_base,
                 tid,
-                route_block_idx,
-                expert_idx,
+                m_tile_idx,
                 output_n_tile,
                 reduce_k_tile,
                 reduce_tile_count,
@@ -915,23 +814,25 @@ class W4A16GemmKernel:
     def _tile_common_prologue(
         self,
         global_scale: cute.Tensor,
-        packed_route_indices: cute.Tensor,
-        topk_weights_flat: cute.Tensor,
         smem_base: Int32,
         tid: Int32,
-        route_block_idx: Int32,
-        expert_idx: Int32,
+        m_tile_idx: Int32,
         output_n_tile: Int32,
     ):
-        global_scale_f32 = global_scale[expert_idx].to(cutlass.Float32)
-        block_valid_rows = self._read_moe_block_data(
-            packed_route_indices,
-            topk_weights_flat,
-            smem_base,
-            tid,
-            route_block_idx,
-            global_scale_f32,
-        )
+        """Dense replacement for the donor's MoE prologue.
+
+        Computes the global scale + how many valid M-rows this CTA owns,
+        and the staging stream offsets.  No route-table read, no topk
+        weight prefetch, no expert lookup -- expert_idx is implicit zero.
+        """
+        global_scale_f32 = global_scale[Int32(0)].to(cutlass.Float32)
+        # Valid M-rows in this CTA's tile (clipped at the M boundary).
+        m_tile_base = m_tile_idx * Int32(self.moe_block_size)
+        block_valid_rows = Int32(self.size_m) - m_tile_base
+        if block_valid_rows > Int32(self.moe_block_size):
+            block_valid_rows = Int32(self.moe_block_size)
+        if block_valid_rows < Int32(0):
+            block_valid_rows = Int32(0)
         (
             a_gl_stride,
             b_gl_stride,
@@ -944,10 +845,11 @@ class W4A16GemmKernel:
             a_rows_per_iter,
             b_sh_rd,
             s_sh_rd,
-        ) = self._tile_stream_offsets(tid, expert_idx, output_n_tile)
+        ) = self._tile_stream_offsets(tid, Int32(0), output_n_tile)
         return (
             global_scale_f32,
             block_valid_rows,
+            m_tile_base,
             a_gl_stride,
             b_gl_stride,
             s_gl_stride,
@@ -1028,14 +930,11 @@ class W4A16GemmKernel:
         c_bf16_flat: cute.Tensor,
         scales_i32_flat: cute.Tensor,
         global_scale: cute.Tensor,
-        packed_route_indices: cute.Tensor,
-        topk_weights_flat: cute.Tensor,
         c_tmp_f32_flat: cute.Tensor,
         locks_i32_flat: cute.Tensor,
         smem_base: Int32,
         tid: Int32,
-        route_block_idx: Int32,
-        expert_idx: Int32,
+        m_tile_idx: Int32,
         output_n_tile: Int32,
         reduce_k_tile: Int32,
         reduce_tile_count: Int32,
@@ -1046,6 +945,7 @@ class W4A16GemmKernel:
         (
             global_scale_f32,
             block_valid_rows,
+            m_tile_base,
             a_gl_stride,
             b_gl_stride,
             s_gl_stride,
@@ -1059,12 +959,9 @@ class W4A16GemmKernel:
             s_sh_rd,
         ) = self._tile_common_prologue(
             global_scale,
-            packed_route_indices,
-            topk_weights_flat,
             smem_base,
             tid,
-            route_block_idx,
-            expert_idx,
+            m_tile_idx,
             output_n_tile,
         )
         a_sh_rd = self._a_shared_read_offset(tid, 8)
@@ -1082,6 +979,7 @@ class W4A16GemmKernel:
             k_tiles,
             reduce_k_tile,
             block_valid_rows,
+            m_tile_base,
             a_gl_stride,
             b_gl_stride,
             s_gl_stride,
@@ -1132,6 +1030,7 @@ class W4A16GemmKernel:
             k_tiles,
             reduce_k_tile,
             block_valid_rows,
+            m_tile_base,
             a_gl_stride,
             b_gl_stride,
             s_gl_stride,
@@ -1169,14 +1068,11 @@ class W4A16GemmKernel:
         c_bf16_flat: cute.Tensor,
         scales_i32_flat: cute.Tensor,
         global_scale: cute.Tensor,
-        packed_route_indices: cute.Tensor,
-        topk_weights_flat: cute.Tensor,
         c_tmp_f32_flat: cute.Tensor,
         locks_i32_flat: cute.Tensor,
         smem_base: Int32,
         tid: Int32,
-        route_block_idx: Int32,
-        expert_idx: Int32,
+        m_tile_idx: Int32,
         output_n_tile: Int32,
         reduce_k_tile: Int32,
         reduce_tile_count: Int32,
@@ -1187,6 +1083,7 @@ class W4A16GemmKernel:
         (
             global_scale_f32,
             block_valid_rows,
+            m_tile_base,
             a_gl_stride,
             b_gl_stride,
             s_gl_stride,
@@ -1200,12 +1097,9 @@ class W4A16GemmKernel:
             s_sh_rd,
         ) = self._tile_common_prologue(
             global_scale,
-            packed_route_indices,
-            topk_weights_flat,
             smem_base,
             tid,
-            route_block_idx,
-            expert_idx,
+            m_tile_idx,
             output_n_tile,
         )
         a_sh_rd = self._a_shared_read_offset(tid, 16)
@@ -1223,6 +1117,7 @@ class W4A16GemmKernel:
             k_tiles,
             reduce_k_tile,
             block_valid_rows,
+            m_tile_base,
             a_gl_stride,
             b_gl_stride,
             s_gl_stride,
@@ -1273,6 +1168,7 @@ class W4A16GemmKernel:
             k_tiles,
             reduce_k_tile,
             block_valid_rows,
+            m_tile_base,
             a_gl_stride,
             b_gl_stride,
             s_gl_stride,
@@ -1321,6 +1217,7 @@ class W4A16GemmKernel:
         k_tiles: Int32,
         reduce_k_tile: Int32,
         block_valid_rows: Int32,
+        m_tile_base: Int32,
         a_gl_stride: Int32,
         b_gl_stride: Int32,
         s_gl_stride: Int32,
@@ -1366,6 +1263,7 @@ class W4A16GemmKernel:
                             k_tiles,
                             reduce_k_tile,
                             block_valid_rows,
+                            m_tile_base,
                             a_gl_stride,
                             b_gl_stride,
                             s_gl_stride,
@@ -2012,6 +1910,7 @@ class W4A16GemmKernel:
         pipe: Int32,
         tile_idx: Int32,
         block_valid_rows: Int32,
+        m_tile_base: Int32,
         a_gl_stride: Int32,
         b_gl_stride: Int32,
         s_gl_stride: Int32,
@@ -2025,13 +1924,12 @@ class W4A16GemmKernel:
     ):
         for i in cutlass.range_constexpr(self.a_sh_wr_iters):
             row = a_rows_per_iter * Int32(i) + a_gl_rd_row
-            route_index = Int32(0)
-            if row < Int32(self.moe_block_size):
-                route_index = ld_shared_i32_relaxed(
-                    smem_base + Int32(self.sh_rd_route_off * 16) + row * Int32(4)
-                )
+            # Dense: A is contiguous in M, so the global row is just
+            # ``m_tile_base + row``.  The donor read this from a per-tile
+            # smem route table.
+            global_row = m_tile_base + row
             a_int4 = (
-                route_index * a_gl_stride
+                global_row * a_gl_stride
                 + tile_idx * Int32(self.a_gl_rd_delta_o)
                 + a_gl_rd_col0
             )
@@ -2100,6 +1998,7 @@ class W4A16GemmKernel:
         k_tiles: Int32,
         reduce_k_tile: Int32,
         block_valid_rows: Int32,
+        m_tile_base: Int32,
         a_gl_stride: Int32,
         b_gl_stride: Int32,
         s_gl_stride: Int32,
@@ -2123,6 +2022,7 @@ class W4A16GemmKernel:
                 k_tiles,
                 reduce_k_tile,
                 block_valid_rows,
+                m_tile_base,
                 a_gl_stride,
                 b_gl_stride,
                 s_gl_stride,
@@ -2146,6 +2046,7 @@ class W4A16GemmKernel:
         k_tiles: Int32,
         reduce_k_tile: Int32,
         block_valid_rows: Int32,
+        m_tile_base: Int32,
         a_gl_stride: Int32,
         b_gl_stride: Int32,
         s_gl_stride: Int32,
@@ -2168,6 +2069,7 @@ class W4A16GemmKernel:
                     Int32(pipe),
                     reduce_k_tile + Int32(pipe),
                     block_valid_rows,
+                    m_tile_base,
                     a_gl_stride,
                     b_gl_stride,
                     s_gl_stride,
@@ -2197,6 +2099,7 @@ class W4A16GemmKernel:
         k_tiles: Int32,
         reduce_k_tile: Int32,
         block_valid_rows: Int32,
+        m_tile_base: Int32,
         a_gl_stride: Int32,
         b_gl_stride: Int32,
         s_gl_stride: Int32,
@@ -2219,6 +2122,7 @@ class W4A16GemmKernel:
                 Int32((pipe + _STAGES - 1) % _STAGES),
                 reduce_k_tile + fetch_tile,
                 block_valid_rows,
+                m_tile_base,
                 a_gl_stride,
                 b_gl_stride,
                 s_gl_stride,
