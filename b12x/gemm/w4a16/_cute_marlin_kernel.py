@@ -1053,6 +1053,7 @@ class W4A16GemmKernel:
             tid,
             output_n_tile,
             block_valid_rows,
+            m_tile_base,
             global_scale_f32,
             reduce_slice_count,
             reduce_slice_idx,
@@ -1191,6 +1192,7 @@ class W4A16GemmKernel:
             tid,
             output_n_tile,
             block_valid_rows,
+            m_tile_base,
             global_scale_f32,
             reduce_slice_count,
             reduce_slice_idx,
@@ -1346,6 +1348,7 @@ class W4A16GemmKernel:
         tid: Int32,
         output_n_tile: Int32,
         block_valid_rows: Int32,
+        m_tile_base: Int32,
         global_scale_f32: cutlass.Float32,
         reduce_slice_count: Int32,
         reduce_slice_idx: Int32,
@@ -1387,6 +1390,7 @@ class W4A16GemmKernel:
                     tid,
                     output_n_tile,
                     block_valid_rows,
+                    m_tile_base,
                     global_scale_f32,
                 )
             else:
@@ -1397,6 +1401,7 @@ class W4A16GemmKernel:
                     tid,
                     output_n_tile,
                     block_valid_rows,
+                    m_tile_base,
                     global_scale_f32,
                 )
 
@@ -2245,26 +2250,21 @@ class W4A16GemmKernel:
         c_sh_rd: Int32,
         c_sh_rd_delta: Int32,
         block_valid_rows: Int32,
+        m_tile_base: Int32,
         store_iters: cutlass.Constexpr[int],
     ):
         for _ in cutlass.range_constexpr(store_iters):
             row = c_gl_wr // c_gl_stride
             if row < block_valid_rows:
-                route_index = ld_shared_i32_relaxed(
-                    smem_base + Int32(self.sh_route_off * 16) + row * Int32(4)
-                )
-                true_idx = route_index * c_gl_stride + (c_gl_wr % c_gl_stride)
+                # Dense: output row is m_tile_base + row (no route lookup).
+                # Donor read this from the sh_route_off smem table.
+                global_row = m_tile_base + row
+                true_idx = global_row * c_gl_stride + (c_gl_wr % c_gl_stride)
                 q0, q1, q2, q3 = ld_shared_v4_u32(
                     self._int4_addr(smem_base, Int32(self.sh_red_off) + c_sh_rd)
                 )
-                if cutlass.const_expr(self.mul_topk_weights):
-                    scale_bf2 = ld_shared_u32(
-                        smem_base + Int32(self.sh_topk_off * 16) + row * Int32(4)
-                    )
-                    q0 = self._elem2_mul(q0, scale_bf2)
-                    q1 = self._elem2_mul(q1, scale_bf2)
-                    q2 = self._elem2_mul(q2, scale_bf2)
-                    q3 = self._elem2_mul(q3, scale_bf2)
+                # ``mul_topk_weights`` is hard-pinned to False for dense,
+                # so the topk-weight multiplication branch is dead.
                 if cutlass.const_expr(self.epilogue_relu2):
                     q0 = self._relu2_elem2(q0)
                     q1 = self._relu2_elem2(q1)
@@ -2290,6 +2290,7 @@ class W4A16GemmKernel:
         tid: Int32,
         output_n_tile: Int32,
         block_valid_rows: Int32,
+        m_tile_base: Int32,
         global_scale_f32: cutlass.Float32,
     ):
         c_gl_stride, c_sh_stride, c_gl_wr_delta, c_sh_rd_delta, c_gl_wr, c_sh_rd = (
@@ -2341,6 +2342,7 @@ class W4A16GemmKernel:
             c_sh_rd,
             c_sh_rd_delta,
             block_valid_rows,
+            m_tile_base,
             store_iters,
         )
 
@@ -2450,6 +2452,7 @@ class W4A16GemmKernel:
         tid: Int32,
         output_n_tile: Int32,
         block_valid_rows: Int32,
+        m_tile_base: Int32,
         global_scale_f32: cutlass.Float32,
     ):
         c_gl_stride, c_sh_stride, c_gl_wr_delta, c_sh_rd_delta, c_gl_wr, c_sh_rd = (
@@ -2512,6 +2515,7 @@ class W4A16GemmKernel:
             c_sh_rd,
             c_sh_rd_delta,
             block_valid_rows,
+            m_tile_base,
             store_iters,
         )
 
