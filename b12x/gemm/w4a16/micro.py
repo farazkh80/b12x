@@ -1,27 +1,34 @@
 """W4A16 dense GEMM micro kernel for SM120 / SM121.
 
-Three-tier dispatch:
+Four-tier dispatch:
 
 * **Decode** (M < ``B12X_GEMM_W4A16_PREFILL_M``, default 256):
   v4 forked CuTe-DSL kernel (``_cute_dense_kernel.py``), warp-level
   bf16 MMA, tile (32, 64, 64), 4 MMA warps.  Sweet spot for the
   Nano3.5 decode linears (M ≤ 32 originally; v4 still runs correctly
   at any M).
-* **Prefill / n_per_cta=1**
-  (``B12X_GEMM_W4A16_PREFILL_M`` ≤ M < ``B12X_GEMM_W4A16_N_PER_CTA2_M``,
-  default 256 ≤ M < 1024): v5 scaled-up CuTe-DSL kernel
-  (``_cute_prefill_kernel.py``), tile (128, 64, 64), 8 MMA warps.
-  General fallback — works at any (N, K) within the envelope.
-* **Prefill / n_per_cta=2** (M ≥ ``B12X_GEMM_W4A16_N_PER_CTA2_M``,
+* **Prefill v6 (Marlin-style)**
+  (M ≥ ``B12X_GEMM_W4A16_V6_M_MIN`` (default 512) AND
+   N ≥ ``B12X_GEMM_W4A16_V6_N_MIN`` (default 1024)):
+  v6 MoE-stripped cp.async + register-pipelined kernel
+  (``_cute_marlin_kernel.py``).  Wins ~25-45% over v5 on the 6 Nano3.5
+  shapes with N ≥ 1024; loses on N=256 (k_proj) so v5 stays the
+  fallback there.
+* **Prefill v5 / n_per_cta=1**
+  (``B12X_GEMM_W4A16_PREFILL_M`` ≤ M, fallback when v6 doesn't apply
+  and M < ``B12X_GEMM_W4A16_N_PER_CTA2_M``): v5 scaled-up CuTe-DSL
+  kernel (``_cute_prefill_kernel.py``), tile (128, 64, 64), 8 MMA warps.
+* **Prefill v5 / n_per_cta=2** (M ≥ ``B12X_GEMM_W4A16_N_PER_CTA2_M``,
   default 1024, and ``num_n_tiles % 2 == 0``): v5 with A-reuse across
   2 consecutive N-tiles per CTA — cuts A TMA traffic in half, wins
-  ~25-30% at large M.  Falls back to n_per_cta=1 when N isn't a
-  multiple of 128 (e.g. ``mamba_in_proj`` with N=10304).
+  ~25-30% over v5/n=1 at large M.  Used when v6 doesn't apply (e.g.
+  small N).
 
-Both backends share weight layout and accuracy gates.
+All backends share weight layout and accuracy gates.
 
 Set ``B12X_GEMM_W4A16_FORCE_REFERENCE=1`` to fall back to the Python
 reference (useful for accuracy debugging — runs on CPU).
+Set ``B12X_GEMM_W4A16_DISABLE_V6=1`` to disable v6 dispatch entirely.
 """
 
 from __future__ import annotations
@@ -32,6 +39,7 @@ from typing import Optional
 import torch
 
 from ._cute_dense_kernel import DenseGemmW4A16CuteDenseKernel
+from ._cute_marlin_kernel import DenseGemmW4A16CuteMarlinKernel
 from ._cute_prefill_kernel import DenseGemmW4A16CutePrefillKernel
 from .reference import dense_reference_w4a16
 
@@ -82,9 +90,26 @@ _TILE_K_SMALL = 32   # for K ≤ _TILE_K_SMALL_K_MAX
 _TILE_K_LARGE = 64   # default
 _TILE_K_SMALL_K_MAX = int(os.environ.get("B12X_GEMM_W4A16_TILE_K_SMALL_K_MAX", "3712"))
 
+# v6 (Marlin-style) crossover.  Spark perf sweep on 7 Nano3.5 dense
+# shapes × M ∈ {512, 1024, 2048, 4096} (see .claude/scripts/v6_perf_sweep.py):
+# v6 wins by 25-45% over v5 on all shapes with N ≥ 1024 starting at M=512;
+# v6 loses 1.1-1.8× on k_proj (N=256) so the threshold gates it out.
+# k_proj is the only Nano3.5 dense linear with N < 1024.
+_V6_M_MIN = int(os.environ.get("B12X_GEMM_W4A16_V6_M_MIN", "512"))
+_V6_N_MIN = int(os.environ.get("B12X_GEMM_W4A16_V6_N_MIN", "1024"))
+_V6_DISABLED = os.environ.get("B12X_GEMM_W4A16_DISABLE_V6") == "1"
+
 
 def _use_prefill(m: int) -> bool:
     return m >= _DEFAULT_PREFILL_M
+
+
+def _use_v6(m: int, k: int, n: int) -> bool:
+    if _V6_DISABLED:
+        return False
+    if m < _V6_M_MIN or n < _V6_N_MIN:
+        return False
+    return DenseGemmW4A16CuteMarlinKernel.is_supported(m, k, n)
 
 
 class DenseGemmW4A16MicroKernel:
@@ -92,7 +117,8 @@ class DenseGemmW4A16MicroKernel:
 
     @classmethod
     def is_supported(cls, m: int, k: int, n: int) -> bool:
-        # Either backend must accept the shape.
+        # Either backend must accept the shape.  v6 inherits the v5
+        # support envelope (its shape constraints are a strict subset).
         if _use_prefill(m):
             return DenseGemmW4A16CutePrefillKernel.is_supported(m, k, n)
         return DenseGemmW4A16CuteDenseKernel.is_supported(m, k, n)
@@ -102,6 +128,9 @@ class DenseGemmW4A16MicroKernel:
         # Cache prefill instances keyed by (tile_k, n_per_cta).
         # Picked per-call based on (K, N, M); see ``_pick_prefill_cfg``.
         self._prefill_cache: dict = {}
+        # v6 is shape-agnostic at construction time: it picks cta_m_size
+        # + tile_n + tile_k per call from M/N/K via _select_tile_config.
+        self._v6: DenseGemmW4A16CuteMarlinKernel | None = None
 
     def _pick_prefill_cfg(self, m: int, k: int, n: int):
         """Return (tile_k, n_per_cta) — autotune-derived dispatch.
@@ -170,6 +199,13 @@ class DenseGemmW4A16MicroKernel:
             return out
 
         if _use_prefill(m):
+            if _use_v6(m, k, n):
+                if self._v6 is None:
+                    self._v6 = DenseGemmW4A16CuteMarlinKernel()
+                return self._v6(
+                    x.contiguous(), w_fp4.contiguous(), w_blockscale.contiguous(),
+                    w_alpha.contiguous(), out=out,
+                )
             return self._pick_prefill(m, k, n)(
                 x.contiguous(), w_fp4.contiguous(), w_blockscale.contiguous(),
                 w_alpha.contiguous(), out=out,
