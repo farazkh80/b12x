@@ -2544,15 +2544,18 @@ def compile_w4a16_gemm(
     size_m: int,
     size_n: int,
     size_k: int,
-    num_experts: int,
-    top_k: int,
-    mul_topk_weights: bool,
     tile_n: int,
     tile_k: int,
-    moe_block_size: int,
-    max_m_blocks: int,
+    cta_m_size: int,
     element_dtype: str = "bf16",
 ) -> W4A16GemmCompileResult:
+    """Compile a dense W4A16 GEMM kernel for the given problem shape + tile.
+
+    Returns a cached ``W4A16GemmCompileResult``.  The compiled callable
+    expects 7 device tensors:
+      a, b_packed_i32, c, scales_i32, global_scale, c_tmp_f32, locks_i32
+    plus a CUDA stream.  Tile arithmetic comes from the donor MoE kernel.
+    """
     cutlass_dtype = _cutlass_element_dtype(element_dtype)
     if torch.cuda.is_available():
         device = int(torch.cuda.current_device())
@@ -2566,7 +2569,7 @@ def compile_w4a16_gemm(
         sms = 120
         max_shared_mem = _DEFAULT_MAX_SHARED_MEM
     cache_key = (
-        "w4a16_gemm",
+        "w4a16_marlin_dense",
         device,
         sms,
         max_shared_mem,
@@ -2574,69 +2577,52 @@ def compile_w4a16_gemm(
         size_m,
         size_n,
         size_k,
-        num_experts,
-        top_k,
-        mul_topk_weights,
         tile_n,
         tile_k,
-        moe_block_size,
-        max_m_blocks,
+        cta_m_size,
     )
     cached = _CACHE.get(cache_key)
     if cached is not None:
         return cached
+
+    max_m_blocks = (size_m + cta_m_size - 1) // cta_m_size
 
     a_fake = cute.runtime.make_fake_compact_tensor(
         cutlass_dtype,
         (size_m * size_k,),
         assumed_align=16,
     )
+    # Packed B is in donor's _repack_4bit_no_perm output shape:
+    # (size_k // 16) * (size_n // 16 * 32) int32 words = K*N/8 int32 = K*N/2 bytes.
     b_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
-        (num_experts * (size_k // 16) * (size_n // 16 * 32),),
+        ((size_k // 16) * (size_n // 16 * 32),),
         assumed_align=16,
     )
     c_fake = cute.runtime.make_fake_compact_tensor(
         cutlass_dtype,
-        (size_m * top_k * size_n,),
+        (size_m * size_n,),
         assumed_align=16,
     )
+    # Permuted FP8 scales (donor's _permute_packed_scales): (K/16) * (N/4) i32.
     scales_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
-        (num_experts * (size_k // 16) * (size_n // 4),),
+        ((size_k // 16) * (size_n // 4),),
         assumed_align=16,
     )
     global_scale_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,
-        (num_experts,),
-        assumed_align=16,
-    )
-    packed_routes_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (max_m_blocks * moe_block_size,),
-        assumed_align=16,
-    )
-    block_experts_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (max_m_blocks,),
-        assumed_align=16,
-    )
-    route_count_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
         (1,),
-        assumed_align=4,
+        assumed_align=16,
     )
-    topk_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32,
-        (size_m * top_k,),
-        assumed_align=4,
-    )
+    # Split-K scratch + atomic locks.  Sized like the donor; the dense
+    # kernel uses split-K when reduce_slice_count > 1 in the scheduler.
     c_tmp_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,
         (
             max(
-                size_n * max_m_blocks * moe_block_size,
-                4 * 256 * moe_block_size * 256,
+                size_n * max_m_blocks * cta_m_size,
+                4 * 256 * cta_m_size * 256,
             ),
         ),
         assumed_align=16,
@@ -2647,20 +2633,13 @@ def compile_w4a16_gemm(
         assumed_align=16,
     )
 
-    # NOTE: this caller still passes the donor's MoE-shaped arg list to be
-    # compatible with the existing in-tree call sites; the values for
-    # num_experts/top_k/mul_topk_weights/max_m_blocks/moe_block_size are
-    # accepted in the cache key but only ``moe_block_size`` (renamed to
-    # ``cta_m_size`` in the constructor) is forwarded to the kernel.
-    # num_experts/top_k/mul_topk_weights are now hard-pinned to 1/1/False
-    # inside W4A16GemmKernel.__init__.
     kernel = W4A16GemmKernel(
         size_m=size_m,
         size_n=size_n,
         size_k=size_k,
         tile_n=tile_n,
         tile_k=tile_k,
-        cta_m_size=moe_block_size,
+        cta_m_size=cta_m_size,
         element_dtype=element_dtype,
     )
     raise_if_kernel_resolution_frozen(
@@ -2673,10 +2652,6 @@ def compile_w4a16_gemm(
         c_fake,
         scales_fake,
         global_scale_fake,
-        packed_routes_fake,
-        block_experts_fake,
-        route_count_fake,
-        topk_fake,
         c_tmp_fake,
         locks_fake,
         current_cuda_stream(),
@@ -2685,7 +2660,7 @@ def compile_w4a16_gemm(
         compiled=compiled,
         tile_n=tile_n,
         tile_k=tile_k,
-        moe_block_size=moe_block_size,
+        moe_block_size=cta_m_size,
         max_m_blocks=max_m_blocks,
         blocks_per_sm=kernel.blocks_per_sm,
     )
