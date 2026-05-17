@@ -45,13 +45,24 @@ _DEFAULT_PREFILL_M = int(os.environ.get("B12X_GEMM_W4A16_PREFILL_M", "256"))
 
 # v5's n_per_cta=2 path reuses rA across 2 consecutive N-tiles in one
 # work-pair — cuts A traffic in half, wins ~25-30% at M ≥ 1024 on
-# wide-N shapes (o_proj, shared.dn, mamba_out at N=2688).  Loses
-# when N is small (k_proj N=256: ~2× slower) because pairing two N
-# tiles halves parallelism but the kernel is already SM-saturation
-# bound there, not A-traffic bound.  Conditions to engage:
+# wide-N shapes (o_proj, shared.dn, mamba_out at N=2688).  Loses when
+# N is small (k_proj N=256: ~2× slower) because pairing two N tiles
+# halves parallelism but the kernel is already SM-saturation bound
+# there, not A-traffic bound.  Conditions to engage:
 #   1. M ≥ _DEFAULT_N_PER_CTA2_M     (enough M to amortize)
-#   2. num_n_tiles % 2 == 0          (kernel constraint)
-#   3. num_n_tiles ≥ _N_PER_CTA2_NT  (preserve grid parallelism)
+#   2. num_n_tiles ≥ _N_PER_CTA2_NT  (preserve grid parallelism)
+#   3. num_n_tiles % 2 == 0          (kernel constraint)
+#
+# mamba_in_proj (K=2688, N=10304) has num_n_tiles=161 (odd) so it
+# can't engage condition 3.  Investigated splitting into two launches
+# (n_per_cta=2 over an even prefix + n_per_cta=1 tail): kernel-only
+# win is just ~3.7% at this shape because the bottleneck is B traffic
+# (10.4 MB FP4 weight) and cooperative FP4-decode staging, not A
+# reuse.  The two-launch overhead (alloc + copy-back) wipes that
+# delta out and goes net negative.  Conclusion: leave mamba_in_proj
+# on n_per_cta=1; the 1.20× v5/marlin ratio at M=2048 on this shape
+# reflects the kernel's structural memory-traffic profile, not a
+# dispatch oversight.
 _DEFAULT_N_PER_CTA2_M = int(os.environ.get("B12X_GEMM_W4A16_N_PER_CTA2_M", "1024"))
 _N_PER_CTA2_NT_MIN = int(os.environ.get("B12X_GEMM_W4A16_N_PER_CTA2_NT_MIN", "8"))
 
