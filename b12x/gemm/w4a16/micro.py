@@ -43,28 +43,44 @@ _DECODE_M_MAX = 32   # v4 was tuned for M ∈ [1, 32] but can run at any M
 # equal — default to v5 from 256 onward to be safe; override via env.
 _DEFAULT_PREFILL_M = int(os.environ.get("B12X_GEMM_W4A16_PREFILL_M", "256"))
 
-# v5's n_per_cta=2 path reuses rA across 2 consecutive N-tiles in one
-# work-pair — cuts A traffic in half, wins ~25-30% at M ≥ 1024 on
-# wide-N shapes (o_proj, shared.dn, mamba_out at N=2688).  Loses when
-# N is small (k_proj N=256: ~2× slower) because pairing two N tiles
-# halves parallelism but the kernel is already SM-saturation bound
-# there, not A-traffic bound.  Conditions to engage:
-#   1. M ≥ _DEFAULT_N_PER_CTA2_M     (enough M to amortize)
-#   2. num_n_tiles ≥ _N_PER_CTA2_NT  (preserve grid parallelism)
-#   3. num_n_tiles % 2 == 0          (kernel constraint)
+# v5's (tile_K, n_per_cta) selection is shape-driven.  Autotune sweep
+# at M ∈ {1024, 2048, 4096} on the Nano3.5 dense linears (see
+# ``scripts/tune_prefill_v5.py``) tuned to **Spark (NVIDIA GB10, SM121,
+# 48 SMs)** — the production target.  Rules:
 #
-# mamba_in_proj (K=2688, N=10304) has num_n_tiles=161 (odd) so it
-# can't engage condition 3.  Investigated splitting into two launches
-# (n_per_cta=2 over an even prefix + n_per_cta=1 tail): kernel-only
-# win is just ~3.7% at this shape because the bottleneck is B traffic
-# (10.4 MB FP4 weight) and cooperative FP4-decode staging, not A
-# reuse.  The two-launch overhead (alloc + copy-back) wipes that
-# delta out and goes net negative.  Conclusion: leave mamba_in_proj
-# on n_per_cta=1; the 1.20× v5/marlin ratio at M=2048 on this shape
-# reflects the kernel's structural memory-traffic profile, not a
-# dispatch oversight.
+#   K ≤ 3712 (q_proj, k_proj, shared.up, shared.dn, mamba_in_proj):
+#       tile_K=32, n_per_cta=1
+#       — 8-15% win over baseline (tile_K=64, n=1) across all M.
+#         Smaller K means fewer total K-tiles; tile_K=32 doubles
+#         K-tile count for finer-grain pipeline overlap and better
+#         SM saturation on Spark's small (48) SM count.  n=2 doesn't
+#         help at tile_K=32 here — the kernel is already saturated.
+#
+#   K ≥ 4096 (o_proj, mamba_output_proj):
+#       tile_K=64, n_per_cta=2 (if eligible, else 1)
+#       — 8% win.  Larger K already has enough K-tiles at the coarse
+#         setting; smaller tile_K adds overhead without payoff.
+#         A-reuse via n_per_cta=2 dominates the speedup.
+#
+# n_per_cta=2 eligibility (only applies when tile_K=64):
+#   * M ≥ _DEFAULT_N_PER_CTA2_M (enough M to amortize)
+#   * num_n_tiles % 2 == 0      (kernel constraint — no half-pair support)
+#   * num_n_tiles ≥ _N_PER_CTA2_NT_MIN (preserve grid parallelism)
+#
+# Local-vs-Spark divergence: on the dev SM120 box (RTX PRO 6000
+# Blackwell, ~144 SMs), shared.dn picks (32, 2) and q_proj M=2048
+# picks (64, 2).  We optimize for Spark since (a) it's the production
+# target and (b) the Marlin baselines we benchmark against were
+# captured there.  The Spark rule is ≤9% suboptimal vs the local-best
+# on local hardware (q_proj M=2048 only).
+#
+# ab_stage stays at 2 on both: ab_stage=3 was never a win (the kernel
+# isn't pipeline-stage-starved at smem-fitting depths).
 _DEFAULT_N_PER_CTA2_M = int(os.environ.get("B12X_GEMM_W4A16_N_PER_CTA2_M", "1024"))
 _N_PER_CTA2_NT_MIN = int(os.environ.get("B12X_GEMM_W4A16_N_PER_CTA2_NT_MIN", "8"))
+_TILE_K_SMALL = 32   # for K ≤ _TILE_K_SMALL_K_MAX
+_TILE_K_LARGE = 64   # default
+_TILE_K_SMALL_K_MAX = int(os.environ.get("B12X_GEMM_W4A16_TILE_K_SMALL_K_MAX", "3712"))
 
 
 def _use_prefill(m: int) -> bool:
@@ -83,26 +99,41 @@ class DenseGemmW4A16MicroKernel:
 
     def __init__(self) -> None:
         self._decode: DenseGemmW4A16CuteDenseKernel | None = None
-        # Two prefill instances: n_per_cta=1 (general) and n_per_cta=2
-        # (A-reuse fast path).  Pick by M + N divisibility at call time.
-        self._prefill_n1: DenseGemmW4A16CutePrefillKernel | None = None
-        self._prefill_n2: DenseGemmW4A16CutePrefillKernel | None = None
+        # Cache prefill instances keyed by (tile_k, n_per_cta).
+        # Picked per-call based on (K, N, M); see ``_pick_prefill_cfg``.
+        self._prefill_cache: dict = {}
 
-    def _pick_prefill(self, m: int, n: int) -> DenseGemmW4A16CutePrefillKernel:
+    def _pick_prefill_cfg(self, m: int, k: int, n: int):
+        """Return (tile_k, n_per_cta) — autotune-derived dispatch.
+
+        See ``B12X_GEMM_W4A16_TILE_K_SMALL_K_MAX`` etc. for env knobs.
+        """
         tile_n = DenseGemmW4A16CutePrefillKernel._TILE_N
         num_n_tiles = n // tile_n
-        use_n2 = (
+
+        # K-driven tile_K + n_per_cta selection (Spark-tuned; see the
+        # block comment above).
+        if k <= _TILE_K_SMALL_K_MAX:
+            # Small-to-mid K: fine K-tile, no A-reuse.  n_per_cta=1
+            # wins for every shape with K ≤ 3712 on Spark.
+            return _TILE_K_SMALL, 1
+
+        # Large K (≥ 4096): coarse K-tile + A-reuse.
+        eligible_n2 = (
             m >= _DEFAULT_N_PER_CTA2_M
             and num_n_tiles % 2 == 0
             and num_n_tiles >= _N_PER_CTA2_NT_MIN
         )
-        if use_n2:
-            if self._prefill_n2 is None:
-                self._prefill_n2 = DenseGemmW4A16CutePrefillKernel(n_per_cta=2)
-            return self._prefill_n2
-        if self._prefill_n1 is None:
-            self._prefill_n1 = DenseGemmW4A16CutePrefillKernel(n_per_cta=1)
-        return self._prefill_n1
+        return _TILE_K_LARGE, (2 if eligible_n2 else 1)
+
+    def _pick_prefill(self, m: int, k: int, n: int) -> DenseGemmW4A16CutePrefillKernel:
+        cfg = self._pick_prefill_cfg(m, k, n)
+        if cfg not in self._prefill_cache:
+            tile_k, n_per_cta = cfg
+            self._prefill_cache[cfg] = DenseGemmW4A16CutePrefillKernel(
+                tile_k=tile_k, n_per_cta=n_per_cta,
+            )
+        return self._prefill_cache[cfg]
 
     def __call__(
         self,
@@ -125,7 +156,7 @@ class DenseGemmW4A16MicroKernel:
             return out
 
         if _use_prefill(m):
-            return self._pick_prefill(m, n)(
+            return self._pick_prefill(m, k, n)(
                 x.contiguous(), w_fp4.contiguous(), w_blockscale.contiguous(),
                 w_alpha.contiguous(), out=out,
             )
