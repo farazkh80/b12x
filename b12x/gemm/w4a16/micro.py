@@ -111,19 +111,33 @@ class DenseGemmW4A16MicroKernel:
         tile_n = DenseGemmW4A16CutePrefillKernel._TILE_N
         num_n_tiles = n // tile_n
 
-        # K-driven tile_K + n_per_cta selection (Spark-tuned; see the
-        # block comment above).
-        if k <= _TILE_K_SMALL_K_MAX:
-            # Small-to-mid K: fine K-tile, no A-reuse.  n_per_cta=1
-            # wins for every shape with K ≤ 3712 on Spark.
-            return _TILE_K_SMALL, 1
-
-        # Large K (≥ 4096): coarse K-tile + A-reuse.
         eligible_n2 = (
             m >= _DEFAULT_N_PER_CTA2_M
             and num_n_tiles % 2 == 0
             and num_n_tiles >= _N_PER_CTA2_NT_MIN
         )
+
+        # K-driven tile_K + n_per_cta selection (Spark-tuned).
+        # First-pass rule was: K ≤ 3712 -> (tile_K=32, n=1); K ≥ 4096 ->
+        # (tile_K=64, n=2 if eligible else 1).  Extended autotune on
+        # 2026-05-17 sweeping num_mma_warps ∈ {4, 8} and tile_M ∈ {64,
+        # 128} (see scripts/tune_prefill_v5.py) showed one mis-dispatch:
+        # q_proj (K=2688, N=4096, num_n_tiles=64) prefers (tile_K=64,
+        # n_per_cta=2) at 981 µs over the small-K rule's (tile_K=32, n=1)
+        # at 1063 µs — an 8% win.  Other K=2688 shapes (shared.up/dn,
+        # mamba_in_proj, k_proj) still prefer (tile_K=32, n=1) or are
+        # n=2-ineligible (odd num_n_tiles).
+        #
+        # Discriminator: N/K ratio.  When N/K > 1.5 AND n=2 is eligible,
+        # there's enough N-direction work to amortize A reloads via
+        # n_per_cta=2 at the coarser tile_K=64; otherwise small tile_K
+        # wins for pipeline-overlap reasons.
+        if k <= _TILE_K_SMALL_K_MAX:
+            if eligible_n2 and n * 2 > k * 3:  # N/K > 1.5
+                return _TILE_K_LARGE, 2
+            return _TILE_K_SMALL, 1
+
+        # Large K (≥ 4096): coarse K-tile + A-reuse.
         return _TILE_K_LARGE, (2 if eligible_n2 else 1)
 
     def _pick_prefill(self, m: int, k: int, n: int) -> DenseGemmW4A16CutePrefillKernel:

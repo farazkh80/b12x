@@ -40,22 +40,35 @@ _SHAPES = [
 
 # Configs to try.  tile_N=64 fixed (atom_layout dependency).
 # n_per_cta=2 skipped when num_n_tiles is odd.
-# Schema: (tile_m, tile_k, ab_stage, n_per_cta).
-_CONFIGS: List[Tuple[int, int, int, int]] = [
-    # tile_M=128 (current baseline tier)
-    (128, 64, 2, 1),   # baseline
-    (128, 64, 3, 1),
-    (128, 32, 2, 1),
-    (128, 32, 3, 1),
-    (128, 64, 2, 2),
-    (128, 32, 2, 2),
-    # tile_M=64 (new: halves smem + accumulator → expects 2 blocks/SM)
-    (64,  64, 2, 1),
-    (64,  64, 3, 1),
-    (64,  32, 2, 1),
-    (64,  32, 3, 1),
-    (64,  64, 2, 2),
-    (64,  32, 2, 2),
+# Schema: (tile_m, tile_k, ab_stage, n_per_cta, num_mma_warps).
+_CONFIGS: List[Tuple[int, int, int, int, int]] = [
+    # --- baseline tier: tile_M=128, num_mma_warps=8 ---
+    (128, 64, 2, 1, 8),   # baseline
+    (128, 32, 2, 1, 8),
+    (128, 64, 2, 2, 8),
+    (128, 32, 2, 2, 8),
+    (128, 64, 3, 1, 8),
+
+    # --- tile_M=64, num_mma_warps=8 (already swept; for comparison) ---
+    ( 64, 64, 2, 1, 8),
+    ( 64, 32, 2, 1, 8),
+    ( 64, 64, 2, 2, 8),
+    ( 64, 32, 2, 2, 8),
+
+    # --- NEW: tile_M=64, num_mma_warps=4 (halves register pressure,
+    # halves smem, expected to fit 2 blocks/SM on Spark) ---
+    ( 64, 64, 2, 1, 4),
+    ( 64, 32, 2, 1, 4),
+    ( 64, 64, 2, 2, 4),
+    ( 64, 32, 2, 2, 4),
+    ( 64, 64, 3, 1, 4),
+    ( 64, 32, 3, 1, 4),
+
+    # --- NEW: tile_M=128, num_mma_warps=4 (full M tile but half the warp
+    # count — accumulator per warp doubles, register pressure stays high
+    # but block count drops; included to isolate which side dominates) ---
+    (128, 64, 2, 1, 4),
+    (128, 32, 2, 1, 4),
 ]
 
 
@@ -115,7 +128,7 @@ def main() -> int:
 
         num_n_tiles = n // 64
         print(f"\n=== {name}  K={k} N={n} (num_n_tiles={num_n_tiles}) ===")
-        hdr = f"{'M':>5} {'tM':>4} {'tK':>3} {'ab':>3} {'n/cta':>5} {'us':>8} {'vs base':>8} {'status':>8}"
+        hdr = f"{'M':>5} {'tM':>4} {'tK':>3} {'ab':>3} {'n/cta':>5} {'wrps':>4} {'us':>8} {'vs base':>8} {'status':>10}"
         print(hdr)
         print("-" * len(hdr))
 
@@ -126,7 +139,7 @@ def main() -> int:
 
             baseline_us = None
             results = []
-            for tile_m, tile_k, ab, npc in _CONFIGS:
+            for tile_m, tile_k, ab, npc, warps in _CONFIGS:
                 # Skip n_per_cta=2 when num_n_tiles isn't even.
                 if npc > 1 and num_n_tiles % npc != 0:
                     continue
@@ -139,35 +152,42 @@ def main() -> int:
                 # K must be a multiple of tile_k.
                 if k % tile_k != 0:
                     continue
+                # tile_M must be a multiple of (atom_M * mma_M):
+                #   warps=8 -> atom_M=4, mma_M=16 -> m_atom=64
+                #   warps=4 -> atom_M=2, mma_M=16 -> m_atom=32
+                m_atom = 64 if warps == 8 else 32
+                if tile_m % m_atom != 0:
+                    continue
 
                 try:
                     kern = DenseGemmW4A16CutePrefillKernel(
-                        tile_m=tile_m, tile_k=tile_k, ab_stage=ab, n_per_cta=npc,
+                        tile_m=tile_m, tile_k=tile_k, ab_stage=ab,
+                        n_per_cta=npc, num_mma_warps=warps,
                     )
                     ok = _check_accuracy(kern, x, w_fp4, w_bs, w_alpha)
                     if not ok:
-                        results.append((tile_m, tile_k, ab, npc, None, "FAIL_ACC"))
+                        results.append((tile_m, tile_k, ab, npc, warps, None, "FAIL_ACC"))
                         continue
                     us = _bench(lambda: kern(x, w_fp4, w_bs, w_alpha, out=out_buf),
                                 warmup=args.warmup, iters=args.iters)
                     if (baseline_us is None and tile_m == 128 and tile_k == 64
-                            and ab == 2 and npc == 1):
+                            and ab == 2 and npc == 1 and warps == 8):
                         baseline_us = us
-                    results.append((tile_m, tile_k, ab, npc, us, "OK"))
+                    results.append((tile_m, tile_k, ab, npc, warps, us, "OK"))
                 except Exception as e:
-                    results.append((tile_m, tile_k, ab, npc, None, f"FAIL: {str(e)[:30]}"))
+                    results.append((tile_m, tile_k, ab, npc, warps, None, f"FAIL: {str(e)[:25]}"))
 
             # Print sorted by time (descending)
-            ok_results = [r for r in results if r[4] is not None]
-            ok_results.sort(key=lambda r: r[4])
+            ok_results = [r for r in results if r[5] is not None]
+            ok_results.sort(key=lambda r: r[5])
             best = ok_results[0] if ok_results else None
-            for tile_m, tile_k, ab, npc, us, status in results:
+            for tile_m, tile_k, ab, npc, warps, us, status in results:
                 if us is None:
-                    print(f"{m:5d} {tile_m:>4d} {tile_k:>3d} {ab:>3d} {npc:>5d} {'—':>8s} {'—':>8s} {status:>8s}")
+                    print(f"{m:5d} {tile_m:>4d} {tile_k:>3d} {ab:>3d} {npc:>5d} {warps:>4d} {'—':>8s} {'—':>8s} {status:>10s}")
                 else:
                     ratio = f"{us/baseline_us:.2f}x" if baseline_us else "—"
-                    star = "  *" if (best and (tile_m, tile_k, ab, npc) == best[:4]) else ""
-                    print(f"{m:5d} {tile_m:>4d} {tile_k:>3d} {ab:>3d} {npc:>5d} {us:7.1f}us {ratio:>8s} {status:>8s}{star}")
+                    star = "  *" if (best and (tile_m, tile_k, ab, npc, warps) == best[:5]) else ""
+                    print(f"{m:5d} {tile_m:>4d} {tile_k:>3d} {ab:>3d} {npc:>5d} {warps:>4d} {us:7.1f}us {ratio:>8s} {status:>10s}{star}")
     return 0
 
 
