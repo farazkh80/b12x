@@ -54,8 +54,18 @@ from b12x.cute.fp4 import (
     threadfence,
 )
 from b12x.cute.utils import current_cuda_stream
+from b12x.moe.fused.w4a16.host import unswizzle_block_scale
+from b12x.moe.fused.w4a16.prepare import (
+    _nvfp4_compute_scale_factor,
+    _permute_packed_scales,
+    _process_nvfp4_packed_global_scale,
+    _process_nvfp4_packed_scales,
+    _repack_4bit_no_perm,
+)
 from b12x.runtime_control import raise_if_kernel_resolution_frozen
 
+
+_SF_VEC_SIZE = 16
 
 # CTA M-tile granularity.  Inherited from the MoE donor kernel.  8 picks a
 # special small-M code path; others use the large-M path.
@@ -2667,4 +2677,349 @@ def compile_w4a16_gemm(
     _CACHE[cache_key] = result
     return result
 
+
+@dataclass(frozen=True)
+class _DenseMarlinPackedWeights:
+    """v5-format dense weights repacked for the MoE-stripped kernel.
+
+    * ``b_packed_i32``: flat int32, ``K*N/8`` elements, ``_repack_4bit_no_perm`` layout.
+    * ``scales_i32``: flat int32, ``K*N/64`` elements, permuted + processed FP8 scales.
+    * ``global_scale``: shape ``(1,)`` float32, processed via
+      ``_process_nvfp4_packed_global_scale`` and divided by the combined scale factor.
+    """
+
+    b_packed_i32: torch.Tensor
+    scales_i32: torch.Tensor
+    global_scale: torch.Tensor
+
+
+def _pack_dense_weights_for_marlin(
+    w_fp4: torch.Tensor,
+    w_blockscale_swizzled: torch.Tensor,
+    w_alpha: torch.Tensor,
+    *,
+    size_n: int,
+    size_k: int,
+    a_dtype: torch.dtype = torch.bfloat16,
+) -> _DenseMarlinPackedWeights:
+    """Convert v5-format quantized weights to the MoE kernel's packed layout.
+
+    Steps mirror ``prepare_w4a16_packed_weights`` minus the expert dim:
+
+    1. ``w_fp4 (N, K/2) u8`` → view as int32 ``(N, K/8) i32`` → transpose
+       to ``(K/8, N) i32`` → ``_repack_4bit_no_perm`` → ``(K/16, 2N) i32``.
+    2. swizzled FP8 scales → ``unswizzle_block_scale`` → ``(N, K/16) f32``
+       → cast to ``a_dtype`` → ``_permute_packed_scales(scales.T, ...)``
+       → ``_process_nvfp4_packed_scales`` → ``(K/16, N) fp8`` viewed as i32.
+    3. ``w_alpha`` (scalar f32) → ``_process_nvfp4_packed_global_scale``
+       (fold FP4 → ``a_dtype`` exponent-bias shift) → divide by
+       ``combined_scale_factor`` from step 2.
+    """
+    qweight_i32 = w_fp4.view(torch.int32).T.contiguous()
+    b_packed = _repack_4bit_no_perm(qweight_i32, size_k=size_k, size_n=size_n)
+    b_packed_flat = b_packed.contiguous().view(-1)
+
+    cols_blocks = size_k // _SF_VEC_SIZE
+    scales_unswizzled_f32 = unswizzle_block_scale(
+        w_blockscale_swizzled, rows=size_n, cols_blocks=cols_blocks,
+    )
+    scales_fp8 = scales_unswizzled_f32.to(torch.float8_e4m3fn)
+    scales_a_dtype = scales_fp8.to(a_dtype)
+    combined_scale_factor = _nvfp4_compute_scale_factor(scales_a_dtype, a_dtype)
+    packed_scales = _permute_packed_scales(
+        scales_a_dtype.T,
+        size_k=size_k,
+        size_n=size_n,
+        group_size=_SF_VEC_SIZE,
+    )
+    processed_scales = _process_nvfp4_packed_scales(
+        packed_scales, scale_factor=combined_scale_factor,
+    )
+    scales_i32_flat = (
+        processed_scales.view(torch.uint8).view(torch.int32).contiguous().view(-1)
+    )
+
+    alpha_1d = w_alpha.reshape(1).contiguous()
+    processed_global = _process_nvfp4_packed_global_scale(
+        alpha_1d, a_dtype=a_dtype,
+    ).to(torch.float32)
+    processed_global = (processed_global / combined_scale_factor).contiguous()
+
+    return _DenseMarlinPackedWeights(
+        b_packed_i32=b_packed_flat,
+        scales_i32=scales_i32_flat,
+        global_scale=processed_global,
+    )
+
+
+class DenseGemmW4A16CuteMarlinKernel:
+    """W4A16 dense GEMM cute backend, v6 (Marlin-style cp.async + register pipeline).
+
+    Strip-port of ``b12x/moe/fused/w4a16/kernel.py`` to the dense case
+    (one expert, no top-k routing).  Same FP4 dequant + bf16 MMA atom as
+    the MoE donor; the routing/expert/topk axes have been stripped so each
+    CTA computes one ``(cta_m_size x tile_n)`` output tile of a dense
+    matmul against the donor's pre-pipelined cp.async + register-tiled
+    epilogue.
+
+    Public surface mirrors ``DenseGemmW4A16CutePrefillKernel`` (v5): takes
+    v5-format ``(w_fp4, w_blockscale, w_alpha)`` and repacks internally
+    to the MoE kernel's input layout (cached per weight tensor identity).
+    """
+
+    _ALLOWED_CTA_M_SIZES = _ALLOWED_ROUTED_SIZES
+
+    @classmethod
+    def is_supported(cls, m: int, k: int, n: int) -> bool:
+        if m <= 0 or k <= 0 or n <= 0:
+            return False
+        # _repack_4bit_no_perm requires K%16==0 and N%64==0.
+        # The smallest tile_k/tile_n in the config tables is 64, and tile_k|k
+        # + tile_n|n must hold.
+        if k % 64 != 0 or n % 64 != 0:
+            return False
+        return True
+
+    def is_supported_instance(self, m: int, k: int, n: int) -> bool:
+        return self.is_supported(m, k, n)
+
+    def __init__(
+        self,
+        *,
+        cta_m_size: int | None = None,
+        tile_n: int | None = None,
+        tile_k: int | None = None,
+        element_dtype: str = "bf16",
+    ) -> None:
+        if cta_m_size is not None and cta_m_size not in self._ALLOWED_CTA_M_SIZES:
+            raise ValueError(
+                f"cta_m_size must be one of {self._ALLOWED_CTA_M_SIZES}, got {cta_m_size}"
+            )
+        if element_dtype not in {"bf16", "fp16"}:
+            raise ValueError(f"unsupported element_dtype {element_dtype!r}")
+        self._cta_m_size = cta_m_size
+        self._tile_n = tile_n
+        self._tile_k = tile_k
+        self._element_dtype = element_dtype
+        self._a_dtype = (
+            torch.bfloat16 if element_dtype == "bf16" else torch.float16
+        )
+        self._weight_cache: dict = {}
+        self._scratch_cache: dict = {}
+
+    def _pick_cta_m_size(self, m: int) -> int:
+        if self._cta_m_size is not None:
+            return int(self._cta_m_size)
+        if m <= 8:
+            return 8
+        if m <= 16:
+            return 16
+        if m <= 32:
+            return 32
+        if m <= 48:
+            return 48
+        return 64
+
+    def _pick_tile_config(
+        self, *, m: int, n: int, k: int, cta_m_size: int,
+    ) -> tuple[int, int]:
+        if self._tile_n is not None and self._tile_k is not None:
+            return int(self._tile_n), int(self._tile_k)
+        if torch.cuda.is_available():
+            props = torch.cuda.get_device_properties(torch.cuda.current_device())
+            sms = int(props.multi_processor_count)
+            max_shared_mem = int(
+                getattr(
+                    props, "shared_memory_per_block_optin", _DEFAULT_MAX_SHARED_MEM
+                )
+            )
+        else:
+            sms = 120
+            max_shared_mem = _DEFAULT_MAX_SHARED_MEM
+        tile_k, tile_n, _, _ = _select_tile_config(
+            problem_m=m,
+            problem_n=n,
+            problem_k=k,
+            top_k=1,
+            moe_block_size=cta_m_size,
+            sms=sms,
+            max_shared_mem=max_shared_mem,
+        )
+        return int(tile_n), int(tile_k)
+
+    def _get_packed_weights(
+        self,
+        w_fp4: torch.Tensor,
+        w_blockscale: torch.Tensor,
+        w_alpha: torch.Tensor,
+        *,
+        size_n: int,
+        size_k: int,
+    ) -> _DenseMarlinPackedWeights:
+        cache_key = (
+            int(w_fp4.data_ptr()),
+            int(w_blockscale.data_ptr()),
+            float(w_alpha.item()),
+            int(size_n),
+            int(size_k),
+            self._element_dtype,
+        )
+        cached = self._weight_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        packed = _pack_dense_weights_for_marlin(
+            w_fp4, w_blockscale, w_alpha,
+            size_n=size_n, size_k=size_k, a_dtype=self._a_dtype,
+        )
+        self._weight_cache[cache_key] = packed
+        return packed
+
+    def _get_scratch(
+        self,
+        *,
+        size_m_padded: int,
+        size_n: int,
+        cta_m_size: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if torch.cuda.is_available():
+            props = torch.cuda.get_device_properties(device)
+            sms = int(props.multi_processor_count)
+        else:
+            sms = 48
+        max_m_blocks = (size_m_padded + cta_m_size - 1) // cta_m_size
+        # Mirror donor's ``packed_gemm_scratch_elements`` with
+        # ``route_slots = padded_M``: c_tmp's size is bounded by either
+        # the full per-output-element scratch (N * padded_M) or a
+        # per-CTA upper bound based on grid_x * c_size.  Small dense
+        # problems hit the first bound; large problems with split-K hit
+        # the second.
+        c_tmp_elements = min(
+            int(size_n) * int(max_m_blocks) * int(cta_m_size),
+            int(sms) * 4 * int(cta_m_size) * 256,
+        )
+        if cta_m_size == 8:
+            c_tmp_elements *= 2
+        c_tmp_elements = max(int(c_tmp_elements), 1)
+        # Locks: one int32 per CTA (grid_x ≤ sms * 4 = blocks_per_sm cap).
+        locks_elements = int(sms) * 4
+        cache_key = (
+            int(getattr(device, "index", 0) or 0),
+            int(size_m_padded),
+            int(size_n),
+            int(cta_m_size),
+        )
+        cached = self._scratch_cache.get(cache_key)
+        if cached is not None:
+            c_tmp, locks = cached
+            if int(c_tmp.numel()) >= c_tmp_elements and int(locks.numel()) >= locks_elements:
+                # Locks: kernel resets them to 0 at the end of each launch
+                # when split-K is used, but a zero-initialized scratch from
+                # creation stays zero between calls when reduce_slice_count=1.
+                # Zero defensively to avoid any cross-call interference.
+                locks.zero_()
+                return c_tmp[:c_tmp_elements], locks[:locks_elements]
+        c_tmp = torch.empty(c_tmp_elements, dtype=torch.float32, device=device)
+        locks = torch.zeros(locks_elements, dtype=torch.int32, device=device)
+        self._scratch_cache[cache_key] = (c_tmp, locks)
+        return c_tmp, locks
+
+    def __call__(
+        self,
+        x: torch.Tensor,
+        w_fp4: torch.Tensor,
+        w_blockscale_swizzled_u8: torch.Tensor,
+        w_alpha: torch.Tensor,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if x.dim() != 2:
+            raise ValueError(f"x must be 2D, got shape {tuple(x.shape)}")
+        if x.dtype != self._a_dtype:
+            raise TypeError(
+                f"x dtype {x.dtype} does not match kernel dtype {self._a_dtype}"
+            )
+        if not x.is_cuda:
+            raise ValueError("x must be a CUDA tensor")
+        if w_fp4.dim() != 2:
+            raise ValueError(f"w_fp4 must be 2D, got shape {tuple(w_fp4.shape)}")
+        m, k = int(x.shape[0]), int(x.shape[1])
+        n = int(w_fp4.shape[0])
+        if int(w_fp4.shape[1]) * 2 != k:
+            raise ValueError(
+                f"w_fp4 shape {tuple(w_fp4.shape)} (K={int(w_fp4.shape[1]) * 2}) "
+                f"does not match x.shape[1]={k}"
+            )
+        if not self.is_supported(m, k, n):
+            raise ValueError(
+                f"unsupported shape for v6 marlin dense: M={m}, K={k}, N={n}"
+            )
+
+        cta_m_size = self._pick_cta_m_size(m)
+        tile_n, tile_k = self._pick_tile_config(m=m, n=n, k=k, cta_m_size=cta_m_size)
+
+        m_padded = ((m + cta_m_size - 1) // cta_m_size) * cta_m_size
+        if m_padded != m:
+            x_used = torch.zeros(m_padded, k, dtype=x.dtype, device=x.device)
+            x_used[:m].copy_(x)
+        else:
+            x_used = x.contiguous() if not x.is_contiguous() else x
+
+        if out is None:
+            out = torch.empty(m, n, dtype=self._a_dtype, device=x.device)
+        else:
+            if tuple(out.shape) != (m, n):
+                raise ValueError(
+                    f"out shape {tuple(out.shape)} != expected {(m, n)}"
+                )
+            if out.dtype != self._a_dtype:
+                raise TypeError(
+                    f"out dtype {out.dtype} does not match kernel dtype {self._a_dtype}"
+                )
+            if not out.is_contiguous():
+                raise ValueError("out must be contiguous")
+
+        packed = self._get_packed_weights(
+            w_fp4, w_blockscale_swizzled_u8, w_alpha,
+            size_n=n, size_k=k,
+        )
+        c_tmp, locks = self._get_scratch(
+            size_m_padded=m_padded, size_n=n, cta_m_size=cta_m_size,
+            device=x.device,
+        )
+
+        # The kernel bakes ``size_m`` into the JIT and uses it as the
+        # M-bound for the C-write path.  Passing the real M means only
+        # rows ``[0, M)`` get written -- the padded ``x_used`` rows
+        # produce no output.  Pre-padded ``x_used`` ensures the A-row
+        # indexing never reads OOB (``global_row = m_tile_base + row``
+        # ranges over ``[0, m_padded)``).
+        result = compile_w4a16_gemm(
+            size_m=m,
+            size_n=n,
+            size_k=k,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            cta_m_size=cta_m_size,
+            element_dtype=self._element_dtype,
+        )
+        stream = current_cuda_stream()
+        result.compiled(
+            x_used.view(-1),
+            packed.b_packed_i32,
+            out.view(-1),
+            packed.scales_i32,
+            packed.global_scale,
+            c_tmp,
+            locks,
+            stream,
+        )
+        return out
+
+
+__all__ = [
+    "DenseGemmW4A16CuteMarlinKernel",
+    "W4A16GemmCompileResult",
+    "W4A16GemmKernel",
+    "compile_w4a16_gemm",
+]
 
