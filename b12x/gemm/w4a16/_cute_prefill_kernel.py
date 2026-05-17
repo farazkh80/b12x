@@ -99,6 +99,7 @@ if _CUTE_AVAILABLE:
             tile_k: Optional[int] = None,
             ab_stage: int = 2,
             n_per_cta: int = 1,
+            num_mma_warps: int = 8,
             sf_vec_size: int = _SF_VEC_SIZE,
         ):
             self.m = m
@@ -115,11 +116,17 @@ if _CUTE_AVAILABLE:
             self.epi_tile = (mma_tiler_mn[0], mma_tiler_mn[1])
             self.cluster_shape_mnk = (1, 1, 1)
             self.cluster_shape_mn = (1, 1)
-            # 8 MMA warps (vs v4's 4) for the prefill regime.  4-warp ×
-            # (4,2,1) atom layout covers (64, 16) per atom; with the
-            # permutation_mnk repeat factors below we lift this to the
-            # full (128, 64) CTA tile in one atom group.
-            self.num_mma_warps = 8
+            # ``num_mma_warps`` chooses the atom_layout in
+            # ``_setup_attributes``:
+            #   8 → (4, 2, 1)  — default; spreads (M, N) tile across more
+            #                    warps; lower per-warp accumulator regs.
+            #   4 → (2, 2, 1)  — half the warp count; doubles per-warp
+            #                    MMA + staging work but halves total CTA
+            #                    register count → may unblock 2-block-
+            #                    per-SM occupancy on Spark.
+            if num_mma_warps not in (4, 8):
+                raise ValueError(f"num_mma_warps must be 4 or 8, got {num_mma_warps}")
+            self.num_mma_warps = num_mma_warps
             self.tma_load_warp_id = self.num_mma_warps
             self.num_threads_per_warp = 32
             self.threads_per_cta = (self.num_mma_warps + 1) * self.num_threads_per_warp
@@ -186,15 +193,18 @@ if _CUTE_AVAILABLE:
             mma_op = cute.nvgpu.warp.MmaF16BF16Op(
                 self.a_dtype, self.acc_dtype, self.mma_inst_mnk,
             )
-            # 8 MMA warps split (4, 2, 1) across (M, N, K).
-            # ``permutation_mnk`` says how each warp's MMA spans the CTA
-            # tile.  Derive M/N iters from ``tile_shape_mnk`` so the
-            # same kernel supports tile_M ∈ {64, 128} and tile_N ∈
-            # {64, 128} without retemplating.
-            #   permutation_M = atom_M(4) * mma_inst_M(16) * M_iter
-            #   permutation_N = atom_N(2) * mma_inst_N(8)  * N_iter
-            #   permutation_K = mma_inst_K(16)
-            atom_layout_shape = (4, 2, 1)
+            # atom_layout picked by num_mma_warps:
+            #   8 warps → (4, 2, 1) — atom covers (64, 16) per warp-group
+            #   4 warps → (2, 2, 1) — atom covers (32, 16); each warp
+            #                         doubles its M-iter count to span
+            #                         the same CTA tile.
+            # ``permutation_mnk`` always equals the CTA tile shape (in M
+            # and N) — derived from ``tile_shape_mnk`` so the kernel
+            # supports any (tile_M, tile_N) divisible by the atom.
+            if self.num_mma_warps == 8:
+                atom_layout_shape = (4, 2, 1)
+            else:  # 4
+                atom_layout_shape = (2, 2, 1)
             atom_layout = cute.make_layout(atom_layout_shape)
             tile_m = self.tile_shape_mnk[0]
             tile_n = self.tile_shape_mnk[1]
@@ -707,6 +717,7 @@ class DenseGemmW4A16CutePrefillKernel:
     _TILE_K = 64
     _AB_STAGE = 2
     _N_PER_CTA = 1
+    _NUM_MMA_WARPS = 8
 
     @classmethod
     def is_supported(cls, m: int, k: int, n: int) -> bool:
@@ -737,12 +748,14 @@ class DenseGemmW4A16CutePrefillKernel:
         tile_k: int = None,
         ab_stage: int = None,
         n_per_cta: int = None,
+        num_mma_warps: int = None,
     ) -> None:
         self._tile_m = tile_m if tile_m is not None else self._TILE_M
         self._tile_n = tile_n if tile_n is not None else self._TILE_N
         self._tile_k = tile_k if tile_k is not None else self._TILE_K
         self._ab_stage = ab_stage if ab_stage is not None else self._AB_STAGE
         self._n_per_cta = n_per_cta if n_per_cta is not None else self._N_PER_CTA
+        self._num_mma_warps = num_mma_warps if num_mma_warps is not None else self._NUM_MMA_WARPS
         self._compile_cache: dict = {}
 
     def _get_compiled(self, m: int, n: int, k: int):
@@ -753,13 +766,14 @@ class DenseGemmW4A16CutePrefillKernel:
         # Different real M values share neither IR nor the compiled
         # binary — but each (M, N, K) is a one-shot compile cost.
         key = (m, n, k, self._tile_m, self._tile_n, self._tile_k,
-               self._ab_stage, self._n_per_cta)
+               self._ab_stage, self._n_per_cta, self._num_mma_warps)
         if key not in self._compile_cache:
             jit_instance = _DenseGemmW4A16PrefillCuteJit(
                 m=m, n=n, k=k,
                 mma_tiler_mn=(self._tile_m, self._tile_n),
                 tile_k=self._tile_k,
                 ab_stage=self._ab_stage,
+                num_mma_warps=self._num_mma_warps,
                 n_per_cta=self._n_per_cta,
             )
 
