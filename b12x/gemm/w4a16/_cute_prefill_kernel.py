@@ -186,17 +186,36 @@ if _CUTE_AVAILABLE:
             mma_op = cute.nvgpu.warp.MmaF16BF16Op(
                 self.a_dtype, self.acc_dtype, self.mma_inst_mnk,
             )
-            # 8 MMA warps split (4, 2, 1) across (M, N, K).  With the
-            # permutation_mnk below we then stretch each warp's coverage
-            # to span the full (128, 64) CTA tile in M and N:
-            #   permutation_M = atom_M(4) * mma_inst_M(16) * M_repeat(2) = 128
-            #   permutation_N = atom_N(2) * mma_inst_N(8)  * N_repeat(4) = 64
-            #   permutation_K = mma_inst_K(16)                          = 16
-            atom_layout = cute.make_layout((4, 2, 1))
+            # 8 MMA warps split (4, 2, 1) across (M, N, K).
+            # ``permutation_mnk`` says how each warp's MMA spans the CTA
+            # tile.  Derive M/N iters from ``tile_shape_mnk`` so the
+            # same kernel supports tile_M ∈ {64, 128} and tile_N ∈
+            # {64, 128} without retemplating.
+            #   permutation_M = atom_M(4) * mma_inst_M(16) * M_iter
+            #   permutation_N = atom_N(2) * mma_inst_N(8)  * N_iter
+            #   permutation_K = mma_inst_K(16)
+            atom_layout_shape = (4, 2, 1)
+            atom_layout = cute.make_layout(atom_layout_shape)
+            tile_m = self.tile_shape_mnk[0]
+            tile_n = self.tile_shape_mnk[1]
+            m_atom = atom_layout_shape[0] * self.mma_inst_mnk[0]   # 64
+            n_atom = atom_layout_shape[1] * self.mma_inst_mnk[1]   # 16
+            if tile_m % m_atom != 0:
+                raise ValueError(
+                    f"tile_M ({tile_m}) must be a multiple of "
+                    f"atom_M*mma_M = {m_atom}"
+                )
+            if tile_n % n_atom != 0:
+                raise ValueError(
+                    f"tile_N ({tile_n}) must be a multiple of "
+                    f"atom_N*mma_N = {n_atom}"
+                )
+            m_iter = tile_m // m_atom
+            n_iter = tile_n // n_atom
             permutation_mnk = (
-                2 * 4 * self.mma_inst_mnk[0],   # 128
-                4 * 2 * self.mma_inst_mnk[1],   #  64
-                self.mma_inst_mnk[2],           #  16
+                m_atom * m_iter,           # = tile_M
+                n_atom * n_iter,           # = tile_N
+                self.mma_inst_mnk[2],      # = 16
             )
             self.tiled_mma = cute.make_tiled_mma(
                 mma_op, atom_layout, permutation_mnk=permutation_mnk,

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Autotune the v5 prefill kernel over ab_stage and tile_k.
+"""Autotune the v5 prefill kernel over (tile_M, tile_K, ab_stage, n_per_cta).
 
-Currently varies only the smem-cheap knobs (ab_stage, tile_k); the
-atom_layout / permutation_mnk wiring is hard-coded for tile_M=128,
-tile_N=64, so changing those requires re-deriving the layout.  Scope
-this sweep to what's safe.
+The kernel's atom_layout (4, 2, 1) requires tile_M to be a multiple
+of atom_M*mma_M = 64 and tile_N a multiple of atom_N*mma_N = 16.
+This sweep covers tile_M ∈ {64, 128}, tile_N=64 (fixed), tile_K ∈
+{32, 64}, ab_stage ∈ {2, 3}, n_per_cta ∈ {1, 2}.
 
 Usage:
     python scripts/tune_prefill_v5.py --shapes all --m-list 2048
@@ -38,20 +38,24 @@ _SHAPES = [
     ("mamba_output_proj", 4096,  2688),   # N=2688, num_n_tiles=42 (even)
 ]
 
-# Configs to try.  tile_M=128, tile_N=64 fixed (atom_layout dependency).
+# Configs to try.  tile_N=64 fixed (atom_layout dependency).
 # n_per_cta=2 skipped when num_n_tiles is odd.
-_CONFIGS: List[Tuple[int, int, int]] = [
-    # (tile_k, ab_stage, n_per_cta)
-    (64, 2, 1),   # baseline n1
-    (64, 3, 1),
-    (32, 2, 1),
-    (32, 3, 1),
-    (32, 4, 1),
-    (64, 2, 2),   # baseline n2 (when applicable)
-    (64, 3, 2),
-    (32, 2, 2),
-    (32, 3, 2),
-    (32, 4, 2),
+# Schema: (tile_m, tile_k, ab_stage, n_per_cta).
+_CONFIGS: List[Tuple[int, int, int, int]] = [
+    # tile_M=128 (current baseline tier)
+    (128, 64, 2, 1),   # baseline
+    (128, 64, 3, 1),
+    (128, 32, 2, 1),
+    (128, 32, 3, 1),
+    (128, 64, 2, 2),
+    (128, 32, 2, 2),
+    # tile_M=64 (new: halves smem + accumulator → expects 2 blocks/SM)
+    (64,  64, 2, 1),
+    (64,  64, 3, 1),
+    (64,  32, 2, 1),
+    (64,  32, 3, 1),
+    (64,  64, 2, 2),
+    (64,  32, 2, 2),
 ]
 
 
@@ -111,7 +115,7 @@ def main() -> int:
 
         num_n_tiles = n // 64
         print(f"\n=== {name}  K={k} N={n} (num_n_tiles={num_n_tiles}) ===")
-        hdr = f"{'M':>5} {'tile_K':>6} {'ab':>3} {'n/cta':>5} {'us':>8} {'vs base':>8} {'status':>8}"
+        hdr = f"{'M':>5} {'tM':>4} {'tK':>3} {'ab':>3} {'n/cta':>5} {'us':>8} {'vs base':>8} {'status':>8}"
         print(hdr)
         print("-" * len(hdr))
 
@@ -122,14 +126,14 @@ def main() -> int:
 
             baseline_us = None
             results = []
-            for tile_k, ab, npc in _CONFIGS:
+            for tile_m, tile_k, ab, npc in _CONFIGS:
                 # Skip n_per_cta=2 when num_n_tiles isn't even.
                 if npc > 1 and num_n_tiles % npc != 0:
                     continue
                 # Skip impossible smem configs.
-                sA = 128 * tile_k * 2 * ab
+                sA = tile_m * tile_k * 2 * ab
                 sB = 64 * tile_k * 2 * ab
-                sC = 128 * 64 * 2
+                sC = tile_m * 64 * 2
                 if sA + sB + sC > 100 * 1024:
                     continue
                 # K must be a multiple of tile_k.
@@ -138,31 +142,32 @@ def main() -> int:
 
                 try:
                     kern = DenseGemmW4A16CutePrefillKernel(
-                        tile_k=tile_k, ab_stage=ab, n_per_cta=npc,
+                        tile_m=tile_m, tile_k=tile_k, ab_stage=ab, n_per_cta=npc,
                     )
                     ok = _check_accuracy(kern, x, w_fp4, w_bs, w_alpha)
                     if not ok:
-                        results.append((tile_k, ab, npc, None, "FAIL_ACC"))
+                        results.append((tile_m, tile_k, ab, npc, None, "FAIL_ACC"))
                         continue
                     us = _bench(lambda: kern(x, w_fp4, w_bs, w_alpha, out=out_buf),
                                 warmup=args.warmup, iters=args.iters)
-                    if baseline_us is None and tile_k == 64 and ab == 2 and npc == 1:
+                    if (baseline_us is None and tile_m == 128 and tile_k == 64
+                            and ab == 2 and npc == 1):
                         baseline_us = us
-                    results.append((tile_k, ab, npc, us, "OK"))
+                    results.append((tile_m, tile_k, ab, npc, us, "OK"))
                 except Exception as e:
-                    results.append((tile_k, ab, npc, None, f"FAIL: {str(e)[:30]}"))
+                    results.append((tile_m, tile_k, ab, npc, None, f"FAIL: {str(e)[:30]}"))
 
-            # Print sorted by time
-            ok_results = [r for r in results if r[3] is not None]
-            ok_results.sort(key=lambda r: r[3])
+            # Print sorted by time (descending)
+            ok_results = [r for r in results if r[4] is not None]
+            ok_results.sort(key=lambda r: r[4])
             best = ok_results[0] if ok_results else None
-            for tile_k, ab, npc, us, status in results:
+            for tile_m, tile_k, ab, npc, us, status in results:
                 if us is None:
-                    print(f"{m:5d} {tile_k:>6d} {ab:>3d} {npc:>5d} {'—':>8s} {'—':>8s} {status:>8s}")
+                    print(f"{m:5d} {tile_m:>4d} {tile_k:>3d} {ab:>3d} {npc:>5d} {'—':>8s} {'—':>8s} {status:>8s}")
                 else:
                     ratio = f"{us/baseline_us:.2f}x" if baseline_us else "—"
-                    star = "  *" if (best and (tile_k, ab, npc) == (best[0], best[1], best[2])) else ""
-                    print(f"{m:5d} {tile_k:>6d} {ab:>3d} {npc:>5d} {us:7.1f}us {ratio:>8s} {status:>8s}{star}")
+                    star = "  *" if (best and (tile_m, tile_k, ab, npc) == best[:4]) else ""
+                    print(f"{m:5d} {tile_m:>4d} {tile_k:>3d} {ab:>3d} {npc:>5d} {us:7.1f}us {ratio:>8s} {status:>8s}{star}")
     return 0
 
 
