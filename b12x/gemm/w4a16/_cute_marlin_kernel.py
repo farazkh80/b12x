@@ -95,6 +95,30 @@ _W4A16_REGS_SM121 = {
     (128, 4, 4, 8, False): 255,
     (128, 4, 8, 4, False): 255,
 }
+# Tile config tables — (tile_k, tile_n, cta_threads).
+#
+# The kernel's register-pressure table (``_W4A16_REGS_SM121`` above) only
+# enumerates four valid ``(cta_n_blocks, cta_k_blocks)`` pairs per
+# cta_threads class:
+#
+#   cta_threads=128: (cta_n=4, cta_k=8) ↔ (tile_n=64,  tile_k=128)
+#                    (cta_n=8, cta_k=4) ↔ (tile_n=128, tile_k=64)
+#   cta_threads=256: (cta_n=8, cta_k=8) ↔ (tile_n=128, tile_k=128)
+#                    (cta_n=16,cta_k=4) ↔ (tile_n=256, tile_k=64)
+#
+# A 2026-05-17 Spark autotune sweep over all (cta_m_size ∈ {16,32,48,64})
+# × (tile_n, tile_k) combos for the 6 Nano3.5 v6-eligible shapes × M ∈
+# {1024, 2048, 4096} confirmed ``_select_tile_config`` already picks the
+# best config for every shape; the only outlier was shared.up where
+# cta_m_size=32 won by ~1-2% but the same change hurt o_proj (-1.8%) and
+# shared.dn (-1.4%), so no shape-agnostic improvement was applied.
+#
+# The Marlin gap on mamba_in_proj M=2048 (v6 = 1724 µs vs Marlin = 810 µs)
+# is *structural*: N=10304 only divides by tile_n=64, which forces
+# tile_k=128 as the single valid config.  Closing that gap requires
+# kernel-code changes (e.g. lower ``_STAGES`` to free smem for 2 blocks
+# per SM, or extend the register table with new (cta_n, cta_k) entries),
+# not tile-config tuning.
 _SMALL_BATCH_TILE_CONFIGS = (
     (128, 128, 256),
     (64, 128, 128),
