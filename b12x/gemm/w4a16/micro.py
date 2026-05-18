@@ -8,8 +8,8 @@ Two-tier dispatch:
   Nano3.5 decode linears (M ≤ 32 originally; v4 still runs correctly
   at any M).
 * **Prefill** (M ≥ ``B12X_GEMM_W4A16_PREFILL_M``):
-  v6 Marlin-style cp.async + register-pipelined kernel
-  (``_cute_marlin_kernel.py``), MoE-stripped to dense.  Includes
+  v6 cp.async + register-pipelined prefill kernel
+  (``_cute_prefill_kernel.py``), MoE-stripped to dense.  Includes
   tile-keyed ``num_stages`` autotune and in-kernel N-padding so the
   wider tile_n=128 geometry works even when N doesn't divide 128
   (e.g. mamba_in_proj N=10304 → kernel sees N=10368, C-write path
@@ -30,13 +30,13 @@ from typing import Optional
 import torch
 
 from ._cute_dense_kernel import DenseGemmW4A16CuteDenseKernel
-from ._cute_marlin_kernel import DenseGemmW4A16CuteMarlinKernel
+from ._cute_prefill_kernel import DenseGemmW4A16CutePrefillKernel
 from .reference import dense_reference_w4a16
 
 
 # Crossover threshold empirically: v4 wins at M ≤ 128 (warp-level 32×64
-# tile keeps work granular), v6 takes over at M ≥ 256 (Marlin-style
-# cp.async pipeline amortizes per-CTA overhead).  At M=128 they're
+# tile keeps work granular), v6 takes over at M ≥ 256 (its cp.async
+# pipeline amortizes per-CTA overhead).  At M=128 they're
 # roughly equal — default to v6 from 256 onward to be safe.
 _DEFAULT_PREFILL_M = int(os.environ.get("B12X_GEMM_W4A16_PREFILL_M", "256"))
 
@@ -51,14 +51,14 @@ class DenseGemmW4A16MicroKernel:
     @classmethod
     def is_supported(cls, m: int, k: int, n: int) -> bool:
         if _use_prefill(m):
-            return DenseGemmW4A16CuteMarlinKernel.is_supported(m, k, n)
+            return DenseGemmW4A16CutePrefillKernel.is_supported(m, k, n)
         return DenseGemmW4A16CuteDenseKernel.is_supported(m, k, n)
 
     def __init__(self) -> None:
         self._decode: DenseGemmW4A16CuteDenseKernel | None = None
         # v6 is shape-agnostic at construction time: it picks cta_m_size
         # + tile_n + tile_k + num_stages per call from M/N/K.
-        self._prefill: DenseGemmW4A16CuteMarlinKernel | None = None
+        self._prefill: DenseGemmW4A16CutePrefillKernel | None = None
 
     def __call__(
         self,
@@ -82,7 +82,7 @@ class DenseGemmW4A16MicroKernel:
 
         if _use_prefill(m):
             if self._prefill is None:
-                self._prefill = DenseGemmW4A16CuteMarlinKernel()
+                self._prefill = DenseGemmW4A16CutePrefillKernel()
             return self._prefill(
                 x.contiguous(), w_fp4.contiguous(), w_blockscale.contiguous(),
                 w_alpha.contiguous(), out=out,
@@ -115,7 +115,7 @@ def dense_gemm_w4a16(
 ) -> torch.Tensor:
     """Public entry point — W4A16 dense GEMM, decode + prefill backends.
 
-    Dispatch picks the v6 Marlin-style prefill kernel when M ≥
+    Dispatch picks the v6 prefill kernel when M ≥
     ``B12X_GEMM_W4A16_PREFILL_M`` (default 256), otherwise the v4 decode
     kernel.  ``w_blockscale`` must be the swizzled FP8 e4m3 tensor (as
     produced by ``quantize_dense_weight_to_fp4``).

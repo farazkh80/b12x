@@ -19,8 +19,9 @@ Architecture (kept from static.py):
 * LdMatrix.x4 sA/sB → reg, StMatrix.x2 reg → sC.
 * Persistent CTA scheduler over (m_tile, n_tile).
 
-Enable via ``B12X_GEMM_W4A16_USE_CUTE=1``; falls back to Triton on
-compile / runtime errors (see ``micro.py``).
+``micro.py`` dispatches here when ``M < B12X_GEMM_W4A16_PREFILL_M``
+(default 256); larger ``M`` falls through to the prefill kernel in
+``_cute_prefill_kernel.py``.
 """
 
 from __future__ import annotations
@@ -56,10 +57,6 @@ except ImportError:
 
 
 _SF_VEC_SIZE = 16
-
-
-def _cute_backend_enabled() -> bool:
-    return os.environ.get("B12X_GEMM_W4A16_USE_CUTE") == "1" and _CUTE_AVAILABLE
 
 
 if _CUTE_AVAILABLE:
@@ -799,10 +796,36 @@ class DenseGemmW4A16CuteDenseKernel:
     ) -> torch.Tensor:
         if not _CUTE_AVAILABLE:
             raise NotImplementedError("cutlass.cute (DSL) not available")
-        m, k = x.shape
-        n = w_fp4.shape[0]
+        if x.dim() != 2:
+            raise ValueError(f"x must be 2D, got shape {tuple(x.shape)}")
+        if x.dtype != torch.bfloat16:
+            raise TypeError(f"x dtype must be bfloat16, got {x.dtype}")
+        if not x.is_cuda:
+            raise ValueError("x must be a CUDA tensor")
+        if w_fp4.dim() != 2:
+            raise ValueError(f"w_fp4 must be 2D, got shape {tuple(w_fp4.shape)}")
+        m, k = int(x.shape[0]), int(x.shape[1])
+        n = int(w_fp4.shape[0])
+        if int(w_fp4.shape[1]) * 2 != k:
+            raise ValueError(
+                f"w_fp4 shape {tuple(w_fp4.shape)} (K={int(w_fp4.shape[1]) * 2}) "
+                f"does not match x.shape[1]={k}"
+            )
         if out is None:
             out = torch.empty(m, n, dtype=torch.bfloat16, device=x.device)
+        else:
+            if tuple(out.shape) != (m, n):
+                raise ValueError(
+                    f"out shape {tuple(out.shape)} != expected {(m, n)}"
+                )
+            if out.dtype != torch.bfloat16:
+                raise TypeError(
+                    f"out dtype must be bfloat16, got {out.dtype}"
+                )
+            if out.device != x.device:
+                raise ValueError("out must be on the same device as x")
+            if not out.is_contiguous():
+                raise ValueError("out must be contiguous")
 
         # Pad A along M to tile_M if needed (one-time per call) so the
         # TMA descriptor covers full tiles. Zero pad is safe — the kernel
@@ -837,4 +860,4 @@ class DenseGemmW4A16CuteDenseKernel:
         return out
 
 
-__all__ = ["DenseGemmW4A16CuteDenseKernel", "_cute_backend_enabled"]
+__all__ = ["DenseGemmW4A16CuteDenseKernel"]

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+
 import pytest
 import torch
 
@@ -12,6 +14,17 @@ from b12x.gemm.w4a16 import (
     quantize_dense_weight_to_fp4,
 )
 from b12x.moe.fused.reference import compare_to_reference
+
+
+def _stable_seed(*parts) -> int:
+    """Deterministic 32-bit seed across Python processes.
+
+    ``hash(...)`` is randomized per interpreter run; use blake2s so the
+    same parametrize tuple seeds the same tensor regardless of which
+    process runs the test.
+    """
+    digest = hashlib.blake2s(repr(parts).encode(), digest_size=4).digest()
+    return int.from_bytes(digest, "little")
 
 
 def test_dense_reference_w4a16_signature():
@@ -66,9 +79,9 @@ def test_dense_gemm_w4a16_signature_callable():
 
 def test_dense_gemm_w4a16_is_supported_matrix():
     """is_supported gate matches the actual envelope (decode + prefill dispatch)."""
-    # M ladder.  Decode kernel (v4) covers any M ∈ [1, 32]; prefill
-    # (v5) takes over for M ≥ B12X_GEMM_W4A16_PREFILL_M (default 33),
-    # so every positive M is supported as long as the shape envelope
+    # M ladder.  Decode kernel (v4) covers M < B12X_GEMM_W4A16_PREFILL_M
+    # (default 256); prefill kernel (v6) takes over above
+    # that.  Every positive M is supported as long as the shape envelope
     # (N % 64 == 0, K % 64 == 0) holds.
     for m in (1, 2, 3, 4, 8, 16, 24, 32, 33, 64, 128, 1024):
         assert DenseGemmW4A16MicroKernel.is_supported(m, 2688, 4096), f"M={m} should be supported"
@@ -117,7 +130,7 @@ def test_dense_gemm_w4a16_nano35_accuracy(name, k, n, m):
     if not DenseGemmW4A16MicroKernel.is_supported(m, k, n):
         pytest.skip(f"unsupported (m={m}, k={k}, n={n})")
     device = torch.device("cuda")
-    torch.manual_seed(hash((name, m)) & 0xFFFFFFFF)
+    torch.manual_seed(_stable_seed(name, m))
     x = (torch.randn(m, k, dtype=torch.bfloat16, device=device) * 0.5).contiguous()
     w = (torch.randn(n, k, dtype=torch.bfloat16, device=device) * 0.1).contiguous()
     w_fp4, w_bs, w_alpha = quantize_dense_weight_to_fp4(w)
@@ -154,7 +167,7 @@ def test_dense_gemm_w4a16_cute_m16_accuracy(name, k, n, monkeypatch):
     if not DenseGemmW4A16CuteDenseKernel.is_supported(m, k, n):
         pytest.skip(f"cute not supported (m={m}, k={k}, n={n})")
     device = torch.device("cuda")
-    torch.manual_seed(hash(("cute", name)) & 0xFFFFFFFF)
+    torch.manual_seed(_stable_seed("cute", name))
     x = (torch.randn(m, k, dtype=torch.bfloat16, device=device) * 0.5).contiguous()
     w = (torch.randn(n, k, dtype=torch.bfloat16, device=device) * 0.1).contiguous()
     w_fp4, w_bs, w_alpha = quantize_dense_weight_to_fp4(w)

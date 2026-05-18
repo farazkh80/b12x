@@ -372,7 +372,7 @@ class _W4A16GemmLaunch:
 
 
 class W4A16GemmKernel:
-    """Dense W4A16 GEMM kernel — Marlin-style cp.async + register pipeline.
+    """Dense W4A16 GEMM kernel — cp.async + register-pipelined.
 
     Ported from the MoE W4A16 kernel (b12x/moe/fused/w4a16/kernel.py) by
     stripping the routing/expert/topk axes.  Each CTA computes one
@@ -2687,7 +2687,7 @@ def compile_w4a16_gemm(
     if size_n_real is None:
         size_n_real = size_n
     cache_key = (
-        "w4a16_marlin_dense",
+        "w4a16_dense_prefill",
         device,
         sms,
         max_shared_mem,
@@ -2797,7 +2797,7 @@ def compile_w4a16_gemm(
 
 
 @dataclass(frozen=True)
-class _DenseMarlinPackedWeights:
+class _DensePrefillPackedWeights:
     """v5-format dense weights repacked for the MoE-stripped kernel.
 
     * ``b_packed_i32``: flat int32, ``K*N/8`` elements, ``_repack_4bit_no_perm`` layout.
@@ -2811,7 +2811,7 @@ class _DenseMarlinPackedWeights:
     global_scale: torch.Tensor
 
 
-def _pack_dense_weights_for_marlin(
+def _pack_dense_weights_for_prefill(
     w_fp4: torch.Tensor,
     w_blockscale_swizzled: torch.Tensor,
     w_alpha: torch.Tensor,
@@ -2820,7 +2820,7 @@ def _pack_dense_weights_for_marlin(
     size_k: int,
     a_dtype: torch.dtype = torch.bfloat16,
     size_n_padded: int | None = None,
-) -> _DenseMarlinPackedWeights:
+) -> _DensePrefillPackedWeights:
     """Convert v5-format quantized weights to the MoE kernel's packed layout.
 
     Steps mirror ``prepare_w4a16_packed_weights`` minus the expert dim:
@@ -2908,15 +2908,15 @@ def _pack_dense_weights_for_marlin(
     ).to(torch.float32)
     processed_global = (processed_global / combined_scale_factor).contiguous()
 
-    return _DenseMarlinPackedWeights(
+    return _DensePrefillPackedWeights(
         b_packed_i32=b_packed_flat,
         scales_i32=scales_i32_flat,
         global_scale=processed_global,
     )
 
 
-class DenseGemmW4A16CuteMarlinKernel:
-    """W4A16 dense GEMM cute backend, v6 (Marlin-style cp.async + register pipeline).
+class DenseGemmW4A16CutePrefillKernel:
+    """W4A16 dense GEMM cute backend, v6 (cp.async + register-pipelined).
 
     Strip-port of ``b12x/moe/fused/w4a16/kernel.py`` to the dense case
     (one expert, no top-k routing).  Same FP4 dequant + bf16 MMA atom as
@@ -3056,12 +3056,19 @@ class DenseGemmW4A16CuteMarlinKernel:
         size_n: int,
         size_k: int,
         size_n_padded: int | None = None,
-    ) -> _DenseMarlinPackedWeights:
+    ) -> _DensePrefillPackedWeights:
         size_n_padded = int(size_n if size_n_padded is None else size_n_padded)
+        # Key on storage pointers, not ``w_alpha.item()`` — that would
+        # force a device → host sync on every call.  Production callers
+        # reuse the same prepared-weight tensors, so identity-keyed
+        # caching hits.  A caller that mutates ``w_alpha`` in place under
+        # the same storage will see stale packed weights; the contract is
+        # that the (w_fp4, w_blockscale, w_alpha) triple is immutable for
+        # a given storage.
         cache_key = (
             int(w_fp4.data_ptr()),
             int(w_blockscale.data_ptr()),
-            float(w_alpha.item()),
+            int(w_alpha.data_ptr()),
             int(size_n),
             size_n_padded,
             int(size_k),
@@ -3070,7 +3077,7 @@ class DenseGemmW4A16CuteMarlinKernel:
         cached = self._weight_cache.get(cache_key)
         if cached is not None:
             return cached
-        packed = _pack_dense_weights_for_marlin(
+        packed = _pack_dense_weights_for_prefill(
             w_fp4, w_blockscale, w_alpha,
             size_n=size_n, size_k=size_k, a_dtype=self._a_dtype,
             size_n_padded=size_n_padded,
@@ -3123,6 +3130,18 @@ class DenseGemmW4A16CuteMarlinKernel:
                 # Zero defensively to avoid any cross-call interference.
                 locks.zero_()
                 return c_tmp[:c_tmp_elements], locks[:locks_elements]
+        # Capture-time alloc is unsafe: the alloc happens once during
+        # capture and is replayed unchanged, which the upstream MoE path
+        # rejects (b12x/moe/fused/w4a16/kernel.py:3617).  Mirror that
+        # guard here.  The (M_padded, N, cta_m_size) cache key is
+        # populated on the first warm-up call, so subsequent graph
+        # captures land in the cached branch above and skip this check.
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "W4A16 dense GEMM scratch is not initialized for CUDA "
+                "graph capture; warm the kernel with the same "
+                "(M_padded, N, cta_m_size) outside capture first."
+            )
         c_tmp = torch.empty(c_tmp_elements, dtype=torch.float32, device=device)
         locks = torch.zeros(locks_elements, dtype=torch.int32, device=device)
         self._scratch_cache[cache_key] = (c_tmp, locks)
@@ -3155,7 +3174,7 @@ class DenseGemmW4A16CuteMarlinKernel:
             )
         if not self.is_supported(m, k, n):
             raise ValueError(
-                f"unsupported shape for v6 marlin dense: M={m}, K={k}, N={n}"
+                f"unsupported shape for v6 dense prefill: M={m}, K={k}, N={n}"
             )
 
         cta_m_size = self._pick_cta_m_size(m)
@@ -3239,9 +3258,8 @@ class DenseGemmW4A16CuteMarlinKernel:
 
 
 __all__ = [
-    "DenseGemmW4A16CuteMarlinKernel",
+    "DenseGemmW4A16CutePrefillKernel",
     "W4A16GemmCompileResult",
     "W4A16GemmKernel",
     "compile_w4a16_gemm",
 ]
-
