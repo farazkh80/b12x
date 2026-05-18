@@ -393,6 +393,7 @@ class W4A16GemmKernel:
         cta_m_size: int,
         element_dtype: str = "bf16",
         num_stages: int = _DEFAULT_NUM_STAGES,
+        size_n_real: int | None = None,
     ):
         if element_dtype not in {"bf16", "fp16"}:
             raise ValueError(f"unsupported element_dtype {element_dtype!r}")
@@ -411,8 +412,23 @@ class W4A16GemmKernel:
         cta_threads = tile_n * tile_k // 64
         if cta_threads not in (128, 256):
             raise ValueError("W4A16 GEMM expects 128 or 256 CTA threads")
+        # size_n is the *padded* N used for tile geometry, weight/scale
+        # layout, and c_gl_wr arithmetic (must satisfy size_n % tile_n == 0).
+        # size_n_real is the *actual* N to write to the C buffer; defaults
+        # to size_n when no padding is in play.  Letting size_n_real <
+        # size_n lets callers pad shapes (e.g. N=10304 → 10368) to unlock
+        # wider tile geometries without copying the output afterwards.
+        if size_n_real is None:
+            size_n_real = size_n
+        if int(size_n_real) > int(size_n):
+            raise ValueError("size_n_real must be <= size_n (padded)")
+        if int(size_n_real) % 8 != 0:
+            raise ValueError(
+                "size_n_real must be a multiple of 8 (per-thread store vector width)"
+            )
         self.size_m = int(size_m)
         self.size_n = int(size_n)
+        self.size_n_real = int(size_n_real)
         self.size_k = int(size_k)
         self.tile_n = int(tile_n)
         self.tile_k = int(tile_k)
@@ -2342,13 +2358,22 @@ class W4A16GemmKernel:
         m_tile_base: Int32,
         store_iters: cutlass.Constexpr[int],
     ):
+        # c_gl_stride is in 8-bf16 vector units; it equals size_n // 8
+        # (size_n = padded N for tile arithmetic).  The actual output
+        # buffer has row stride size_n_real // 8 — equal to c_gl_stride
+        # when no padding is active, smaller when N was padded up.
+        c_gl_stride_real = Int32(self.size_n_real // 8)
         for _ in cutlass.range_constexpr(store_iters):
             row = c_gl_wr // c_gl_stride
-            if row < block_valid_rows:
+            col_vec = c_gl_wr % c_gl_stride
+            # Skip writes that would land in the (padded N – real N) tail
+            # of the last N-tile.  With c_gl_stride == c_gl_stride_real,
+            # this check is a no-op (col_vec is naturally bounded).
+            if row < block_valid_rows and col_vec < c_gl_stride_real:
                 # Dense: output row is m_tile_base + row (no route lookup).
                 # Donor read this from the sh_route_off smem table.
                 global_row = m_tile_base + row
-                true_idx = global_row * c_gl_stride + (c_gl_wr % c_gl_stride)
+                true_idx = global_row * c_gl_stride_real + col_vec
                 q0, q1, q2, q3 = ld_shared_v4_u32(
                     self._int4_addr(smem_base, Int32(self.sh_red_off) + c_sh_rd)
                 )
@@ -2638,6 +2663,7 @@ def compile_w4a16_gemm(
     cta_m_size: int,
     element_dtype: str = "bf16",
     num_stages: int = _DEFAULT_NUM_STAGES,
+    size_n_real: int | None = None,
 ) -> W4A16GemmCompileResult:
     """Compile a dense W4A16 GEMM kernel for the given problem shape + tile.
 
@@ -2658,6 +2684,8 @@ def compile_w4a16_gemm(
         device = None
         sms = 120
         max_shared_mem = _DEFAULT_MAX_SHARED_MEM
+    if size_n_real is None:
+        size_n_real = size_n
     cache_key = (
         "w4a16_marlin_dense",
         device,
@@ -2666,6 +2694,7 @@ def compile_w4a16_gemm(
         element_dtype,
         size_m,
         size_n,
+        int(size_n_real),
         size_k,
         tile_n,
         tile_k,
@@ -2690,12 +2719,17 @@ def compile_w4a16_gemm(
         ((size_k // 16) * (size_n // 16 * 32),),
         assumed_align=16,
     )
+    # C buffer is laid out at the *real* N (not padded) so the wrapper
+    # can hand the caller a clean contiguous (M, N_real) output without
+    # any post-kernel slice/copy.
     c_fake = cute.runtime.make_fake_compact_tensor(
         cutlass_dtype,
-        (size_m * size_n,),
+        (size_m * int(size_n_real),),
         assumed_align=16,
     )
     # Permuted FP8 scales (donor's _permute_packed_scales): (K/16) * (N/4) i32.
+    # N is the *padded* N -- the scales tensor lives in padded layout when
+    # size_n_real < size_n_padded.
     scales_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
         ((size_k // 16) * (size_n // 4),),
@@ -2733,6 +2767,7 @@ def compile_w4a16_gemm(
         cta_m_size=cta_m_size,
         element_dtype=element_dtype,
         num_stages=int(num_stages),
+        size_n_real=int(size_n_real),
     )
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=kernel, cache_key=cache_key
@@ -2784,6 +2819,7 @@ def _pack_dense_weights_for_marlin(
     size_n: int,
     size_k: int,
     a_dtype: torch.dtype = torch.bfloat16,
+    size_n_padded: int | None = None,
 ) -> _DenseMarlinPackedWeights:
     """Convert v5-format quantized weights to the MoE kernel's packed layout.
 
@@ -2798,21 +2834,65 @@ def _pack_dense_weights_for_marlin(
        (fold FP4 → ``a_dtype`` exponent-bias shift) → divide by
        ``combined_scale_factor`` from step 2.
     """
-    qweight_i32 = w_fp4.view(torch.int32).T.contiguous()
-    b_packed = _repack_4bit_no_perm(qweight_i32, size_k=size_k, size_n=size_n)
+    # When ``size_n_padded > size_n``, the caller wants the kernel to
+    # see a larger N (e.g. to unlock tile_n=128 when actual N=10304).
+    # We pad both the FP4 weight and the unswizzled scales with zero
+    # rows; zero-weight rows contribute zero to the matmul, and the
+    # kernel's per-column write bound (``size_n_real``) skips writes
+    # to the padded tail.
+    if size_n_padded is None:
+        size_n_padded = size_n
+    size_n_for_kernel = int(size_n_padded)
+    if size_n_for_kernel < size_n:
+        raise ValueError("size_n_padded must be >= size_n")
+    pad_rows = size_n_for_kernel - int(size_n)
+
+    if pad_rows > 0:
+        zero_rows = torch.zeros(
+            (pad_rows, w_fp4.shape[1]), dtype=w_fp4.dtype, device=w_fp4.device,
+        )
+        w_fp4_padded = torch.cat([w_fp4, zero_rows], dim=0).contiguous()
+    else:
+        w_fp4_padded = w_fp4
+    qweight_i32 = w_fp4_padded.view(torch.int32).T.contiguous()
+    b_packed = _repack_4bit_no_perm(
+        qweight_i32, size_k=size_k, size_n=size_n_for_kernel,
+    )
     b_packed_flat = b_packed.contiguous().view(-1)
 
     cols_blocks = size_k // _SF_VEC_SIZE
-    scales_unswizzled_f32 = unswizzle_block_scale(
-        w_blockscale_swizzled, rows=size_n, cols_blocks=cols_blocks,
-    )
+    # ``unswizzle_block_scale`` pads its rows-padded layout up to the
+    # nearest multiple of 128 internally; requesting rows=size_n_for_kernel
+    # returns the unswizzled slice including the zero-padded tail when
+    # the FP8 swizzle was already wide enough (the standard case for
+    # quantize_dense_weight_to_fp4 output).  When the swizzle layout
+    # isn't wide enough, fall back to padding the unswizzled scales.
+    swizzle_rows_padded = ((int(size_n) + 127) // 128) * 128
+    if size_n_for_kernel <= swizzle_rows_padded:
+        scales_unswizzled_f32 = unswizzle_block_scale(
+            w_blockscale_swizzled,
+            rows=size_n_for_kernel,
+            cols_blocks=cols_blocks,
+        )
+    else:
+        scales_unswizzled_real = unswizzle_block_scale(
+            w_blockscale_swizzled, rows=int(size_n), cols_blocks=cols_blocks,
+        )
+        pad = torch.zeros(
+            (size_n_for_kernel - int(size_n), cols_blocks),
+            dtype=scales_unswizzled_real.dtype,
+            device=scales_unswizzled_real.device,
+        )
+        scales_unswizzled_f32 = torch.cat(
+            [scales_unswizzled_real, pad], dim=0,
+        ).contiguous()
     scales_fp8 = scales_unswizzled_f32.to(torch.float8_e4m3fn)
     scales_a_dtype = scales_fp8.to(a_dtype)
     combined_scale_factor = _nvfp4_compute_scale_factor(scales_a_dtype, a_dtype)
     packed_scales = _permute_packed_scales(
         scales_a_dtype.T,
         size_k=size_k,
-        size_n=size_n,
+        size_n=size_n_for_kernel,
         group_size=_SF_VEC_SIZE,
     )
     processed_scales = _process_nvfp4_packed_scales(
@@ -2907,6 +2987,27 @@ class DenseGemmW4A16CuteMarlinKernel:
             return 48
         return 64
 
+    def _pick_n_padded(self, *, n: int, k: int) -> int:
+        """Round N up to the next multiple of 128 (the largest tile_n).
+
+        When N already divides 128 the result equals N and no padding
+        happens.  When it doesn't (e.g. mamba_in_proj N=10304), padding
+        unlocks tile_n=128 which is materially faster than the only
+        otherwise-valid tile_n=64.
+
+        Skip the padding if it grows N by more than ~1% — the per-call
+        wasted compute on the padding tail then outweighs the geometry
+        win.  The Nano3.5 outlier (10304→10368, +0.6%) lands well
+        inside the budget.
+        """
+        n = int(n)
+        if n % 128 == 0:
+            return n
+        n_padded = ((n + 127) // 128) * 128
+        if n_padded - n > max(64, n // 64):
+            return n  # padding overhead too high; keep the narrow tile.
+        return n_padded
+
     def _pick_num_stages(self, *, tile_n: int, tile_k: int) -> int:
         """Pick pipeline depth (cp.async → MMA stages) by tile geometry.
 
@@ -2954,12 +3055,15 @@ class DenseGemmW4A16CuteMarlinKernel:
         *,
         size_n: int,
         size_k: int,
+        size_n_padded: int | None = None,
     ) -> _DenseMarlinPackedWeights:
+        size_n_padded = int(size_n if size_n_padded is None else size_n_padded)
         cache_key = (
             int(w_fp4.data_ptr()),
             int(w_blockscale.data_ptr()),
             float(w_alpha.item()),
             int(size_n),
+            size_n_padded,
             int(size_k),
             self._element_dtype,
         )
@@ -2969,6 +3073,7 @@ class DenseGemmW4A16CuteMarlinKernel:
         packed = _pack_dense_weights_for_marlin(
             w_fp4, w_blockscale, w_alpha,
             size_n=size_n, size_k=size_k, a_dtype=self._a_dtype,
+            size_n_padded=size_n_padded,
         )
         self._weight_cache[cache_key] = packed
         return packed
@@ -3054,13 +3159,21 @@ class DenseGemmW4A16CuteMarlinKernel:
             )
 
         cta_m_size = self._pick_cta_m_size(m)
+        # N-padding: when the actual N doesn't divide 128, pad up to the
+        # next multiple of 128 internally so the kernel can use the
+        # wider tile_n=128 geometry (typically ~25% faster than the
+        # narrow tile_n=64 fallback).  ``size_n_real`` < ``size_n``
+        # tells the kernel to skip writes to the padded tail; the
+        # caller still receives a clean (M, N) output buffer.
+        n_padded = self._pick_n_padded(n=n, k=k)
         # Tile pick is stable across num_stages for the Nano3.5 shapes
         # (the candidate set is determined by N%tile_n, K%tile_k, smem
         # cap at the deepest stages; tile_n/tile_k are picked before
         # depth so order doesn't matter).  Use _DEFAULT_NUM_STAGES for
         # the tile selection's smem-fit check.
         tile_n, tile_k = self._pick_tile_config(
-            m=m, n=n, k=k, cta_m_size=cta_m_size, num_stages=_DEFAULT_NUM_STAGES,
+            m=m, n=n_padded, k=k, cta_m_size=cta_m_size,
+            num_stages=_DEFAULT_NUM_STAGES,
         )
         num_stages = self._pick_num_stages(tile_n=tile_n, tile_k=tile_k)
 
@@ -3087,10 +3200,10 @@ class DenseGemmW4A16CuteMarlinKernel:
 
         packed = self._get_packed_weights(
             w_fp4, w_blockscale_swizzled_u8, w_alpha,
-            size_n=n, size_k=k,
+            size_n=n, size_k=k, size_n_padded=n_padded,
         )
         c_tmp, locks = self._get_scratch(
-            size_m_padded=m_padded, size_n=n, cta_m_size=cta_m_size,
+            size_m_padded=m_padded, size_n=n_padded, cta_m_size=cta_m_size,
             device=x.device,
         )
 
@@ -3102,7 +3215,8 @@ class DenseGemmW4A16CuteMarlinKernel:
         # ranges over ``[0, m_padded)``).
         result = compile_w4a16_gemm(
             size_m=m,
-            size_n=n,
+            size_n=n_padded,
+            size_n_real=n,
             size_k=k,
             tile_n=tile_n,
             tile_k=tile_k,
