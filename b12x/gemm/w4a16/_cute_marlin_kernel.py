@@ -71,7 +71,14 @@ _SF_VEC_SIZE = 16
 # special small-M code path; others use the large-M path.
 _ALLOWED_ROUTED_SIZES = (8, 16, 32, 48, 64)
 _PACK_FACTOR = 8
-_STAGES = 4
+# Pipeline depth of the cp.async + dequant + MMA K-pipeline.  Higher
+# values hide more memory latency but increase smem footprint
+# (sh_a_size, sh_b_size, sh_s_size all scale linearly with stages),
+# which can drop blocks_per_sm.  Configurable per kernel instance via
+# W4A16GemmKernel(num_stages=...) — default 4.  Lowering to 2 unlocks
+# 2 blocks/SM on mamba_in_proj (N=10304, single-config-only shape)
+# but loses pipeline parallelism elsewhere; see _select_num_stages.
+_DEFAULT_NUM_STAGES = 4
 _DEVICE_MAX_REG_BYTES = 255 * 1024
 _DEFAULT_MAX_SHARED_MEM = 101_376
 
@@ -115,10 +122,13 @@ _W4A16_REGS_SM121 = {
 #
 # The Marlin gap on mamba_in_proj M=2048 (v6 = 1724 µs vs Marlin = 810 µs)
 # is *structural*: N=10304 only divides by tile_n=64, which forces
-# tile_k=128 as the single valid config.  Closing that gap requires
-# kernel-code changes (e.g. lower ``_STAGES`` to free smem for 2 blocks
-# per SM, or extend the register table with new (cta_n, cta_k) entries),
-# not tile-config tuning.
+# tile_k=128 as the single valid config.  ``num_stages`` (pipeline depth)
+# was made configurable on 2026-05-18 — see W4A16GemmKernel.__init__.
+# Lowering num_stages can free smem for 2 blocks/SM on this shape, but
+# losing pipeline parallelism does not pay back the wave-parallelism gain
+# (see _select_num_stages below).  Closing the residual gap further would
+# need register-table entries for new (cta_n, cta_k) combinations or
+# persistent split-K (Marlin-style).
 _SMALL_BATCH_TILE_CONFIGS = (
     (128, 128, 256),
     (64, 128, 128),
@@ -163,18 +173,19 @@ def _shared_memory_footprint(
     cta_m_blocks: int,
     tile_n: int,
     tile_k: int,
+    num_stages: int = _DEFAULT_NUM_STAGES,
 ) -> int:
     cta_m = int(cta_m_blocks) * 16
     cta_n = int(tile_n)
     cta_k = int(tile_k)
     sh_block_meta_size = cta_m * 16
-    sh_a_size = _STAGES * (cta_m * cta_k) * 2
-    sh_b_size = _STAGES * (cta_k * cta_n // _PACK_FACTOR) * 4
+    sh_a_size = int(num_stages) * (cta_m * cta_k) * 2
+    sh_b_size = int(num_stages) * (cta_k * cta_n // _PACK_FACTOR) * 4
     sh_red_size = cta_m * (cta_n + 8) * 2
     sh_bias_size = cta_n * 2
     tmp_size = min(sh_b_size, sh_red_size) + sh_bias_size
     tmp_size = max(max(sh_b_size, sh_red_size), tmp_size)
-    sh_s_size = _covering_count(cta_k, 16) * cta_n * 2 * _STAGES
+    sh_s_size = _covering_count(cta_k, 16) * cta_n * 2 * int(num_stages)
     return tmp_size + sh_a_size + sh_s_size + sh_block_meta_size
 
 
@@ -190,6 +201,7 @@ def _determine_blocks_per_sm(
     uses_m_block_8: bool,
     sms: int,
     max_shared_mem: int,
+    num_stages: int = _DEFAULT_NUM_STAGES,
 ) -> int:
     num_regs = _w4a16_num_regs(
         cta_threads=cta_threads,
@@ -203,6 +215,7 @@ def _determine_blocks_per_sm(
         cta_m_blocks=cta_m_blocks,
         tile_n=tile_n,
         tile_k=tile_k,
+        num_stages=num_stages,
     )
     blocks_per_sm_limit = min(
         _DEVICE_MAX_REG_BYTES // register_bytes,
@@ -228,6 +241,7 @@ def _candidate_tile_fits(
     tile_k: int,
     cta_threads: int,
     max_shared_mem: int,
+    num_stages: int = _DEFAULT_NUM_STAGES,
 ) -> bool:
     if int(tile_k) == -1 or int(tile_n) == -1 or int(cta_threads) == -1:
         return False
@@ -239,6 +253,7 @@ def _candidate_tile_fits(
         cta_m_blocks=cta_m_blocks,
         tile_n=tile_n,
         tile_k=tile_k,
+        num_stages=num_stages,
     )
     return smem_bytes <= int(max_shared_mem)
 
@@ -253,6 +268,7 @@ def _select_tile_config(
     sms: int,
     max_shared_mem: int,
     required_cta_threads: int | None = None,
+    num_stages: int = _DEFAULT_NUM_STAGES,
 ) -> tuple[int, int, int, int]:
     cta_m_blocks = _covering_count(moe_block_size, 16)
     uses_m_block_8 = moe_block_size == 8
@@ -274,6 +290,7 @@ def _select_tile_config(
             tile_k=tile_k,
             cta_threads=cta_threads,
             max_shared_mem=int(max_shared_mem) - 512,
+            num_stages=num_stages,
         ):
             continue
         blocks_per_sm_limit = _determine_blocks_per_sm(
@@ -287,6 +304,7 @@ def _select_tile_config(
             uses_m_block_8=uses_m_block_8,
             sms=sms,
             max_shared_mem=max_shared_mem,
+            num_stages=num_stages,
         )
         if blocks_per_sm_limit > best_blocks_per_sm:
             best_blocks_per_sm = blocks_per_sm_limit
@@ -305,6 +323,37 @@ def _select_tile_config(
     return best_tile_config
 
 
+# Tile-keyed ``num_stages`` overrides (Spark autotune 2026-05-18).
+#
+# The kernel's MMA pipeline depth (``num_stages``) trades smem footprint
+# against latency hiding.  Spark sweeps showed the winning depth is
+# determined by the *tile shape*, not the problem shape:
+#
+#   tile_n=128, tile_k=64   (cta_threads=128): stages=3 — frees smem for
+#       2 blocks/SM, wins +7-12% on o_proj / shared.up / shared.dn /
+#       mamba_output_proj across M ∈ {512..4096}.
+#   tile_n=64,  tile_k=128  (cta_threads=128): stages=2 — frees enough
+#       smem for 2 blocks/SM on the wide-K narrow-N case (mamba_in_proj
+#       N=10304), wins +2-4%.
+#   tile_n=256, tile_k=64   (cta_threads=256): stages=4 — already at
+#       blocks_per_sm=1 ceiling (tile too big for 2/SM at any depth);
+#       deeper pipeline = better latency hiding.  +0.3% over stages=3.
+#   tile_n=128, tile_k=128  (cta_threads=256): stages=4 (default;
+#       smem too tight to drop stages without underutilization).
+#
+# Any tile not in the table uses _DEFAULT_NUM_STAGES.
+_NUM_STAGES_BY_TILE: dict[tuple[int, int], int] = {
+    # (tile_n, tile_k): num_stages
+    (128, 64): 3,
+    (64, 128): 2,
+    (256, 64): 4,
+}
+
+
+def _select_num_stages_for_tile(*, tile_n: int, tile_k: int) -> int:
+    return _NUM_STAGES_BY_TILE.get((int(tile_n), int(tile_k)), _DEFAULT_NUM_STAGES)
+
+
 @dataclass(frozen=True)
 class W4A16GemmCompileResult:
     compiled: object
@@ -313,6 +362,7 @@ class W4A16GemmCompileResult:
     moe_block_size: int
     max_m_blocks: int
     blocks_per_sm: int
+    num_stages: int = _DEFAULT_NUM_STAGES
 
 
 @dataclass(frozen=True)
@@ -342,6 +392,7 @@ class W4A16GemmKernel:
         tile_k: int,
         cta_m_size: int,
         element_dtype: str = "bf16",
+        num_stages: int = _DEFAULT_NUM_STAGES,
     ):
         if element_dtype not in {"bf16", "fp16"}:
             raise ValueError(f"unsupported element_dtype {element_dtype!r}")
@@ -355,6 +406,8 @@ class W4A16GemmKernel:
             raise ValueError(f"unsupported cta_m_size {cta_m_size}")
         if cta_m_size != 8 and cta_m_size % 16 != 0:
             raise ValueError("cta_m_size must be 8 or a multiple of 16")
+        if int(num_stages) < 2:
+            raise ValueError("num_stages must be at least 2")
         cta_threads = tile_n * tile_k // 64
         if cta_threads not in (128, 256):
             raise ValueError("W4A16 GEMM expects 128 or 256 CTA threads")
@@ -366,6 +419,7 @@ class W4A16GemmKernel:
         self.cta_n_blocks = int(tile_n // 16)
         self.cta_k_blocks = int(tile_k // 16)
         self.cta_threads = int(cta_threads)
+        self.num_stages = int(num_stages)
         # Keep ``moe_block_size`` field name for parity with the donor's
         # internal methods (which heavily reference self.moe_block_size).
         # For dense it's just the per-CTA M-tile size.
@@ -401,6 +455,7 @@ class W4A16GemmKernel:
             uses_m_block_8=self.uses_m_block_8,
             sms=self.sms,
             max_shared_mem=max_shared_mem,
+            num_stages=self.num_stages,
         )
 
         # W4A16 shared-memory geometry, in int4 units unless noted.
@@ -439,7 +494,7 @@ class W4A16GemmKernel:
         self.sh_topk_off = 0
 
         sh_red_size = (2 * self.cta_n_blocks + 1) * 16 * self.cta_m_blocks
-        sh_b_size = _STAGES * self.b_sh_stage
+        sh_b_size = self.num_stages * self.b_sh_stage
         sh_size_min = min(sh_red_size, sh_b_size)
         sh_size_max = max(sh_red_size, sh_b_size)
         sh_bias_size = self.cta_n_blocks * 16 // 8
@@ -447,8 +502,8 @@ class W4A16GemmKernel:
         self.sh_b_off = self.sh_valid_count_off
         self.sh_red_off = self.sh_valid_count_off
         self.sh_s_off = self.sh_valid_count_off + sh_b_red_bias_size
-        self.sh_a_off = self.sh_s_off + _STAGES * self.s_sh_stage
-        self.shared_int4 = self.sh_a_off + _STAGES * self.a_sh_stage
+        self.sh_a_off = self.sh_s_off + self.num_stages * self.s_sh_stage
+        self.shared_int4 = self.sh_a_off + self.num_stages * self.a_sh_stage
         self.shared_words = self.shared_int4 * 4
 
     @cute.jit
@@ -1269,7 +1324,7 @@ class W4A16GemmKernel:
         b_frag = cute.make_rmem_tensor((2, 2), Uint32)
         tile_idx = Int32(0)
         while tile_idx < k_tiles:
-            for pipe in cutlass.range_constexpr(_STAGES):
+            for pipe in cutlass.range_constexpr(self.num_stages):
                 if tile_idx < k_tiles:
                     for kk in cutlass.range_constexpr(self.b_sh_wr_iters):
                         self._load_next_fragment_bundle(
@@ -1842,14 +1897,14 @@ class W4A16GemmKernel:
                     tid,
                     b_sh_rd,
                     s_sh_rd,
-                    Int32((pipe + 1) % _STAGES),
+                    Int32((pipe + 1) % self.num_stages),
                     Int32(0),
                 )
                 self._load_a_register_bundle(
                     a_regs_next,
                     smem_base,
                     a_sh_rd,
-                    Int32((pipe + 1) % _STAGES),
+                    Int32((pipe + 1) % self.num_stages),
                     Int32(0),
                     uses_m_block_8,
                 )
@@ -2097,7 +2152,7 @@ class W4A16GemmKernel:
         a_rows_per_iter: Int32,
         output_n_tile: Int32,
     ):
-        for pipe in cutlass.range_constexpr(_STAGES - 1):
+        for pipe in cutlass.range_constexpr(self.num_stages - 1):
             if Int32(pipe) < k_tiles:
                 self._stage_k_tile_async(
                     a_bf16_flat,
@@ -2122,7 +2177,7 @@ class W4A16GemmKernel:
                 )
             else:
                 cute.arch.cp_async_commit_group()
-        cute.arch.cp_async_wait_group(_STAGES - 2)
+        cute.arch.cp_async_wait_group(self.num_stages - 2)
         cute.arch.sync_threads()
 
     @cute.jit
@@ -2150,7 +2205,7 @@ class W4A16GemmKernel:
         a_rows_per_iter: Int32,
         output_n_tile: Int32,
     ):
-        fetch_tile = tile_idx + Int32(_STAGES - 1)
+        fetch_tile = tile_idx + Int32(self.num_stages - 1)
         if fetch_tile < k_tiles:
             self._stage_k_tile_async(
                 a_bf16_flat,
@@ -2158,7 +2213,7 @@ class W4A16GemmKernel:
                 scales_i32_flat,
                 smem_base,
                 tid,
-                Int32((pipe + _STAGES - 1) % _STAGES),
+                Int32((pipe + self.num_stages - 1) % self.num_stages),
                 reduce_k_tile + fetch_tile,
                 block_valid_rows,
                 m_tile_base,
@@ -2175,7 +2230,7 @@ class W4A16GemmKernel:
             )
         else:
             cute.arch.cp_async_commit_group()
-        cute.arch.cp_async_wait_group(_STAGES - 2)
+        cute.arch.cp_async_wait_group(self.num_stages - 2)
         cute.arch.sync_threads()
 
     @cute.jit
@@ -2582,6 +2637,7 @@ def compile_w4a16_gemm(
     tile_k: int,
     cta_m_size: int,
     element_dtype: str = "bf16",
+    num_stages: int = _DEFAULT_NUM_STAGES,
 ) -> W4A16GemmCompileResult:
     """Compile a dense W4A16 GEMM kernel for the given problem shape + tile.
 
@@ -2614,6 +2670,7 @@ def compile_w4a16_gemm(
         tile_n,
         tile_k,
         cta_m_size,
+        int(num_stages),
     )
     cached = _CACHE.get(cache_key)
     if cached is not None:
@@ -2675,6 +2732,7 @@ def compile_w4a16_gemm(
         tile_k=tile_k,
         cta_m_size=cta_m_size,
         element_dtype=element_dtype,
+        num_stages=int(num_stages),
     )
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=kernel, cache_key=cache_key
@@ -2697,6 +2755,7 @@ def compile_w4a16_gemm(
         moe_block_size=cta_m_size,
         max_m_blocks=max_m_blocks,
         blocks_per_sm=kernel.blocks_per_sm,
+        num_stages=int(num_stages),
     )
     _CACHE[cache_key] = result
     return result
@@ -2813,6 +2872,7 @@ class DenseGemmW4A16CuteMarlinKernel:
         cta_m_size: int | None = None,
         tile_n: int | None = None,
         tile_k: int | None = None,
+        num_stages: int | None = None,
         element_dtype: str = "bf16",
     ) -> None:
         if cta_m_size is not None and cta_m_size not in self._ALLOWED_CTA_M_SIZES:
@@ -2821,9 +2881,12 @@ class DenseGemmW4A16CuteMarlinKernel:
             )
         if element_dtype not in {"bf16", "fp16"}:
             raise ValueError(f"unsupported element_dtype {element_dtype!r}")
+        if num_stages is not None and int(num_stages) < 2:
+            raise ValueError("num_stages must be at least 2")
         self._cta_m_size = cta_m_size
         self._tile_n = tile_n
         self._tile_k = tile_k
+        self._num_stages = num_stages
         self._element_dtype = element_dtype
         self._a_dtype = (
             torch.bfloat16 if element_dtype == "bf16" else torch.float16
@@ -2844,8 +2907,19 @@ class DenseGemmW4A16CuteMarlinKernel:
             return 48
         return 64
 
+    def _pick_num_stages(self, *, tile_n: int, tile_k: int) -> int:
+        """Pick pipeline depth (cp.async → MMA stages) by tile geometry.
+
+        The optimal depth is a property of the tile shape, not the
+        problem shape.  See ``_NUM_STAGES_BY_TILE`` for the autotune
+        table — Spark autotune 2026-05-18.
+        """
+        if self._num_stages is not None:
+            return int(self._num_stages)
+        return _select_num_stages_for_tile(tile_n=int(tile_n), tile_k=int(tile_k))
+
     def _pick_tile_config(
-        self, *, m: int, n: int, k: int, cta_m_size: int,
+        self, *, m: int, n: int, k: int, cta_m_size: int, num_stages: int,
     ) -> tuple[int, int]:
         if self._tile_n is not None and self._tile_k is not None:
             return int(self._tile_n), int(self._tile_k)
@@ -2868,6 +2942,7 @@ class DenseGemmW4A16CuteMarlinKernel:
             moe_block_size=cta_m_size,
             sms=sms,
             max_shared_mem=max_shared_mem,
+            num_stages=num_stages,
         )
         return int(tile_n), int(tile_k)
 
@@ -2979,7 +3054,15 @@ class DenseGemmW4A16CuteMarlinKernel:
             )
 
         cta_m_size = self._pick_cta_m_size(m)
-        tile_n, tile_k = self._pick_tile_config(m=m, n=n, k=k, cta_m_size=cta_m_size)
+        # Tile pick is stable across num_stages for the Nano3.5 shapes
+        # (the candidate set is determined by N%tile_n, K%tile_k, smem
+        # cap at the deepest stages; tile_n/tile_k are picked before
+        # depth so order doesn't matter).  Use _DEFAULT_NUM_STAGES for
+        # the tile selection's smem-fit check.
+        tile_n, tile_k = self._pick_tile_config(
+            m=m, n=n, k=k, cta_m_size=cta_m_size, num_stages=_DEFAULT_NUM_STAGES,
+        )
+        num_stages = self._pick_num_stages(tile_n=tile_n, tile_k=tile_k)
 
         m_padded = ((m + cta_m_size - 1) // cta_m_size) * cta_m_size
         if m_padded != m:
@@ -3025,6 +3108,7 @@ class DenseGemmW4A16CuteMarlinKernel:
             tile_k=tile_k,
             cta_m_size=cta_m_size,
             element_dtype=self._element_dtype,
+            num_stages=num_stages,
         )
         stream = current_cuda_stream()
         result.compiled(
